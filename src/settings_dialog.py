@@ -2,7 +2,7 @@
 import subprocess
 from gi.repository import Gtk, Adw
 from .constants import APP_NAME, APP_GITHUB, APK_DASH_GITHUB
-from .config import save_config, find_unity, find_apk_dash
+from .config import save_config, find_unity, find_apk_dash, list_unity_versions
 
 
 class SettingsDialog(Adw.Dialog):
@@ -10,10 +10,11 @@ class SettingsDialog(Adw.Dialog):
         super().__init__()
         self.set_title("Settings")
         self.set_content_width(560)
-        self.set_content_height(600)
+        self.set_content_height(650)
         self.cfg = cfg
         self.on_save = on_save
         self.proj_rows = []
+        self._saved = False
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
@@ -25,9 +26,9 @@ class SettingsDialog(Adw.Dialog):
 
         page = Adw.PreferencesPage()
 
-        # General
+        # ── General ──
         grp = Adw.PreferencesGroup(title="General")
-        self.unity_row = Adw.EntryRow(title="Unity Editor")
+        self.unity_row = Adw.EntryRow(title="Unity Editor (default)")
         self.unity_row.set_text(cfg.get("unity", ""))
         grp.add(self.unity_row)
 
@@ -44,9 +45,20 @@ class SettingsDialog(Adw.Dialog):
         detect.add_suffix(detect_btn)
         detect.set_activatable_widget(detect_btn)
         grp.add(detect)
+
+        # Theme (live preview)
+        self._original_theme = cfg.get("theme", "system")
+        self.theme_row = Adw.ComboRow(title="Theme")
+        self.theme_row.set_model(Gtk.StringList.new(["System", "Dark", "Light"]))
+        theme_idx = {"system": 0, "dark": 1, "light": 2}
+        self.theme_row.set_selected(theme_idx.get(self._original_theme, 0))
+        self.theme_row.connect("notify::selected", self._on_theme_preview)
+        grp.add(self.theme_row)
+        self.connect("closed", self._on_closed)
+
         page.add(grp)
 
-        # Projects
+        # ── Projects ──
         self.proj_grp = Adw.PreferencesGroup(title="Projects")
         add_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
         add_btn.add_css_class("flat")
@@ -57,7 +69,7 @@ class SettingsDialog(Adw.Dialog):
             self._add_project_row(p)
         page.add(self.proj_grp)
 
-        # About
+        # ── About ──
         about_grp = Adw.PreferencesGroup(title="About")
         for title, url in [(APP_NAME, APP_GITHUB), ("APK Dash", APK_DASH_GITHUB)]:
             row = Adw.ActionRow(title=title, subtitle=url)
@@ -69,6 +81,21 @@ class SettingsDialog(Adw.Dialog):
 
         toolbar.set_content(page)
         self.set_child(toolbar)
+
+    @staticmethod
+    def _apply_theme(name):
+        mgr = Adw.StyleManager.get_default()
+        schemes = {"dark": Adw.ColorScheme.FORCE_DARK,
+                   "light": Adw.ColorScheme.FORCE_LIGHT}
+        mgr.set_color_scheme(schemes.get(name, Adw.ColorScheme.DEFAULT))
+
+    def _on_theme_preview(self, *_):
+        names = {0: "system", 1: "dark", 2: "light"}
+        self._apply_theme(names.get(self.theme_row.get_selected(), "system"))
+
+    def _on_closed(self, *_):
+        if not self._saved:
+            self._apply_theme(self._original_theme)
 
     def _add_project_row(self, proj=None):
         if proj is None:
@@ -95,6 +122,19 @@ class SettingsDialog(Adw.Dialog):
         build_row.set_text(proj.get("build_dir", ""))
         exp.add_row(build_row)
 
+        # Per-project Unity override
+        unity_versions = list_unity_versions()
+        unity_row = Adw.ComboRow(title="Unity version")
+        labels = ["Default (global)"] + [v[0] for v in unity_versions]
+        unity_row.set_model(Gtk.StringList.new(labels))
+        # Select current
+        proj_unity = proj.get("unity", "")
+        sel = 0
+        for i, (ver, path) in enumerate(unity_versions):
+            if path == proj_unity: sel = i + 1
+        unity_row.set_selected(sel)
+        exp.add_row(unity_row)
+
         android_sw = Adw.SwitchRow(title="Android")
         android_sw.set_active("android" in proj.get("targets", []))
         exp.add_row(android_sw)
@@ -103,13 +143,38 @@ class SettingsDialog(Adw.Dialog):
         ios_sw.set_active("ios" in proj.get("targets", []))
         exp.add_row(ios_sw)
 
+        # Upload section (nested expander)
+        up = proj.get("upload", {})
+        upload_exp = Adw.ExpanderRow(title="Upload (SCP)", show_enable_switch=False)
+
+        up_host = Adw.EntryRow(title="Host")
+        up_host.set_text(up.get("host", ""))
+        upload_exp.add_row(up_host)
+
+        up_user = Adw.EntryRow(title="User")
+        up_user.set_text(up.get("user", ""))
+        upload_exp.add_row(up_user)
+
+        up_dir = Adw.EntryRow(title="Remote directory")
+        up_dir.set_text(up.get("remote_dir", ""))
+        upload_exp.add_row(up_dir)
+
+        up_pattern = Adw.EntryRow(title="Rename ({name}, {build})")
+        up_pattern.set_text(up.get("rename_pattern", "{name}_mq3_{build}.apk"))
+        upload_exp.add_row(up_pattern)
+
+        exp.add_row(upload_exp)
+
         remove_row = Adw.ActionRow(title="Remove project")
         remove_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
         remove_btn.add_css_class("flat")
         remove_btn.add_css_class("error")
         entry = {"exp": exp, "name": name_row, "path": path_row,
                  "desc": desc_row, "build_dir": build_row,
-                 "android": android_sw, "ios": ios_sw}
+                 "android": android_sw, "ios": ios_sw,
+                 "unity_combo": unity_row, "unity_versions": unity_versions,
+                 "up_host": up_host, "up_user": up_user,
+                 "up_dir": up_dir, "up_pattern": up_pattern}
         def do_remove(_, e=entry, x=exp):
             self.proj_grp.remove(x)
             self.proj_rows.remove(e)
@@ -131,23 +196,42 @@ class SettingsDialog(Adw.Dialog):
         if d: self.dash_row.set_text(d)
 
     def _save(self, _):
+        theme_map = {0: "system", 1: "dark", 2: "light"}
         projects = []
         for r in self.proj_rows:
             targets = []
             if r["android"].get_active(): targets.append("android")
             if r["ios"].get_active(): targets.append("ios")
-            projects.append({
+            # Unity per-project
+            sel = r["unity_combo"].get_selected()
+            unity_path = ""
+            if sel > 0 and sel - 1 < len(r["unity_versions"]):
+                unity_path = r["unity_versions"][sel - 1][1]
+            p = {
                 "name": r["name"].get_text().strip(),
                 "path": r["path"].get_text().strip(),
                 "desc": r["desc"].get_text().strip(),
                 "build_dir": r["build_dir"].get_text().strip(),
                 "targets": targets,
-            })
+            }
+            if unity_path: p["unity"] = unity_path
+            # Per-project upload
+            up_host = r["up_host"].get_text().strip()
+            if up_host:
+                p["upload"] = {
+                    "host": up_host,
+                    "user": r["up_user"].get_text().strip(),
+                    "remote_dir": r["up_dir"].get_text().strip(),
+                    "rename_pattern": r["up_pattern"].get_text().strip() or "{name}_{build}.apk",
+                }
+            projects.append(p)
         self.cfg = {
             "unity": self.unity_row.get_text().strip(),
             "apk_dash": self.dash_row.get_text().strip(),
+            "theme": theme_map.get(self.theme_row.get_selected(), "system"),
             "projects": projects,
         }
+        self._saved = True
         save_config(self.cfg)
         self.on_save(self.cfg)
         self.close()

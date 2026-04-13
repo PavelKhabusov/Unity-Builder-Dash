@@ -1,14 +1,15 @@
 """App-wide constants and patterns."""
-import re
+import os, re
 
 APP_NAME = "Unity Builder Dash"
 APP_ID = "com.PavelKhabusov.UnityBuilderDash"
 APP_GITHUB = "https://github.com/PavelKhabusov/Unity-Builder-Dash"
 APK_DASH_GITHUB = "https://github.com/PavelKhabusov/APK-Dash"
+ICONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icons")
 
 TARGET_INFO = {
-    "android": {"label": "Android", "method": "BuildScript.BuildAndroid", "icon": "package-x-generic-symbolic"},
-    "ios":     {"label": "iOS",     "method": "BuildScript.BuildiOS",     "icon": "phone-symbolic"},
+    "android": {"label": "Android", "method": "BuildScript.BuildAndroid", "icon": "ubd-android-symbolic"},
+    "ios":     {"label": "iOS",     "method": "BuildScript.BuildiOS",     "icon": "ubd-apple-symbolic"},
 }
 
 SKIP_PATTERNS = [
