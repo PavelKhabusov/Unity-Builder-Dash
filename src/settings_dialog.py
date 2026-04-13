@@ -163,6 +163,10 @@ class SettingsDialog(Adw.Dialog):
         up_pattern.set_text(up.get("rename_pattern", "{name}_mq3_{build}.apk"))
         upload_exp.add_row(up_pattern)
 
+        up_pass = Adw.PasswordEntryRow(title="Password (optional)")
+        up_pass.set_text(up.get("password", ""))
+        upload_exp.add_row(up_pass)
+
         exp.add_row(upload_exp)
 
         remove_row = Adw.ActionRow(title="Remove project")
@@ -174,7 +178,8 @@ class SettingsDialog(Adw.Dialog):
                  "android": android_sw, "ios": ios_sw,
                  "unity_combo": unity_row, "unity_versions": unity_versions,
                  "up_host": up_host, "up_user": up_user,
-                 "up_dir": up_dir, "up_pattern": up_pattern}
+                 "up_dir": up_dir, "up_pattern": up_pattern,
+                 "up_pass": up_pass}
         def do_remove(_, e=entry, x=exp):
             self.proj_grp.remove(x)
             self.proj_rows.remove(e)
@@ -218,12 +223,15 @@ class SettingsDialog(Adw.Dialog):
             # Per-project upload
             up_host = r["up_host"].get_text().strip()
             if up_host:
-                p["upload"] = {
+                up = {
                     "host": up_host,
                     "user": r["up_user"].get_text().strip(),
                     "remote_dir": r["up_dir"].get_text().strip(),
                     "rename_pattern": r["up_pattern"].get_text().strip() or "{name}_{build}.apk",
                 }
+                pw = r["up_pass"].get_text().strip()
+                if pw: up["password"] = pw
+                p["upload"] = up
             projects.append(p)
         self.cfg = {
             "unity": self.unity_row.get_text().strip(),

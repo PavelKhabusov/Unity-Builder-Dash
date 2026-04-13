@@ -1,6 +1,6 @@
 """Main application window."""
 import os, subprocess, datetime, time, threading
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Gtk, Adw, GLib, Gio
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
@@ -171,6 +171,22 @@ class BuilderWindow(Adw.ApplicationWindow):
         ver = Gtk.Label(label=get_version(proj["path"]), css_classes=["caption"])
         sub.append(ver)
 
+        # APK size
+        apk = find_apk(proj)
+        if apk:
+            mb = os.path.getsize(apk) / (1024 * 1024)
+            sub.append(Gtk.Label(label=f"{mb:.0f} MB", css_classes=["dim-label", "caption"]))
+
+        # Last build info
+        builds = load_builds_log()
+        proj_builds = [b for b in builds if b.get("project") == proj["name"]]
+        if proj_builds:
+            last = proj_builds[-1]
+            dm, ds = divmod(last.get("duration", 0), 60)
+            sub.append(Gtk.Label(
+                label=f"{last.get('date', '')}  {dm}:{ds:02d}",
+                css_classes=["dim-label", "caption"]))
+
         stat = Gtk.Label(label="", css_classes=["caption"])
         sub.append(stat)
         info.append(sub)
@@ -209,24 +225,33 @@ class BuilderWindow(Adw.ApplicationWindow):
             actions.append(upload_btn)
             buttons.append(upload_btn)
 
-        # Open in Unity
-        unity_btn = Gtk.Button(icon_name="application-x-executable-symbolic",
-                               tooltip_text="Open in Unity", css_classes=["flat"])
-        unity_btn.connect("clicked", lambda _, p=proj: self._open_in_unity(p))
-        actions.append(unity_btn)
+        # Context menu (three dots)
+        menu = Gio.Menu()
+        proj_id = proj["name"].replace(" ", "_")
+        menu.append("Open in Unity", f"win.open-unity-{proj_id}")
+        menu.append("Health Check", f"win.scan-{proj_id}")
+        menu.append("Open Build Folder", f"win.folder-{proj_id}")
+        menu.append("Open Project Folder", f"win.proj-folder-{proj_id}")
+        menu.append("Edit in Settings", f"win.edit-{proj_id}")
 
-        # Health check
-        scan_btn = Gtk.Button(icon_name="security-medium-symbolic",
-                              tooltip_text="Health check", css_classes=["flat"])
-        scan_btn.connect("clicked", lambda _, p=proj: self._on_scan(p))
-        actions.append(scan_btn)
+        # Register actions
+        for action_name, callback in [
+            (f"open-unity-{proj_id}", lambda *_, p=proj: self._open_in_unity(p)),
+            (f"scan-{proj_id}", lambda *_, p=proj: self._on_scan(p)),
+            (f"folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
+                ["xdg-open", p.get("build_dir") or p["path"]])),
+            (f"proj-folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
+                ["xdg-open", p["path"]])),
+            (f"edit-{proj_id}", lambda *_, p=proj: self._on_settings(None)),
+        ]:
+            action = Gio.SimpleAction.new(action_name, None)
+            action.connect("activate", callback)
+            self.add_action(action)
 
-        # Folder
-        fb = Gtk.Button(icon_name="folder-symbolic",
-                        tooltip_text="Open build folder", css_classes=["flat"])
-        fb.connect("clicked", lambda _, p=proj: subprocess.Popen(
-            ["xdg-open", p.get("build_dir") or p["path"]]))
-        actions.append(fb)
+        menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic",
+                                  menu_model=menu, css_classes=["flat"],
+                                  valign=Gtk.Align.CENTER)
+        actions.append(menu_btn)
 
         inner.append(actions)
         row.append(inner)
@@ -412,10 +437,19 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not apk:
             self._log("No APK found.\n")
             return
-        self._log(f"Uploading {os.path.basename(apk)}...\n")
+        mb = os.path.getsize(apk) / (1024 * 1024)
+        self._log(f"Uploading {os.path.basename(apk)} ({mb:.0f} MB)...\n")
+        self.stage_label.set_text("Uploading...")
+        self.progress_bar.set_fraction(0)
+        def on_progress(frac):
+            GLib.idle_add(self.progress_bar.set_fraction, frac)
+            GLib.idle_add(self.stage_label.set_text, f"Uploading... {frac*100:.0f}%")
         def do_upload():
-            ok = upload_apk(self.cfg, proj, apk, lambda t: GLib.idle_add(self._log, t))
-            GLib.idle_add(self._log, "Upload done.\n" if ok else "Upload failed.\n")
+            ok = upload_apk(self.cfg, proj, apk,
+                            log_cb=lambda t: GLib.idle_add(self._log, t),
+                            progress_cb=on_progress)
+            GLib.idle_add(self.stage_label.set_text, "Uploaded!" if ok else "Upload failed")
+            GLib.idle_add(self.progress_bar.set_fraction, 1.0 if ok else 0)
         threading.Thread(target=do_upload, daemon=True).start()
 
     def _open_in_unity(self, proj):

@@ -206,9 +206,8 @@ def scan_project(path):
 
     return issues, ok
 
-def upload_apk(cfg, proj, apk_path, log_cb=None):
-    """Upload APK to remote server via SCP with per-project settings."""
-    # Per-project upload overrides global
+def upload_apk(cfg, proj, apk_path, log_cb=None, progress_cb=None):
+    """Upload APK via SCP. Uses sshpass if password in config, otherwise opens terminal."""
     upload = proj.get("upload", cfg.get("upload", {}))
     if not upload.get("host"): return False
 
@@ -220,17 +219,43 @@ def upload_apk(cfg, proj, apk_path, log_cb=None):
     host = upload["host"]
     user = upload.get("user", "")
     remote_dir = upload.get("remote_dir", "")
+    password = upload.get("password", "")
     dest = f"{user}@{host}:{remote_dir}/{remote_name}" if user else f"{host}:{remote_dir}/{remote_name}"
 
     if log_cb: log_cb(f"Uploading {remote_name} → {host}...\n")
+
+    # Upload via FTP using curl (works with Beget and most hosting)
+    ftp_url = f"ftp://{host}/{remote_dir}/{remote_name}".replace("//", "/").replace("ftp:/", "ftp://")
+    creds = f"{user}:{password}" if password else user
+
     try:
-        r = subprocess.run(["scp", apk_path, dest],
-                           capture_output=True, text=True, timeout=300)
-        if r.returncode == 0:
+        proc = subprocess.Popen(
+            ["curl", "-T", apk_path, ftp_url,
+             "--user", creds, "--ftp-create-dirs", "-#"],
+            stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+        # curl -# outputs progress to stderr like: "######## 45.2%"
+        last_pct = ""
+        for ch in iter(lambda: proc.stderr.read(1), ''):
+            if ch == '\r' or ch == '\n':
+                if last_pct and progress_cb:
+                    # Extract percentage
+                    import re as _re
+                    m = _re.search(r'(\d+\.?\d*)%', last_pct)
+                    if m:
+                        pct = float(m.group(1))
+                        progress_cb(pct / 100.0)
+                last_pct = ""
+            else:
+                last_pct += ch
+
+        proc.wait()
+        if proc.returncode == 0:
+            if progress_cb: progress_cb(1.0)
             if log_cb: log_cb(f"Uploaded: {remote_name}\n")
             return True
         else:
-            if log_cb: log_cb(f"Upload failed: {r.stderr}\n")
+            if log_cb: log_cb(f"Upload failed (exit {proc.returncode})\n")
             return False
     except Exception as e:
         if log_cb: log_cb(f"Upload error: {e}\n")

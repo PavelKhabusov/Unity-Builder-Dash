@@ -72,9 +72,14 @@ class BuildWorker:
                     if t > 0: GLib.idle_add(self.stage_cb, None, min(c/t, 1.0))
                 GLib.idle_add(self.log_cb, line)
 
-            self.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
+                # Stop reading once build result is known
+                if build_ok or build_failed:
+                    break
+
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
         except Exception as e:
             GLib.idle_add(self.log_cb, f"\n  Error: {e}\n")
 
