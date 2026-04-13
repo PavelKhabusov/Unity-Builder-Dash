@@ -8,28 +8,90 @@ def show_history(parent):
     builds = load_builds_log()
     dlg = Adw.Dialog()
     dlg.set_title("Build History")
-    dlg.set_content_width(600)
-    dlg.set_content_height(600)
+    dlg.set_content_width(650)
+    dlg.set_content_height(650)
 
     tb = Adw.ToolbarView()
-    tb.add_top_bar(Adw.HeaderBar())
-    content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    header = Adw.HeaderBar()
+    tb.add_top_bar(header)
 
     if not builds:
-        content.append(Adw.StatusPage(title="No builds yet"))
-    else:
-        chart = Gtk.DrawingArea()
-        chart.set_content_height(180)
-        chart.set_margin_top(16)
-        chart.set_margin_start(16)
-        chart.set_margin_end(16)
-        chart.set_draw_func(lambda area, cr, w, h: _draw_chart(cr, w, h, builds))
-        content.append(chart)
+        tb.set_content(Adw.StatusPage(title="No builds yet"))
+        dlg.set_child(tb)
+        dlg.present(parent)
+        return
 
-        scroll = Gtk.ScrolledWindow(vexpand=True)
+    content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+    # ── Filters ──
+    projects = sorted(set(b.get("project", "") for b in builds))
+    filter_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                         halign=Gtk.Align.CENTER)
+    filter_box.set_margin_top(8)
+    filter_box.set_margin_bottom(4)
+
+    state = {"project": None, "success_only": False}
+    chart_area = [None]
+    list_box = [None]
+
+    proj_dropdown = Gtk.DropDown.new_from_strings(["All"] + projects)
+    proj_dropdown.set_selected(0)
+    filter_box.append(proj_dropdown)
+
+    success_toggle = Gtk.CheckButton(label="Success only")
+    filter_box.append(success_toggle)
+
+    # Chart Y: Duration / Size / Both
+    chart_mode = Gtk.DropDown.new_from_strings(["Duration + Size", "Duration", "Size"])
+    chart_mode.set_selected(0)
+    state["chart_mode"] = 0
+    filter_box.append(chart_mode)
+
+    # Chart X: Build / Time
+    x_mode = Gtk.DropDown.new_from_strings(["Build #", "Time"])
+    x_mode.set_selected(0)
+    state["x_mode"] = 0
+    filter_box.append(x_mode)
+
+    content.append(filter_box)
+
+    # ── Chart ──
+    chart = Gtk.DrawingArea()
+    chart.set_content_height(180)
+    chart.set_margin_start(16)
+    chart.set_margin_end(16)
+    chart_area[0] = chart
+    content.append(chart)
+
+    # ── List ──
+    scroll = Gtk.ScrolledWindow(vexpand=True)
+    list_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    list_box[0] = list_container
+    scroll.set_child(list_container)
+    content.append(scroll)
+
+    def get_filtered():
+        filtered = builds
+        if state["project"]:
+            filtered = [b for b in filtered if b.get("project") == state["project"]]
+        if state["success_only"]:
+            filtered = [b for b in filtered if b.get("success")]
+        return filtered
+
+    def refresh():
+        filtered = get_filtered()
+        # Update chart
+        mode = state["chart_mode"]
+        xm = state["x_mode"]
+        chart_area[0].set_draw_func(
+            lambda area, cr, w, h, m=mode, x=xm: _draw_chart(cr, w, h, filtered, m, x))
+        chart_area[0].queue_draw()
+        # Update list
+        while (c := list_box[0].get_first_child()):
+            list_box[0].remove(c)
         page = Adw.PreferencesPage()
-        grp = Adw.PreferencesGroup(title=f"Last {min(len(builds), 20)} builds")
-        for b in reversed(builds[-20:]):
+        grp = Adw.PreferencesGroup(title=f"{len(filtered[-20:])} builds")
+        for b in reversed(filtered[-20:]):
             icon = "object-select-symbolic" if b.get("success") else "dialog-error-symbolic"
             size = f"  {b['apk_size_mb']} MB" if b.get("apk_size_mb") else ""
             dm, ds = divmod(b.get("duration", 0), 60)
@@ -38,8 +100,6 @@ def show_history(parent):
                 subtitle=f"{b.get('date', '?')}  {dm}:{ds:02d}{size}  build {b.get('build', '?')}"
             )
             row.add_prefix(Gtk.Image.new_from_icon_name(icon))
-
-            # Find matching log file
             log = _find_log(b)
             if log:
                 log_btn = Gtk.Button(icon_name="document-open-symbolic",
@@ -47,11 +107,28 @@ def show_history(parent):
                                      css_classes=["flat"])
                 log_btn.connect("clicked", lambda _, p=log: subprocess.Popen(["xdg-open", p]))
                 row.add_suffix(log_btn)
-
             grp.add(row)
         page.add(grp)
-        scroll.set_child(page)
-        content.append(scroll)
+        list_box[0].append(page)
+
+    def on_project_changed(*_):
+        idx = proj_dropdown.get_selected()
+        state["project"] = None if idx == 0 else projects[idx - 1]
+        refresh()
+
+    proj_dropdown.connect("notify::selected", on_project_changed)
+    success_toggle.connect("toggled", lambda b: (
+        state.__setitem__("success_only", b.get_active()), refresh()))
+    def on_chart_mode(*_):
+        state["chart_mode"] = chart_mode.get_selected()
+        refresh()
+    chart_mode.connect("notify::selected", on_chart_mode)
+    def on_x_mode(*_):
+        state["x_mode"] = x_mode.get_selected()
+        refresh()
+    x_mode.connect("notify::selected", on_x_mode)
+
+    refresh()
 
     tb.set_content(content)
     dlg.set_child(tb)
@@ -156,8 +233,8 @@ def _draw_smooth_fill(cr, points, baseline_y):
     cr.close_path()
 
 
-def _draw_chart(cr, w, h, builds):
-    """Draw build duration + APK size chart."""
+def _draw_chart(cr, w, h, builds, mode=0, x_mode=0):
+    """Draw chart. mode: 0=both, 1=duration, 2=size. x_mode: 0=build#, 1=date."""
     data = [b for b in builds if b.get("duration", 0) > 0]
     if len(data) < 2:
         return
@@ -182,6 +259,9 @@ def _draw_chart(cr, w, h, builds):
     cr.fill()
 
     # Grid
+    show_size = mode != 1
+    show_dur = mode != 2
+
     cr.set_line_width(0.5)
     for i in range(5):
         y = pad_t + ch * i / 4
@@ -190,14 +270,15 @@ def _draw_chart(cr, w, h, builds):
         cr.line_to(w - pad_r, y)
         cr.stroke()
         # Duration labels (left, blue)
-        val = max_dur - dur_range * i / 4
-        m, s = divmod(int(val), 60)
-        cr.set_source_rgba(0.38, 0.63, 0.92, 0.6)
-        cr.set_font_size(9)
-        cr.move_to(2, y + 3)
-        cr.show_text(f"{m}:{s:02d}")
+        if show_dur:
+            val = max_dur - dur_range * i / 4
+            m, s = divmod(int(val), 60)
+            cr.set_source_rgba(0.38, 0.63, 0.92, 0.6)
+            cr.set_font_size(9)
+            cr.move_to(2, y + 3)
+            cr.show_text(f"{m}:{s:02d}")
         # Size labels (right, orange)
-        if pos_sizes:
+        if pos_sizes and show_size:
             sv = max_size - size_range * i / 4
             cr.set_source_rgba(0.92, 0.63, 0.18, 0.6)
             cr.move_to(w - pad_r + 4, y + 3)
@@ -216,7 +297,7 @@ def _draw_chart(cr, w, h, builds):
     bottom = pad_t + ch
 
     # --- Size curve (orange, behind) ---
-    if pos_sizes:
+    if pos_sizes and show_size:
         size_xy = [(x_for(i), y_size(s)) for i, s in enumerate(sizes) if s > 0]
         if len(size_xy) >= 2:
             _draw_smooth_fill(cr, size_xy, bottom)
@@ -233,27 +314,34 @@ def _draw_chart(cr, w, h, builds):
 
     # --- Duration curve (blue, front) ---
     dur_xy = [(x_for(i), y_dur(d)) for i, d in enumerate(durations)]
-    _draw_smooth_fill(cr, dur_xy, bottom)
-    cr.set_source_rgba(0.38, 0.63, 0.92, 0.12)
-    cr.fill()
-    _draw_smooth_line(cr, dur_xy)
-    cr.set_source_rgba(0.38, 0.63, 0.92, 0.9)
-    cr.set_line_width(2)
-    cr.stroke()
-
-    # Dots — green=success, red=failed
-    for i, (x, y) in enumerate(dur_xy):
-        if data[i].get("success"):
-            cr.set_source_rgba(0.18, 0.76, 0.49, 1)
-        else:
-            cr.set_source_rgba(0.88, 0.11, 0.14, 1)
-        cr.arc(x, y, 4, 0, math.tau)
+    if show_dur:
+        _draw_smooth_fill(cr, dur_xy, bottom)
+        cr.set_source_rgba(0.38, 0.63, 0.92, 0.12)
         cr.fill()
+        _draw_smooth_line(cr, dur_xy)
+        cr.set_source_rgba(0.38, 0.63, 0.92, 0.9)
+        cr.set_line_width(2)
+        cr.stroke()
+
+        # Dots — green=success, red=failed
+        for i, (x, y) in enumerate(dur_xy):
+            if data[i].get("success"):
+                cr.set_source_rgba(0.18, 0.76, 0.49, 1)
+            else:
+                cr.set_source_rgba(0.88, 0.11, 0.14, 1)
+            cr.arc(x, y, 4, 0, math.tau)
+            cr.fill()
 
     # Bottom labels
+    pts = dur_xy if show_dur else [(x_for(i), 0) for i in range(len(data))]
     cr.set_source_rgba(1, 1, 1, 0.4)
     cr.set_font_size(9)
     step = max(1, len(data) // 6)
     for i in range(0, len(data), step):
-        cr.move_to(dur_xy[i][0] - 8, h - 5)
-        cr.show_text(str(data[i].get("build", "")))
+        cr.move_to(pts[i][0] - 8, h - 5)
+        if x_mode == 1:
+            # Time: "2026-04-13 21:58" → "21:58"
+            date = data[i].get("date", "")
+            cr.show_text(date[11:16] if len(date) > 14 else date[-5:])
+        else:
+            cr.show_text(str(data[i].get("build", "")))

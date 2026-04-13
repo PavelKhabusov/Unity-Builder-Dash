@@ -272,7 +272,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                 ["xdg-open", p.get("build_dir") or p["path"]])),
             (f"proj-folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
                 ["xdg-open", p["path"]])),
-            (f"edit-{proj_id}", lambda *_, p=proj: self._on_settings(None)),
+            (f"edit-{proj_id}", lambda *_, p=proj: self._on_settings(None, expand=p["name"])),
         ]
         for action_name, callback in action_list:
             action = Gio.SimpleAction.new(action_name, None)
@@ -368,6 +368,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not query:
             if hasattr(self, '_full_log_text') and self._full_log_text:
                 self._rebuild_log(self._full_log_text)
+            self._scroll_to_bottom()
             return
         source = getattr(self, '_full_log_text', '') or self.log_buffer.get_text(
             self.log_buffer.get_start_iter(), self.log_buffer.get_end_iter(), False)
@@ -507,8 +508,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._build_queue = []
         if self.worker: self.worker.cancel()
 
-    def _on_settings(self, _):
-        SettingsDialog(self.cfg, self._apply_config).present(self)
+    def _on_settings(self, _, expand=None):
+        dlg = SettingsDialog(self.cfg, self._apply_config, expand_project=expand)
+        dlg.present(self)
 
     def _apply_config(self, cfg):
         self.cfg = cfg

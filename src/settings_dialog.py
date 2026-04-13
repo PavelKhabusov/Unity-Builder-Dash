@@ -6,7 +6,7 @@ from .config import save_config, find_unity, find_apk_dash, list_unity_versions
 
 
 class SettingsDialog(Adw.Dialog):
-    def __init__(self, cfg, on_save):
+    def __init__(self, cfg, on_save, expand_project=None):
         super().__init__()
         self.set_title("Settings")
         self.set_content_width(560)
@@ -15,6 +15,7 @@ class SettingsDialog(Adw.Dialog):
         self.on_save = on_save
         self.proj_rows = []
         self._saved = False
+        self._expand_project = expand_project
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
@@ -56,9 +57,7 @@ class SettingsDialog(Adw.Dialog):
         grp.add(self.theme_row)
         self.connect("closed", self._on_closed)
 
-        page.add(grp)
-
-        # ── Projects ──
+        # ── Projects (first) ──
         self.proj_grp = Adw.PreferencesGroup(title="Projects")
         add_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
         add_btn.add_css_class("flat")
@@ -68,6 +67,9 @@ class SettingsDialog(Adw.Dialog):
         for p in cfg.get("projects", []):
             self._add_project_row(p)
         page.add(self.proj_grp)
+
+        # ── General (after projects) ──
+        page.add(grp)
 
         # ── About ──
         about_grp = Adw.PreferencesGroup(title="About")
@@ -81,6 +83,7 @@ class SettingsDialog(Adw.Dialog):
 
         toolbar.set_content(page)
         self.set_child(toolbar)
+
 
     @staticmethod
     def _apply_theme(name):
@@ -109,14 +112,14 @@ class SettingsDialog(Adw.Dialog):
         name_row.connect("changed", lambda r: exp.set_title(r.get_text() or "New Project"))
         exp.add_row(name_row)
 
-        path_row = Adw.EntryRow(title="Project path")
-        path_row.set_text(proj.get("path", ""))
-        exp.add_row(path_row)
-
         desc_row = Adw.EntryRow(title="Description")
         desc_row.set_text(proj.get("desc", ""))
         desc_row.connect("changed", lambda r: exp.set_subtitle(r.get_text()))
         exp.add_row(desc_row)
+
+        path_row = Adw.EntryRow(title="Project path")
+        path_row.set_text(proj.get("path", ""))
+        exp.add_row(path_row)
 
         build_row = Adw.EntryRow(title="Build directory")
         build_row.set_text(proj.get("build_dir", ""))
@@ -135,13 +138,19 @@ class SettingsDialog(Adw.Dialog):
         unity_row.set_selected(sel)
         exp.add_row(unity_row)
 
-        android_sw = Adw.SwitchRow(title="Android")
+        targets_row = Adw.ActionRow(title="Targets")
+        android_sw = Gtk.CheckButton(label="Android")
         android_sw.set_active("android" in proj.get("targets", []))
-        exp.add_row(android_sw)
-
-        ios_sw = Adw.SwitchRow(title="iOS")
+        ios_sw = Gtk.CheckButton(label="iOS")
         ios_sw.set_active("ios" in proj.get("targets", []))
-        exp.add_row(ios_sw)
+        targets_row.add_suffix(android_sw)
+        targets_row.add_suffix(ios_sw)
+        exp.add_row(targets_row)
+
+        hide_adb_sw = Adw.SwitchRow(title="Hide ADB during build",
+            subtitle="Saves ~2 min but may break some SDKs")
+        hide_adb_sw.set_active(proj.get("hide_adb", False))
+        exp.add_row(hide_adb_sw)
 
         # Upload section (nested expander)
         up = proj.get("upload", {})
@@ -175,7 +184,7 @@ class SettingsDialog(Adw.Dialog):
         remove_btn.add_css_class("error")
         entry = {"exp": exp, "name": name_row, "path": path_row,
                  "desc": desc_row, "build_dir": build_row,
-                 "android": android_sw, "ios": ios_sw,
+                 "android": android_sw, "ios": ios_sw, "hide_adb": hide_adb_sw,
                  "unity_combo": unity_row, "unity_versions": unity_versions,
                  "up_host": up_host, "up_user": up_user,
                  "up_dir": up_dir, "up_pattern": up_pattern,
@@ -190,6 +199,9 @@ class SettingsDialog(Adw.Dialog):
 
         self.proj_rows.append(entry)
         self.proj_grp.add(exp)
+        if self._expand_project and proj.get("name") == self._expand_project:
+            exp.set_expanded(True)
+            self._scroll_to = exp
 
     def _add_project(self, _):
         self._add_project_row()
@@ -220,6 +232,7 @@ class SettingsDialog(Adw.Dialog):
                 "targets": targets,
             }
             if unity_path: p["unity"] = unity_path
+            if r["hide_adb"].get_active(): p["hide_adb"] = True
             # Per-project upload
             up_host = r["up_host"].get_text().strip()
             if up_host:

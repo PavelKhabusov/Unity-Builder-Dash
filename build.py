@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unity Builder Dash — GTK4/Adwaita build tool for Unity projects."""
 
-import gi
+import gi, os, atexit, signal
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Gdk, Adw
@@ -9,6 +9,19 @@ from gi.repository import Gtk, Gdk, Adw
 from src.constants import APP_ID, ICONS_DIR
 from src.config import load_config
 from src.window import BuilderWindow
+
+
+def restore_adb():
+    """Restore adb if left disabled from interrupted build."""
+    cfg = load_config()
+    unity = cfg.get("unity", "")
+    if not unity: return
+    adb = os.path.join(os.path.dirname(unity),
+        "Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb")
+    hidden = adb + ".disabled"
+    if not os.path.exists(adb) and os.path.exists(hidden):
+        try: os.rename(hidden, adb)
+        except: pass
 
 
 def apply_theme(cfg):
@@ -44,4 +57,8 @@ class App(Adw.Application):
 
 
 if __name__ == "__main__":
+    atexit.register(restore_adb)
+    signal.signal(signal.SIGTERM, lambda *_: (restore_adb(), exit(0)))
+    signal.signal(signal.SIGINT, lambda *_: (restore_adb(), exit(0)))
+    restore_adb()  # restore on startup too
     App().run()

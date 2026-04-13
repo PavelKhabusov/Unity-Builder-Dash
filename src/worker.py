@@ -65,17 +65,22 @@ class BuildWorker:
         lock = os.path.join(path, "Temp", "UnityLockfile")
         if os.path.exists(lock): os.remove(lock)
 
-        # Temporarily hide Unity's adb to skip 2+ min device scan
+        # Hide Unity's adb to skip 2+ min device scan (only if project opts in)
         unity_adb = os.path.join(os.path.dirname(self.unity),
             "Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb")
         adb_hidden = unity_adb + ".disabled"
+        # Restore if left from interrupted build
+        if not os.path.exists(unity_adb) and os.path.exists(adb_hidden):
+            try: os.rename(adb_hidden, unity_adb)
+            except: pass
         adb_was_hidden = False
-        try:
-            if os.path.exists(unity_adb):
-                os.rename(unity_adb, adb_hidden)
-                adb_was_hidden = True
-        except: pass
-        # Also kill system adb
+        hide_adb = self.project.get("hide_adb", False)
+        if hide_adb:
+            try:
+                if os.path.exists(unity_adb):
+                    os.rename(unity_adb, adb_hidden)
+                    adb_was_hidden = True
+            except: pass
         try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
         except: pass
 
