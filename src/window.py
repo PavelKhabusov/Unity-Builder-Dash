@@ -477,7 +477,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Done" if ok else "Failed")
         self.progress_bar.set_fraction(1.0 if ok else 0)
         self.worker = None
-        self._build_cards()
+        # Delay rebuild to let Unity finish moving APK
+        GLib.timeout_add(2000, self._build_cards)
 
         if ok and self._build_queue:
             p, t = self._build_queue.pop(0)
@@ -534,7 +535,14 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     def _on_cancel(self, _):
         self._build_queue = []
-        if self.worker: self.worker.cancel()
+        if self.worker:
+            self.worker.cancel()
+            # Restore adb if it was hidden
+            self.worker._restore_adb()
+        self._set_building(False)
+        self.stage_label.set_text("Cancelled")
+        self.progress_bar.set_fraction(0)
+        self._log("\n  Cancelled by user.\n")
 
     def _on_settings(self, _, expand=None):
         dlg = SettingsDialog(self.cfg, self._apply_config, expand_project=expand)

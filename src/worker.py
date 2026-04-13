@@ -27,13 +27,23 @@ class BuildWorker:
     def cancel(self):
         self.cancelled = True
         if self.process:
-            try: os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            try: os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
             except ProcessLookupError: pass
 
     def elapsed_str(self):
         if not self.start_time: return ""
         m, s = divmod(int(time.time() - self.start_time), 60)
         return f"{m}:{s:02d}"
+
+    def _restore_adb(self):
+        unity_adb = os.path.join(os.path.dirname(self.unity),
+            "Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb")
+        adb_hidden = unity_adb + ".disabled"
+        if not os.path.exists(unity_adb) and os.path.exists(adb_hidden):
+            try: os.rename(adb_hidden, unity_adb)
+            except: pass
+        try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
+        except: pass
 
     def _save_log(self, lines):
         try:
@@ -134,14 +144,9 @@ class BuildWorker:
                     elif not self.cancelled:
                         GLib.idle_add(self.log_cb, f"\n  Failed {el}\n")
                         GLib.idle_add(self.done_cb, False)
-                    # Save log, restore adb, let Unity exit gracefully
                     self._save_log(full_log)
                     self.process.wait()
-                    if adb_was_hidden and os.path.exists(adb_hidden):
-                        try: os.rename(adb_hidden, unity_adb)
-                        except: pass
-                    try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
-                    except: pass
+                    self._restore_adb()
                     return
 
             self.process.wait()
@@ -149,13 +154,7 @@ class BuildWorker:
             GLib.idle_add(self.log_cb, f"\n  Error: {e}\n")
         finally:
             self._save_log(full_log)
-            # Restore adb
-            if adb_was_hidden and os.path.exists(adb_hidden):
-                try: os.rename(adb_hidden, unity_adb)
-                except: pass
-            # Restart adb server for deploy
-            try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
-            except: pass
+            self._restore_adb()
 
         el = self.elapsed_str()
         success = build_ok and not build_failed and not self.cancelled
