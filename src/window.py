@@ -4,9 +4,10 @@ from gi.repository import Gtk, Adw, GLib, Gio
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
-                     get_unity_for_project, scan_project, upload_apk)
+                     get_unity_for_project, upload_apk)
 from .worker import BuildWorker
 from .settings_dialog import SettingsDialog
+from .dialogs import show_history, show_scan
 
 
 class BuilderWindow(Adw.ApplicationWindow):
@@ -111,7 +112,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.log_buffer = Gtk.TextBuffer()
         self.log_view = Gtk.TextView(buffer=self.log_buffer, editable=False,
                                      cursor_visible=False, monospace=True)
-        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.NONE)
         self.log_view.set_top_margin(6)
         self.log_view.set_bottom_margin(6)
         self.log_view.set_left_margin(8)
@@ -124,6 +125,12 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("search-changed", self._on_log_search)
         search_box.append(self.search_entry)
+
+        wrap_toggle = Gtk.ToggleButton(icon_name="format-justify-left-symbolic",
+                                       tooltip_text="Word wrap", active=False)
+        wrap_toggle.connect("toggled", lambda b: self.log_view.set_wrap_mode(
+            Gtk.WrapMode.WORD_CHAR if b.get_active() else Gtk.WrapMode.NONE))
+        search_box.append(wrap_toggle)
         lbox.append(search_box)
 
         self.log_scroll = Gtk.ScrolledWindow(vexpand=True)
@@ -237,27 +244,28 @@ class BuilderWindow(Adw.ApplicationWindow):
             actions.append(deploy)
             buttons.append(deploy)
 
-        # Upload button (per-project)
-        has_upload = proj.get("upload", {}).get("host") or self.cfg.get("upload", {}).get("host")
-        if has_upload and "android" in proj.get("targets", []):
-            upload_btn = Gtk.Button(icon_name="go-up-symbolic",
-                                   tooltip_text="Upload APK to server", css_classes=["flat"])
-            upload_btn.connect("clicked", lambda _, p=proj: self._on_upload(p))
-            upload_btn.set_sensitive(find_apk(proj) is not None)
-            actions.append(upload_btn)
-            buttons.append(upload_btn)
+        # Health check icon
+        scan_btn = Gtk.Button(icon_name="security-medium-symbolic",
+                              tooltip_text="Health check", css_classes=["flat"])
+        scan_btn.connect("clicked", lambda _, p=proj: self._on_scan(p))
+        actions.append(scan_btn)
 
         # Context menu (three dots)
         menu = Gio.Menu()
         proj_id = proj["name"].replace(" ", "_")
+
+        has_upload = proj.get("upload", {}).get("host") or self.cfg.get("upload", {}).get("host")
+        if has_upload:
+            menu.append("Upload to Server", f"win.upload-{proj_id}")
+
         menu.append("Open in Unity", f"win.open-unity-{proj_id}")
-        menu.append("Health Check", f"win.scan-{proj_id}")
         menu.append("Open Build Folder", f"win.folder-{proj_id}")
         menu.append("Open Project Folder", f"win.proj-folder-{proj_id}")
         menu.append("Edit in Settings", f"win.edit-{proj_id}")
 
         # Register actions
-        for action_name, callback in [
+        action_list = [
+            (f"upload-{proj_id}", lambda *_, p=proj: self._on_upload(p)),
             (f"open-unity-{proj_id}", lambda *_, p=proj: self._open_in_unity(p)),
             (f"scan-{proj_id}", lambda *_, p=proj: self._on_scan(p)),
             (f"folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
@@ -265,7 +273,8 @@ class BuilderWindow(Adw.ApplicationWindow):
             (f"proj-folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
                 ["xdg-open", p["path"]])),
             (f"edit-{proj_id}", lambda *_, p=proj: self._on_settings(None)),
-        ]:
+        ]
+        for action_name, callback in action_list:
             action = Gio.SimpleAction.new(action_name, None)
             action.connect("activate", callback)
             self.add_action(action)
@@ -323,48 +332,47 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.log_buffer.create_tag("stage", foreground="#62a0ea", weight=700)
         self.log_buffer.create_tag("hidden", invisible=True)
 
-    def _log(self, t):
-        end = self.log_buffer.get_end_iter()
-        tag = None
-        s = t.strip()
-        if "error" in s.lower() or "FAILED" in s:
-            tag = "error"
-        elif "warning" in s.lower():
-            tag = "warning"
-        elif "Done!" in s or "[Build] OK" in s:
-            tag = "success"
-        elif s.startswith("[Stage]") or any(s.startswith(p[1] or "") for p in STAGE_PATTERNS if p[1]):
-            tag = "stage"
+    def _get_tag(self, s):
+        s = s.strip()
+        if "error" in s.lower() or "FAILED" in s: return "error"
+        if "warning" in s.lower(): return "warning"
+        if "Done!" in s or "[Build] OK" in s: return "success"
+        if s.startswith("[Stage]") or any(s.startswith(p[1] or "") for p in STAGE_PATTERNS if p[1]): return "stage"
+        return None
 
+    def _insert_tagged(self, text, scroll=True):
+        end = self.log_buffer.get_end_iter()
+        tag = self._get_tag(text)
         if tag:
-            self.log_buffer.insert_with_tags_by_name(end, t, tag)
+            self.log_buffer.insert_with_tags_by_name(end, text, tag)
         else:
-            self.log_buffer.insert(end, t)
-        mk = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
-        self.log_view.scroll_mark_onscreen(mk)
-        self.log_buffer.delete_mark(mk)
+            self.log_buffer.insert(end, text)
+        if scroll:
+            mk = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
+            self.log_view.scroll_mark_onscreen(mk)
+            self.log_buffer.delete_mark(mk)
+
+    def _log(self, t):
+        if not hasattr(self, '_full_log_text'): self._full_log_text = ""
+        self._full_log_text += t
+        self._insert_tagged(t)
+
+    def _rebuild_log(self, text):
+        """Rebuild log buffer with syntax highlighting."""
+        self.log_buffer.set_text("")
+        for line in text.splitlines(keepends=True):
+            self._insert_tagged(line, scroll=False)
 
     def _on_log_search(self, entry):
-        """Simple log filter — hides non-matching lines."""
         query = entry.get_text().lower().strip()
         if not query:
-            # Show all
-            self.log_buffer.remove_tag_by_name("hidden",
-                self.log_buffer.get_start_iter(), self.log_buffer.get_end_iter())
+            if hasattr(self, '_full_log_text') and self._full_log_text:
+                self._rebuild_log(self._full_log_text)
             return
-        start = self.log_buffer.get_start_iter()
-        end = self.log_buffer.get_end_iter()
-        self.log_buffer.apply_tag_by_name("hidden", start, end)
-        # Show matching lines
-        it = start.copy()
-        while True:
-            line_end = it.copy()
-            line_end.forward_to_line_end()
-            text = self.log_buffer.get_text(it, line_end, False)
-            if query in text.lower():
-                self.log_buffer.remove_tag_by_name("hidden", it, line_end)
-            if not it.forward_line():
-                break
+        source = getattr(self, '_full_log_text', '') or self.log_buffer.get_text(
+            self.log_buffer.get_start_iter(), self.log_buffer.get_end_iter(), False)
+        filtered = "\n".join(l for l in source.splitlines() if query in l.lower())
+        self._rebuild_log(filtered)
 
     def _scroll_to_bottom(self, *_):
         adj = self.log_scroll.get_vadjustment()
@@ -394,6 +402,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             self._log("Unity editor not found. Check Settings.\n")
             return
         self.log_buffer.set_text("")
+        self._full_log_text = ""
         self._set_building(True)
         now = datetime.datetime.now().strftime("%H:%M:%S")
         info = TARGET_INFO[target_key]
@@ -489,71 +498,10 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._log(f"Opening {proj['name']} in Unity...\n")
 
     def _on_scan(self, proj):
-        issues, ok_items = scan_project(proj["path"])
-        dlg = Adw.Dialog()
-        dlg.set_title(f"{proj['name']} — Health Check")
-        dlg.set_content_width(420)
-        dlg.set_content_height(400)
-
-        tb = Adw.ToolbarView()
-        tb.add_top_bar(Adw.HeaderBar())
-        page = Adw.PreferencesPage()
-
-        if ok_items:
-            grp = Adw.PreferencesGroup(title="OK")
-            for text in ok_items:
-                row = Adw.ActionRow(title=text)
-                row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
-                grp.add(row)
-            page.add(grp)
-
-        if issues:
-            grp = Adw.PreferencesGroup(title="Issues")
-            icons = {"error": "dialog-error-symbolic", "warn": "dialog-warning-symbolic",
-                     "info": "dialog-information-symbolic"}
-            for sev, text in issues:
-                row = Adw.ActionRow(title=text)
-                row.add_prefix(Gtk.Image.new_from_icon_name(icons.get(sev, "dialog-information-symbolic")))
-                grp.add(row)
-            page.add(grp)
-
-        if not issues and not ok_items:
-            page.add(Adw.StatusPage(title="Nothing to report"))
-
-        tb.set_content(page)
-        dlg.set_child(tb)
-        dlg.present(self)
+        show_scan(self, proj)
 
     def _on_history(self, _):
-        builds = load_builds_log()
-        dlg = Adw.Dialog()
-        dlg.set_title("Build History")
-        dlg.set_content_width(500)
-        dlg.set_content_height(500)
-
-        tb = Adw.ToolbarView()
-        tb.add_top_bar(Adw.HeaderBar())
-        page = Adw.PreferencesPage()
-
-        if not builds:
-            page.add(Adw.StatusPage(title="No builds yet"))
-        else:
-            grp = Adw.PreferencesGroup(title=f"Last {min(len(builds), 20)} builds")
-            for b in reversed(builds[-20:]):
-                icon = "object-select-symbolic" if b.get("success") else "dialog-error-symbolic"
-                size = f"  {b['apk_size_mb']} MB" if b.get("apk_size_mb") else ""
-                dm, ds = divmod(b.get("duration", 0), 60)
-                row = Adw.ActionRow(
-                    title=f"{b['project']} — {b.get('target', '?')}",
-                    subtitle=f"{b.get('date', '?')}  {dm}:{ds:02d}{size}  build {b.get('build', '?')}"
-                )
-                row.add_prefix(Gtk.Image.new_from_icon_name(icon))
-                grp.add(row)
-            page.add(grp)
-
-        tb.set_content(page)
-        dlg.set_child(tb)
-        dlg.present(self)
+        show_history(self)
 
     def _on_cancel(self, _):
         self._build_queue = []
