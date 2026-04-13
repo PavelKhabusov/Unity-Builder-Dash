@@ -118,13 +118,19 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.log_view.set_left_margin(8)
         self.log_view.set_right_margin(8)
 
-        # Search bar for log
+        # Search + level filter bar
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         search_box.set_margin_bottom(4)
         self.search_entry = Gtk.SearchEntry(placeholder_text="Filter log...")
         self.search_entry.set_hexpand(True)
-        self.search_entry.connect("search-changed", self._on_log_search)
+        self.search_entry.connect("search-changed", self._on_log_filter)
         search_box.append(self.search_entry)
+
+        self.level_filter = Gtk.DropDown.new_from_strings(
+            ["All", "Errors", "Warnings", "Stages"])
+        self.level_filter.set_selected(0)
+        self.level_filter.connect("notify::selected", lambda *_: self._on_log_filter())
+        search_box.append(self.level_filter)
 
         wrap_toggle = Gtk.ToggleButton(icon_name="format-justify-left-symbolic",
                                        tooltip_text="Word wrap", active=False)
@@ -334,8 +340,9 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     def _get_tag(self, s):
         s = s.strip()
-        if "error" in s.lower() or "FAILED" in s: return "error"
-        if "warning" in s.lower(): return "warning"
+        sl = s.lower()
+        if "error" in sl or "FAILED" in s or "unable" in sl or "exception" in sl: return "error"
+        if "warning" in sl or "please" in sl: return "warning"
         if "Done!" in s or "[Build] OK" in s: return "success"
         if s.startswith("[Stage]") or any(s.startswith(p[1] or "") for p in STAGE_PATTERNS if p[1]): return "stage"
         return None
@@ -355,6 +362,14 @@ class BuilderWindow(Adw.ApplicationWindow):
     def _log(self, t):
         if not hasattr(self, '_full_log_text'): self._full_log_text = ""
         self._full_log_text += t
+        # Check if line passes current filter
+        query = self.search_entry.get_text().lower().strip()
+        level = self.level_filter.get_selected()
+        tag = self._get_tag(t)
+        if level == 1 and tag != "error": return
+        if level == 2 and tag not in ("error", "warning"): return
+        if level == 3 and tag != "stage": return
+        if query and query not in t.lower(): return
         self._insert_tagged(t)
 
     def _rebuild_log(self, text):
@@ -363,17 +378,30 @@ class BuilderWindow(Adw.ApplicationWindow):
         for line in text.splitlines(keepends=True):
             self._insert_tagged(line, scroll=False)
 
-    def _on_log_search(self, entry):
-        query = entry.get_text().lower().strip()
-        if not query:
+    def _on_log_filter(self, *_):
+        query = self.search_entry.get_text().lower().strip()
+        level = self.level_filter.get_selected()  # 0=All, 1=Errors, 2=Warnings, 3=Stages
+
+        if not query and level == 0:
             if hasattr(self, '_full_log_text') and self._full_log_text:
                 self._rebuild_log(self._full_log_text)
             self._scroll_to_bottom()
             return
+
         source = getattr(self, '_full_log_text', '') or self.log_buffer.get_text(
             self.log_buffer.get_start_iter(), self.log_buffer.get_end_iter(), False)
-        filtered = "\n".join(l for l in source.splitlines() if query in l.lower())
-        self._rebuild_log(filtered)
+
+        lines = source.splitlines()
+        if level == 1:
+            lines = [l for l in lines if self._get_tag(l) == "error"]
+        elif level == 2:
+            lines = [l for l in lines if self._get_tag(l) in ("error", "warning")]
+        elif level == 3:
+            lines = [l for l in lines if self._get_tag(l) == "stage"]
+        if query:
+            lines = [l for l in lines if query in l.lower()]
+
+        self._rebuild_log("\n".join(lines))
 
     def _scroll_to_bottom(self, *_):
         adj = self.log_scroll.get_vadjustment()
