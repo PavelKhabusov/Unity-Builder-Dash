@@ -33,8 +33,13 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.cancel_btn.set_sensitive(False)
         self.cancel_btn.connect("clicked", self._on_cancel)
 
+        self.increment_toggle = Gtk.ToggleButton(icon_name="list-add-symbolic",
+                                                   tooltip_text="Auto-increment build version")
+        self.increment_toggle.set_active(cfg.get("auto_increment", False))
+
         header.pack_start(build_all)
         header.pack_start(self.cancel_btn)
+        header.pack_start(self.increment_toggle)
 
         # Header right
         self.spinner = Gtk.Spinner()
@@ -121,10 +126,24 @@ class BuilderWindow(Adw.ApplicationWindow):
         search_box.append(self.search_entry)
         lbox.append(search_box)
 
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        scroll.set_child(self.log_view)
-        scroll.add_css_class("card")
-        lbox.append(scroll)
+        self.log_scroll = Gtk.ScrolledWindow(vexpand=True)
+        self.log_scroll.set_child(self.log_view)
+        self.log_scroll.add_css_class("card")
+
+        # Overlay with scroll-down button
+        overlay = Gtk.Overlay()
+        overlay.set_child(self.log_scroll)
+        scroll_btn = Gtk.Button(icon_name="go-bottom-symbolic",
+                                tooltip_text="Scroll to bottom",
+                                css_classes=["circular", "osd"],
+                                halign=Gtk.Align.END, valign=Gtk.Align.END)
+        scroll_btn.set_margin_end(12)
+        scroll_btn.set_margin_bottom(12)
+        scroll_btn.connect("clicked", self._scroll_to_bottom)
+        overlay.add_overlay(scroll_btn)
+        overlay.set_vexpand(True)
+
+        lbox.append(overlay)
         content.append(lbox)
 
         self._setup_log_tags()
@@ -344,6 +363,10 @@ class BuilderWindow(Adw.ApplicationWindow):
             if not it.forward_line():
                 break
 
+    def _scroll_to_bottom(self, *_):
+        adj = self.log_scroll.get_vadjustment()
+        adj.set_value(adj.get_upper())
+
     def _on_stage(self, text, frac):
         if text: self.stage_label.set_text(text)
         if frac >= 0: self.progress_bar.set_fraction(frac)
@@ -376,7 +399,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.progress_bar.set_fraction(0)
         self.stage_label.set_text("Starting Unity...")
         self.worker = BuildWorker(self.cfg, proj, target_key,
-                                  self._log, self._on_done, self._on_stage)
+                                  self._log, self._on_done, self._on_stage,
+                                  auto_increment=self.increment_toggle.get_active())
         self.worker.start()
 
     def _on_done(self, ok):

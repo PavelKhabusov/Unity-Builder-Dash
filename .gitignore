@@ -1,4 +1,5 @@
 config.json
 build_history.json
 builds_log.json
+logs/
 __pycache__/
