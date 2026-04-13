@@ -8,19 +8,25 @@ A native GNOME (GTK4 + Libadwaita) desktop application for building and deployin
 
 ## Features
 
-- Build multiple Unity projects (Android APK, iOS Xcode) with one click
+- **Build** multiple Unity projects (Android APK, iOS Xcode) with one click
 - **Build All** — sequential builds across all configured projects
-- **Project Health Check** — scan projects without opening Unity: version, Cloud ID, build scenes, compilation errors, git status
+- **Build History** — interactive chart (duration + APK size), filterable by project, with log viewer
+- **Project Health Check** — version, Cloud ID, build scenes, compilation errors, git status
 - **Deploy to device** via [APK Dash](https://github.com/PavelKhabusov/APK-Dash) integration
-- **Build progress** — real-time log with colored output (errors, warnings, stages), progress bar, ETA based on previous builds
-- **Dynamic config** — add/remove projects, auto-detect Unity editor and APK Dash paths
-- Automatic lockfile cleanup, build folder management
-- Native GNOME look & feel with dark theme support
+- **Upload to server** — FTP upload with per-project host, directory, and rename pattern
+- **Build progress** — real-time log with colored output, progress bar, ETA based on previous builds
+- **Log search & filter** — find text in build output, toggle word wrap
+- **Per-project settings** — Unity version override, custom build directory, hide ADB for faster builds
+- **Theme** — System / Dark / Light with live preview in settings
+- **Auto-increment toggle** — build with or without version bump
+- **Open in Unity** — launch editor from context menu
+- **Desktop notifications** — get notified when build completes
+- **GNOME native** — Adwaita widgets, dark theme, .desktop launcher
 
 ## Requirements
 
 - Python 3.10+
-- GTK4 and Libadwaita (`python3-gi`, `gir1.2-adw-1`)
+- GTK4 and Libadwaita
 - Unity Editor with Android/iOS build support
 - [APK Dash](https://github.com/PavelKhabusov/APK-Dash) (optional, for device deployment)
 
@@ -45,7 +51,6 @@ cd Unity-Builder-Dash
 2. Copy and edit the config:
 ```bash
 cp config.example.json config.json
-# Edit config.json with your Unity path and projects
 ```
 
 3. Run:
@@ -53,14 +58,15 @@ cp config.example.json config.json
 ./build.py
 ```
 
-On first launch with no config, the Settings dialog opens automatically with auto-detection of Unity Editor path.
+On first launch with no config, Settings opens automatically with auto-detection of Unity Editor path.
 
 ## Unity BuildScript
 
-The app calls `BuildScript.BuildAndroid` or `BuildScript.BuildiOS` via Unity's `-executeMethod`. Place this script in `Assets/Editor/BuildScript.cs` of each project:
+Place this in `Assets/Editor/BuildScript.cs` of each project:
 
 ```csharp
 using UnityEditor;
+using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
 using System.Linq;
 
@@ -79,24 +85,28 @@ public static class BuildScript {
 
         var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions {
             scenes = GetScenes(),
-            locationPathName = "Builds/MyApp.apk",
+            locationPathName = "Builds/MyApp",
             target = BuildTarget.Android,
             options = BuildOptions.None
         });
 
-        if (report.summary.result != BuildResult.Succeeded)
+        if (report.summary.result == BuildResult.Succeeded)
+            UnityEngine.Debug.Log("[Build] OK");
+        else {
+            UnityEngine.Debug.LogError("[Build] FAILED");
             EditorApplication.Exit(1);
+        }
     }
 
-    [MenuItem("Build/iOS Xcode")]
-    public static void BuildiOS() {
+    // Without version increment (called when toggle is off)
+    public static void BuildAndroidNoIncrement() {
+        EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
         var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions {
             scenes = GetScenes(),
-            locationPathName = "Builds/iOS",
-            target = BuildTarget.iOS,
+            locationPathName = "Builds/MyApp",
+            target = BuildTarget.Android,
             options = BuildOptions.None
         });
-
         if (report.summary.result != BuildResult.Succeeded)
             EditorApplication.Exit(1);
     }
@@ -116,30 +126,44 @@ cp unity-builder-dash.desktop ~/.local/share/applications/
 
 | Field | Description |
 |-------|-------------|
-| `unity` | Path to Unity Editor binary |
+| `unity` | Path to Unity Editor binary (default) |
 | `apk_dash` | Path to APK Dash script (optional) |
+| `theme` | `"system"`, `"dark"`, or `"light"` |
 | `projects[].name` | Display name |
 | `projects[].path` | Unity project root |
 | `projects[].desc` | Short description |
 | `projects[].build_dir` | Output folder for builds |
 | `projects[].targets` | Array: `"android"`, `"ios"` |
+| `projects[].unity` | Per-project Unity Editor override (optional) |
+| `projects[].hide_adb` | Hide ADB during build to skip device scan (~2 min faster) |
+| `projects[].upload.host` | FTP host for upload |
+| `projects[].upload.user` | FTP username |
+| `projects[].upload.password` | FTP password (optional) |
+| `projects[].upload.remote_dir` | Remote directory |
+| `projects[].upload.rename_pattern` | Rename pattern, e.g. `{name}_mq3_{build}.apk` |
 
 ## Project structure
 
 ```
 unity-builder-dash/
-  build.py                  — Entry point
-  config.json               — User config (gitignored)
-  config.example.json       — Config template
-  build_history.json        — Build duration history for ETA (gitignored)
-  unity-builder-dash.desktop — GNOME desktop entry
+  build.py                    — Entry point, theme, adb safety
+  config.json                 — User config (gitignored)
+  config.example.json         — Config template
+  build_history.json          — ETA history (gitignored)
+  builds_log.json             — Full build log entries (gitignored)
+  unity-builder-dash.desktop  — GNOME desktop entry
+  icons/
+    ubd-android-symbolic.svg  — Android build icon
+    ubd-apple-symbolic.svg    — iOS build icon
+  logs/                       — Unity build logs (gitignored)
   src/
-    __init__.py             — GTK/Adw version requirements
-    constants.py            — App metadata, target info, log patterns
-    config.py               — Config/history I/O, project scanner, auto-detect
-    worker.py               — BuildWorker — runs Unity in a background thread
-    settings_dialog.py      — Settings UI — edit paths, manage projects
-    window.py               — Main window — cards, log, progress, actions
+    __init__.py               — GTK/Adw version requirements
+    constants.py              — App metadata, target info, log patterns
+    config.py                 — Config/history I/O, project scanner, upload, auto-detect
+    worker.py                 — BuildWorker — runs Unity in a background thread
+    settings_dialog.py        — Settings UI — projects, paths, upload, theme
+    dialogs.py                — History dialog with chart, health check dialog
+    window.py                 — Main window — project rows, log, progress, actions
 ```
 
 ## License
