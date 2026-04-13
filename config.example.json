@@ -1,0 +1,20 @@
+{
+  "unity": "/path/to/Unity/Hub/Editor/6000.x.x/Editor/Unity",
+  "apk_dash": "/path/to/APK Dash",
+  "projects": [
+    {
+      "name": "MyProject",
+      "path": "/path/to/MyProject",
+      "desc": "Android VR app",
+      "build_dir": "/path/to/MyProject/Builds",
+      "targets": ["android"]
+    },
+    {
+      "name": "MyMobileProject",
+      "path": "/path/to/MyMobileProject",
+      "desc": "iOS and Android",
+      "build_dir": "/path/to/MyMobileProject/Builds",
+      "targets": ["android", "ios"]
+    }
+  ]
+}
