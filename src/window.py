@@ -202,6 +202,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         if proj_builds:
             last = proj_builds[-1]
             dm, ds = divmod(last.get("duration", 0), 60)
+            ok = last.get("success", False)
+            icon = "object-select-symbolic" if ok else "dialog-error-symbolic"
+            sub.append(Gtk.Image.new_from_icon_name(icon))
             sub.append(Gtk.Label(
                 label=f"{last.get('date', '')}  {dm}:{ds:02d}",
                 css_classes=["dim-label", "caption"]))
@@ -436,6 +439,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Done" if ok else "Failed")
         self.progress_bar.set_fraction(1.0 if ok else 0)
         self.worker = None
+        self._build_cards()
 
         if ok and self._build_queue:
             p, t = self._build_queue.pop(0)
@@ -499,7 +503,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             grp = Adw.PreferencesGroup(title="OK")
             for text in ok_items:
                 row = Adw.ActionRow(title=text)
-                row.add_prefix(Gtk.Image.new_from_icon_name("emblem-ok-symbolic"))
+                row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
                 grp.add(row)
             page.add(grp)
 
@@ -536,7 +540,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         else:
             grp = Adw.PreferencesGroup(title=f"Last {min(len(builds), 20)} builds")
             for b in reversed(builds[-20:]):
-                icon = "emblem-ok-symbolic" if b.get("success") else "dialog-error-symbolic"
+                icon = "object-select-symbolic" if b.get("success") else "dialog-error-symbolic"
                 size = f"  {b['apk_size_mb']} MB" if b.get("apk_size_mb") else ""
                 dm, ds = divmod(b.get("duration", 0), 60)
                 row = Adw.ActionRow(

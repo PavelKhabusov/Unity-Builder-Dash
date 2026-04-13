@@ -65,7 +65,17 @@ class BuildWorker:
         lock = os.path.join(path, "Temp", "UnityLockfile")
         if os.path.exists(lock): os.remove(lock)
 
-        # Kill system ADB before Unity starts — prevents "Multiple ADB server instances" conflict
+        # Temporarily hide Unity's adb to skip 2+ min device scan
+        unity_adb = os.path.join(os.path.dirname(self.unity),
+            "Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb")
+        adb_hidden = unity_adb + ".disabled"
+        adb_was_hidden = False
+        try:
+            if os.path.exists(unity_adb):
+                os.rename(unity_adb, adb_hidden)
+                adb_was_hidden = True
+        except: pass
+        # Also kill system adb
         try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
         except: pass
 
@@ -119,9 +129,14 @@ class BuildWorker:
                     elif not self.cancelled:
                         GLib.idle_add(self.log_cb, f"\n  Failed {el}\n")
                         GLib.idle_add(self.done_cb, False)
-                    # Save log and let Unity exit gracefully
+                    # Save log, restore adb, let Unity exit gracefully
                     self._save_log(full_log)
                     self.process.wait()
+                    if adb_was_hidden and os.path.exists(adb_hidden):
+                        try: os.rename(adb_hidden, unity_adb)
+                        except: pass
+                    try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
+                    except: pass
                     return
 
             self.process.wait()
@@ -129,6 +144,13 @@ class BuildWorker:
             GLib.idle_add(self.log_cb, f"\n  Error: {e}\n")
         finally:
             self._save_log(full_log)
+            # Restore adb
+            if adb_was_hidden and os.path.exists(adb_hidden):
+                try: os.rename(adb_hidden, unity_adb)
+                except: pass
+            # Restart adb server for deploy
+            try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
+            except: pass
 
         el = self.elapsed_str()
         success = build_ok and not build_failed and not self.cancelled
