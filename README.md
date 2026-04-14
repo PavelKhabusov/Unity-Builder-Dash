@@ -1,4 +1,4 @@
-<img src="icons/ubd-app-icon.png" width="32" align="left" style="margin-right: 8px;" />
+<img src="icons/ubd-app-icon.png" width="64" align="left" style="margin-right: 8px;" />
 
 # Unity Builder Dash
 
