@@ -24,22 +24,22 @@ SKIP_PATTERNS = [
 ]
 
 STAGE_PATTERNS = [
-    ("Begin MonoManager ReloadAssembly", "Compiling scripts..."),
-    ("- Completed reload", "Scripts compiled"),
+    ("Begin MonoManager ReloadAssembly", "(1/7) Compiling scripts..."),
+    ("- Completed reload",              "(1/7) Scripts compiled"),
     ("[Stage]", None),
-    ("Start importing Assets", "Importing assets..."),
-    ("Refresh completed", "Import done"),
-    ("Building scenes", "Building scenes..."),
-    ("Packaging assets", "Packaging..."),
-    ("Packing APK", "Packing APK..."),
-    ("Building Gradle project", "Gradle build..."),
-    ("Moving file", "Finalizing..."),
-    ("[Build] OK", "Build complete!"),
-    ("[Build] FAILED", "Build failed!"),
-    ("Compiling shader", "Compiling shaders..."),
-    ("Stripping", "Stripping code..."),
-    ("BuildPlayer", "Build pipeline..."),
-    ("Exporting project", "Exporting Xcode..."),
+    ("Start importing Assets",          "(2/7) Importing assets..."),
+    ("Refresh completed",               "(2/7) Import done"),
+    ("Compiling shader",                "(3/7) Compiling shaders..."),
+    ("Stripping",                       "(4/7) Stripping code..."),
+    ("BuildPlayer",                     "(4/7) Build pipeline..."),
+    ("Building scenes",                 "(5/7) Building scenes..."),
+    ("Packaging assets",                "(5/7) Packaging..."),
+    ("Building Gradle project",         "(6/7) Gradle build..."),
+    ("Packing APK",                     "(6/7) Packing APK..."),
+    ("Exporting project",               "(6/7) Exporting Xcode..."),
+    ("Moving file",                     "(7/7) Finalizing..."),
+    ("[Build] OK",                      "(7/7) Build complete!"),
+    ("[Build] FAILED",                  "Build failed!"),
 ]
 
 PROGRESS_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
