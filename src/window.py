@@ -264,6 +264,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         if has_upload:
             menu.append("Upload to Server", f"win.upload-{proj_id}")
 
+        if "android" in proj.get("targets", []):
+            menu.append("Push APK to Device", f"win.push-{proj_id}")
+
         menu.append("Open in Unity", f"win.open-unity-{proj_id}")
         menu.append("Open Build Folder", f"win.folder-{proj_id}")
         menu.append("Open Project Folder", f"win.proj-folder-{proj_id}")
@@ -272,6 +275,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         # Register actions
         action_list = [
             (f"upload-{proj_id}", lambda *_, p=proj: self._on_upload(p)),
+            (f"push-{proj_id}", lambda *_, p=proj: self._on_push_to_device(p)),
             (f"open-unity-{proj_id}", lambda *_, p=proj: self._open_in_unity(p)),
             (f"scan-{proj_id}", lambda *_, p=proj: self._on_scan(p)),
             (f"folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
@@ -498,6 +502,30 @@ class BuilderWindow(Adw.ApplicationWindow):
                          stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
+
+    def _on_push_to_device(self, proj):
+        apk = find_apk(proj)
+        if not apk:
+            self._log("No APK found.\n")
+            return
+        self._log(f"Pushing {os.path.basename(apk)} to device /sdcard/Download/...\n")
+        self.stage_label.set_text("Pushing to device...")
+        self.progress_bar.pulse()
+        def do_push():
+            try:
+                r = subprocess.run(
+                    ["adb", "push", apk, f"/sdcard/Download/{os.path.basename(apk)}"],
+                    capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    GLib.idle_add(self._log, f"Pushed to /sdcard/Download/\n")
+                    GLib.idle_add(self.stage_label.set_text, "Push complete")
+                else:
+                    GLib.idle_add(self._log, f"Push failed: {r.stderr.strip()}\n")
+                    GLib.idle_add(self.stage_label.set_text, "Push failed")
+            except Exception as e:
+                GLib.idle_add(self._log, f"Push error: {e}\n")
+            GLib.idle_add(self.progress_bar.set_fraction, 0)
+        threading.Thread(target=do_push, daemon=True).start()
 
     def _on_upload(self, proj):
         apk = find_apk(proj)
