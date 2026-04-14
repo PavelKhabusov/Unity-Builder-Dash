@@ -9,6 +9,7 @@ from gi.repository import Gtk, Gdk, Adw
 from src.constants import APP_ID, ICONS_DIR
 from src.config import load_config
 from src.window import BuilderWindow
+from src.settings_page import SettingsPage
 
 
 def restore_adb():
@@ -51,7 +52,7 @@ class App(Adw.Application):
             orig = self.win._apply_config
             def on_config(c):
                 orig(c)
-                apply_theme(c)
+                SettingsPage._apply_theme(c.get("theme", "system"))
             self.win._apply_config = on_config
         self.win.present()
 

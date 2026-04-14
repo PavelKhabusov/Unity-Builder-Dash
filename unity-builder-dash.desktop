@@ -1,8 +1,9 @@
 [Desktop Entry]
 Name=Unity Builder Dash
 Comment=Build and deploy Unity projects
-Exec=/home/pavel/DEV/unity-builder-dash/build.py
+Exec=python3 /home/pavel/DEV/unity-builder-dash/build.py
+Path=/home/pavel/DEV/unity-builder-dash
 Type=Application
 Categories=Development;
 StartupWMClass=com.PavelKhabusov.UnityBuilderDash
-Icon=package-x-generic
+Icon=/home/pavel/DEV/unity-builder-dash/icons/ubd-app-icon.png

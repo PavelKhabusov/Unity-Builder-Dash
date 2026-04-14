@@ -1,43 +1,81 @@
+<img src="icons/ubd-app-icon.png" width="32" align="left" style="margin-right: 8px;" />
+
 # Unity Builder Dash
 
 ![Python](https://img.shields.io/badge/Python-3-3776AB?logo=python&logoColor=white)
 ![GTK4](https://img.shields.io/badge/GTK4-Libadwaita-4A86CF?logo=gnome&logoColor=white)
 ![Unity](https://img.shields.io/badge/Unity-6+-000000?logo=unity&logoColor=white)
 
-A native GNOME (GTK4 + Libadwaita) desktop application for building and deploying Unity projects from the command line, without opening the Unity Editor.
+A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, profiling and managing Unity projects and Android devices.
 
 ## Features
 
+### Projects
 - **Build** multiple Unity projects (Android APK, iOS Xcode) with one click
 - **Build All** — sequential builds across all configured projects
-- **Build History** — interactive chart (duration + APK size), filterable by project, with log viewer
-- **Project Health Check** — version, Cloud ID, build scenes, compilation errors, git status
-- **Deploy to device** via [APK Dash](https://github.com/PavelKhabusov/APK-Dash) integration
-- **Upload to server** — FTP upload with per-project host, directory, and rename pattern
-- **Build progress** — real-time log with colored output, progress bar, ETA based on previous builds
-- **Log search & filter** — find text in build output, toggle word wrap
-- **Per-project settings** — Unity version override, custom build directory, hide ADB for faster builds
-- **Theme** — System / Dark / Light with live preview in settings
+- **Real-time build log** — colored output with search, level filter (Errors/Warnings/Stages), word wrap
+- **Progress bar** with ETA based on previous builds
 - **Auto-increment toggle** — build with or without version bump
-- **Open in Unity** — launch editor from context menu
-- **Desktop notifications** — get notified when build completes
-- **GNOME native** — Adwaita widgets, dark theme, .desktop launcher
+- **Upload to server** — FTP upload with per-project host, directory, and rename pattern
+- **Deploy to device** via [APK Dash](https://github.com/PavelKhabusov/APK-Dash) integration
+- **Desktop notifications** on build completion
+
+### Devices
+- **Device manager** — list connected USB/WiFi devices via ADB
+- **Wireless connect/disconnect** by IP
+- **App management** — list installed third-party apps with version, install/update date
+  - Force stop, clear data, uninstall with confirmation
+  - Manage runtime permissions (grant/revoke with switches)
+  - Open profiler for specific app
+  - Search/filter apps
+- **Install APK / Push file** to device
+- **Screenshot** — capture and open
+- **Inline logcat** — real-time log viewer with app filter, level filter, search, pause
+- **Shell** — open terminal with `adb shell`
+- **Files** — open native file manager (MTP)
+- **WiFi / Airplane mode** toggle
+- **Restart ADB / Kill MTP** conflicts
+
+### History
+- **Build history** — interactive chart (duration + APK size over time)
+- **Filters** — by project, success only, chart mode (duration/size/both), X axis (build #/time)
+- **Log viewer** — open build log files
+
+### Profiler
+- **Real-time performance monitoring** with live charts
+- **Metrics:** FPS, Frame Time, GPU %, RAM (PSS), CPU %, Temperature
+- **Meta Quest support** — VrApi logcat stream for GPU/CPU level, stale frames, FFR, DSF, App GPU time, SoC temp
+- **Device + app selection** with auto-detection of running apps
+- **Battery** level and temperature in status bar
+
+### Settings
+- Per-project Unity version override, custom build directory
+- Hide ADB during build (~2 min faster)
+- Upload config per project (FTP host, user, password, rename pattern)
+- Theme — System / Dark / Light with live preview
+- Auto-detect Unity Editor and APK Dash paths
+
+### General
+- **Sidebar navigation** — Projects, Devices, History, Profiler, Settings
+- **GNOME native** — Adwaita widgets, NavigationSplitView, dark theme
+- **Project health check** — version, Cloud ID, build scenes, errors, git status
 
 ## Requirements
 
 - Python 3.10+
 - GTK4 and Libadwaita
 - Unity Editor with Android/iOS build support
-- [APK Dash](https://github.com/PavelKhabusov/APK-Dash) (optional, for device deployment)
+- ADB (Android Debug Bridge) for device features
+- [APK Dash](https://github.com/PavelKhabusov/APK-Dash) (optional, for device deployment UI)
 
 ### Arch Linux
 ```bash
-sudo pacman -S python-gobject gtk4 libadwaita
+sudo pacman -S python-gobject gtk4 libadwaita android-tools
 ```
 
 ### Ubuntu / Debian
 ```bash
-sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adb
 ```
 
 ## Setup
@@ -153,17 +191,23 @@ unity-builder-dash/
   builds_log.json             — Full build log entries (gitignored)
   unity-builder-dash.desktop  — GNOME desktop entry
   icons/
+    ubd-app-icon.png          — Application icon
+    ubd-app-icon.svg          — Application icon (SVG)
     ubd-android-symbolic.svg  — Android build icon
     ubd-apple-symbolic.svg    — iOS build icon
   logs/                       — Unity build logs (gitignored)
   src/
     __init__.py               — GTK/Adw version requirements
     constants.py              — App metadata, target info, log patterns
-    config.py                 — Config/history I/O, project scanner, upload, auto-detect
-    worker.py                 — BuildWorker — runs Unity in a background thread
-    settings_dialog.py        — Settings UI — projects, paths, upload, theme
-    dialogs.py                — History dialog with chart, health check dialog
-    window.py                 — Main window — project rows, log, progress, actions
+    config.py                 — Config/history I/O, project scanner, upload
+    worker.py                 — BuildWorker — runs Unity in background thread
+    log_view.py               — Reusable log viewer widget (search, filter, wrap)
+    window.py                 — Main window — sidebar, projects page, navigation
+    devices.py                — Device manager — ADB controls, app list, logcat
+    history_page.py           — Build history with chart and filters
+    profiler.py               — Real-time profiler — FPS, RAM, CPU, GPU, thermal
+    settings_page.py          — Settings — projects, paths, upload, theme
+    dialogs.py                — Health check dialog
 ```
 
 ## License

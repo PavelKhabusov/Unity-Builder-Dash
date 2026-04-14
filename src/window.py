@@ -1,4 +1,4 @@
-"""Main application window."""
+"""Main application window with sidebar navigation."""
 import os, subprocess, datetime, time, threading
 from gi.repository import Gtk, Adw, GLib, Gio
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS
@@ -6,23 +6,164 @@ from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
                      get_unity_for_project, upload_apk)
 from .worker import BuildWorker
-from .settings_dialog import SettingsDialog
-from .dialogs import show_history, show_scan
+from .settings_page import SettingsPage
+from .history_page import HistoryPage
+from .devices import DevicesPage
+from .dialogs import show_scan
+from .log_view import LogView
+from .profiler import ProfilerPage
+
+
+# Sidebar items: (id, icon, label)
+SIDEBAR_ITEMS = [
+    ("projects", "applications-system-symbolic", "Projects"),
+    ("devices",  "phone-symbolic",      "Devices"),
+    ("history",  "document-open-recent-symbolic", "History"),
+    ("profiler", "org.gnome.SystemMonitor-symbolic", "Profiler"),
+]
+SIDEBAR_BOTTOM = ("settings", "emblem-system-symbolic", "Settings")
 
 
 class BuilderWindow(Adw.ApplicationWindow):
     def __init__(self, app, cfg):
         super().__init__(application=app, title=APP_NAME,
-                         default_width=900, default_height=700)
+                         default_width=1000, default_height=700)
         self.cfg = cfg
         self.worker = None
         self._build_queue = []
         self._elapsed_timer = None
 
-        toolbar = Adw.ToolbarView()
-        header = Adw.HeaderBar()
+        # ── Split view: sidebar + content ──
+        self._split = Adw.NavigationSplitView()
 
-        # Header left
+        # ── Sidebar ──
+        sidebar_page = Adw.NavigationPage(title=APP_NAME)
+        sidebar_toolbar = Adw.ToolbarView()
+        sidebar_header = Adw.HeaderBar()
+        import os as _os
+        icon_path = _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "icons", "ubd-app-icon.png")
+        center = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        center.set_margin_start(14)
+        if _os.path.isfile(icon_path):
+            from gi.repository import Gdk as _Gdk
+            icon_img = Gtk.Image.new_from_paintable(
+                _Gdk.Texture.new_from_filename(icon_path))
+            icon_img.set_pixel_size(20)
+            center.append(icon_img)
+        title_lbl = Gtk.Label(xalign=0)
+        title_lbl.set_markup(
+            '<span size="8500" weight="bold" line_height="0.8">Unity Builder\n'
+            '</span><span size="small" alpha="60%" line_height="0.8">Dash</span>')
+        self._sidebar_title_lbl = title_lbl
+        center.append(title_lbl)
+        self._sidebar_title_center = center
+        sidebar_header.set_show_title(False)
+        sidebar_header.pack_start(center)
+        self._sidebar_header_title = self._sidebar_title_lbl
+        sidebar_toolbar.add_top_bar(sidebar_header)
+
+        sidebar_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        sidebar_list = Gtk.ListBox()
+        sidebar_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        sidebar_list.add_css_class("navigation-sidebar")
+
+        for item_id, icon, label in SIDEBAR_ITEMS:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            box.set_margin_top(6)
+            box.set_margin_bottom(6)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            img = Gtk.Image.new_from_icon_name(icon)
+            lbl = Gtk.Label(label=label)
+            box.append(img)
+            box.append(lbl)
+            row.set_child(box)
+            row._page_id = item_id
+            row._box = box
+            row._label = lbl
+            sidebar_list.append(row)
+
+        sidebar_content.append(sidebar_list)
+
+        # Spacer pushes Settings to bottom
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        sidebar_content.append(spacer)
+
+        # Settings pinned to bottom
+        settings_list = Gtk.ListBox()
+        settings_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        settings_list.add_css_class("navigation-sidebar")
+
+        item_id, icon, label = SIDEBAR_BOTTOM
+        settings_row = Gtk.ListBoxRow()
+        sbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        sbox.set_margin_top(6)
+        sbox.set_margin_bottom(6)
+        sbox.set_margin_start(8)
+        sbox.set_margin_end(8)
+        sbox.append(Gtk.Image.new_from_icon_name(icon))
+        settings_lbl = Gtk.Label(label=label)
+        sbox.append(settings_lbl)
+        settings_row.set_child(sbox)
+        settings_row._page_id = item_id
+        settings_row._box = sbox
+        settings_row._label = settings_lbl
+        settings_list.append(settings_row)
+        sidebar_content.append(settings_list)
+
+        # Deselect other list when one is selected
+        def _cross_deselect(active_list, other_list):
+            def handler(lb, row):
+                if row is not None:
+                    other_list.unselect_all()
+                self._on_sidebar_selected(lb, row)
+            return handler
+
+        sidebar_list.connect("row-selected", _cross_deselect(sidebar_list, settings_list))
+        settings_list.connect("row-selected", _cross_deselect(settings_list, sidebar_list))
+
+        # Collapse button
+        collapse_list = Gtk.ListBox()
+        collapse_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        collapse_list.add_css_class("navigation-sidebar")
+        collapse_row = Gtk.ListBoxRow()
+        collapse_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        collapse_box.set_margin_top(6)
+        collapse_box.set_margin_bottom(6)
+        collapse_box.set_margin_start(8)
+        collapse_box.set_margin_end(8)
+        collapse_box.append(Gtk.Image.new_from_icon_name("sidebar-show-symbolic"))
+        self._collapse_label = Gtk.Label(label="Collapse")
+        collapse_box.append(self._collapse_label)
+        collapse_row.set_child(collapse_box)
+        collapse_row._box = collapse_box
+        collapse_row._label = self._collapse_label
+        collapse_list.append(collapse_row)
+        collapse_list.set_opacity(0.4)
+        collapse_list.connect("row-activated", lambda *_: self._toggle_sidebar())
+        sidebar_content.append(collapse_list)
+
+        sidebar_toolbar.set_content(sidebar_content)
+        sidebar_page.set_child(sidebar_toolbar)
+        self._split.set_sidebar(sidebar_page)
+        self._split.set_min_sidebar_width(110)
+        self._split.set_max_sidebar_width(140)
+        self._sidebar_list = sidebar_list
+        self._settings_list = settings_list
+        self._sidebar_collapsed = False
+        self._sidebar_labels = []  # filled below
+        self._sidebar_header_title = None
+
+        # ── Content pages ──
+        self._content_page = Adw.NavigationPage(title="Projects")
+        content_toolbar = Adw.ToolbarView()
+        self._content_header = Adw.HeaderBar()
+
+        # Header left — build controls
         build_all = Gtk.Button(icon_name="media-playback-start-symbolic",
                                tooltip_text="Build All Android")
         build_all.add_css_class("suggested-action")
@@ -38,52 +179,173 @@ class BuilderWindow(Adw.ApplicationWindow):
                                                    tooltip_text="Auto-increment build version")
         self.increment_toggle.set_active(cfg.get("auto_increment", False))
 
-        header.pack_start(build_all)
-        header.pack_start(self.cancel_btn)
-        header.pack_start(self.increment_toggle)
+        self._content_header.pack_start(build_all)
+        self._content_header.pack_start(self.cancel_btn)
+        self._content_header.pack_start(self.increment_toggle)
 
-        # Header right
+        # Header right — spinner + elapsed + log toggle
         self.spinner = Gtk.Spinner()
         self.elapsed_label = Gtk.Label(label="")
         self.elapsed_label.add_css_class("dim-label")
 
-        history_btn = Gtk.Button(icon_name="document-open-recent-symbolic",
-                                 tooltip_text="Build History")
-        history_btn.connect("clicked", self._on_history)
+        self._log_toggle = Gtk.ToggleButton(icon_name="utilities-terminal-symbolic",
+                                             tooltip_text="Show/hide build log")
+        self._log_toggle.connect("toggled",
+                                  lambda b: self._toggle_build_log(b.get_active()))
 
-        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic", tooltip_text="Settings")
-        settings_btn.connect("clicked", self._on_settings)
+        self._settings_save_btn = Gtk.Button(label="Save", css_classes=["suggested-action"])
+        self._settings_save_btn.set_visible(False)
+        self._content_header.pack_end(self._settings_save_btn)
+        self._content_header.pack_end(self._log_toggle)
+        self._content_header.pack_end(self.spinner)
+        self._content_header.pack_end(self.elapsed_label)
 
-        header.pack_end(settings_btn)
-        header.pack_end(history_btn)
-        header.pack_end(self.spinner)
-        header.pack_end(self.elapsed_label)
-        toolbar.add_top_bar(header)
+        # Settings save button (added after settings page is created)
 
-        # Content
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        content_toolbar.add_top_bar(self._content_header)
 
-        # ── Projects list (vertical, like Unity Hub) ──
+        # Stack for content pages
+        self._stack = Gtk.Stack()
+        self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._stack.set_transition_duration(150)
+
+        # Projects page
+        self._projects_page = self._build_projects_page()
+        self._stack.add_named(self._projects_page, "projects")
+
+        # Devices page
+        self._devices_page = DevicesPage()
+        self._stack.add_named(self._devices_page, "devices")
+
+        # History page
+        self._history_page = HistoryPage()
+        self._stack.add_named(self._history_page, "history")
+
+        # Profiler page
+        self._profiler_page = ProfilerPage()
+        self._stack.add_named(self._profiler_page, "profiler")
+
+        # Settings page
+        self._settings_page = SettingsPage(cfg, self._apply_config)
+        self._stack.add_named(self._settings_page, "settings")
+        self._settings_save_btn.connect("clicked", self._settings_page._save)
+
+        content_toolbar.set_content(self._stack)
+        self._content_page.set_child(content_toolbar)
+        self._split.set_content(self._content_page)
+
+        self.set_content(self._split)
+
+        # Select first item
+        self._sidebar_list.select_row(self._sidebar_list.get_row_at_index(0))
+
+        if not cfg.get("unity") or not cfg.get("projects"):
+            self._settings_list.select_row(self._settings_list.get_row_at_index(0))
+
+    # ── Sidebar ──
+
+    def _toggle_sidebar(self):
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        collapsed = self._sidebar_collapsed
+
+        # Toggle labels, centering, header
+        all_rows = []
+        for i in range(10):
+            r = self._sidebar_list.get_row_at_index(i)
+            if r is None: break
+            all_rows.append(r)
+        r = self._settings_list.get_row_at_index(0)
+        if r: all_rows.append(r)
+
+        for row in all_rows:
+            lbl = getattr(row, "_label", None)
+            box = getattr(row, "_box", None)
+            if lbl:
+                lbl.set_visible(not collapsed)
+            if box:
+                box.set_halign(Gtk.Align.CENTER if collapsed else Gtk.Align.FILL)
+
+        # Collapse button label
+        if hasattr(self, "_collapse_label"):
+            self._collapse_label.set_visible(not collapsed)
+
+        # Header: hide text, center icon
+        if hasattr(self, "_sidebar_title_lbl"):
+            self._sidebar_title_lbl.set_visible(not collapsed)
+        if hasattr(self, "_sidebar_title_center"):
+            self._sidebar_title_center.set_halign(
+                Gtk.Align.CENTER if collapsed else Gtk.Align.CENTER)
+
+        # Set width immediately (no laggy animation)
+        if collapsed:
+            self._split.set_min_sidebar_width(48)
+            self._split.set_max_sidebar_width(48)
+        else:
+            self._split.set_min_sidebar_width(110)
+            self._split.set_max_sidebar_width(140)
+
+    # ── Sidebar navigation ──
+
+    def _on_sidebar_selected(self, listbox, row):
+        if row is None:
+            return
+        page_id = row._page_id
+        self._stack.set_visible_child_name(page_id)
+        titles = {i[0]: i[2] for i in SIDEBAR_ITEMS}
+        titles[SIDEBAR_BOTTOM[0]] = SIDEBAR_BOTTOM[2]
+        title = titles.get(page_id, "")
+        self._content_page.set_title(title)
+
+        # Show/hide build controls based on page
+        is_projects = page_id == "projects"
+        self.build_all_btn.set_visible(is_projects)
+        self.cancel_btn.set_visible(is_projects)
+        self.increment_toggle.set_visible(is_projects)
+        self._log_toggle.set_visible(is_projects)
+        self._settings_save_btn.set_visible(page_id == "settings")
+
+        # Refresh data on page switch
+        if page_id == "history":
+            self._history_page.refresh()
+        elif page_id == "devices":
+            self._devices_page.refresh()
+        elif page_id == "profiler":
+            self._profiler_page.refresh()
+
+    # ── Projects page ──
+
+    def _build_projects_page(self):
+        """Build the projects content page."""
+        paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+
+        # ── Top: projects + progress ──
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Projects list
         self.projects_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.projects_list.set_margin_top(8)
         self.projects_list.set_margin_start(12)
         self.projects_list.set_margin_end(12)
         self.cards = {}
         self._build_cards()
-        content.append(self.projects_list)
+
+        proj_scroll = Gtk.ScrolledWindow(vexpand=True)
+        proj_scroll.set_child(self.projects_list)
+        top.append(proj_scroll)
 
         # Empty state
         self.empty = Adw.StatusPage(title="No projects configured",
             description="Open Settings to add Unity projects",
             icon_name="emblem-system-symbolic")
-        self.empty.set_visible(not cfg.get("projects"))
-        content.append(self.empty)
+        self.empty.set_visible(not self.cfg.get("projects"))
+        top.append(self.empty)
 
-        # ── Progress ──
+        # Progress
         pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         pbox.set_margin_top(8)
         pbox.set_margin_start(16)
         pbox.set_margin_end(16)
+        pbox.set_margin_bottom(4)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self.stage_label = Gtk.Label(label="Ready")
@@ -100,71 +362,44 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.progress_bar = Gtk.ProgressBar()
         self.progress_bar.set_show_text(False)
         pbox.append(self.progress_bar)
-        content.append(pbox)
+        top.append(pbox)
 
-        # ── Log ──
-        lbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
-        lbox.set_margin_top(4)
-        lbox.set_margin_start(12)
-        lbox.set_margin_end(12)
-        lbox.set_margin_bottom(12)
+        paned.set_start_child(top)
+        paned.set_resize_start_child(True)
+        paned.set_shrink_start_child(False)
 
-        self.log_buffer = Gtk.TextBuffer()
-        self.log_view = Gtk.TextView(buffer=self.log_buffer, editable=False,
-                                     cursor_visible=False, monospace=True)
-        self.log_view.set_wrap_mode(Gtk.WrapMode.NONE)
-        self.log_view.set_top_margin(6)
-        self.log_view.set_bottom_margin(6)
-        self.log_view.set_left_margin(8)
-        self.log_view.set_right_margin(8)
+        # ── Bottom: log panel (hidden by default) ──
+        self._build_log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        # Search + level filter bar
-        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        search_box.set_margin_bottom(4)
-        self.search_entry = Gtk.SearchEntry(placeholder_text="Filter log...")
-        self.search_entry.set_hexpand(True)
-        self.search_entry.connect("search-changed", self._on_log_filter)
-        search_box.append(self.search_entry)
+        log_close = Gtk.Button(icon_name="window-close-symbolic",
+                               tooltip_text="Close log", css_classes=["flat"])
 
-        self.level_filter = Gtk.DropDown.new_from_strings(
-            ["All", "Errors", "Warnings", "Stages"])
-        self.level_filter.set_selected(0)
-        self.level_filter.connect("notify::selected", lambda *_: self._on_log_filter())
-        search_box.append(self.level_filter)
+        self._log_widget = LogView(
+            levels=["All", "Errors", "Warnings", "Stages"],
+            get_tag=self._get_tag,
+            extra_end=[log_close])
+        self._build_log_box.append(self._log_widget)
 
-        wrap_toggle = Gtk.ToggleButton(icon_name="format-justify-left-symbolic",
-                                       tooltip_text="Word wrap", active=False)
-        wrap_toggle.connect("toggled", lambda b: self.log_view.set_wrap_mode(
-            Gtk.WrapMode.WORD_CHAR if b.get_active() else Gtk.WrapMode.NONE))
-        search_box.append(wrap_toggle)
-        lbox.append(search_box)
+        self._build_log_box.set_visible(False)
 
-        self.log_scroll = Gtk.ScrolledWindow(vexpand=True)
-        self.log_scroll.set_child(self.log_view)
-        self.log_scroll.add_css_class("card")
+        log_close.connect("clicked", lambda _: self._toggle_build_log(False))
 
-        # Overlay with scroll-down button
-        overlay = Gtk.Overlay()
-        overlay.set_child(self.log_scroll)
-        scroll_btn = Gtk.Button(icon_name="go-bottom-symbolic",
-                                tooltip_text="Scroll to bottom",
-                                css_classes=["circular", "osd"],
-                                halign=Gtk.Align.END, valign=Gtk.Align.END)
-        scroll_btn.set_margin_end(12)
-        scroll_btn.set_margin_bottom(12)
-        scroll_btn.connect("clicked", self._scroll_to_bottom)
-        overlay.add_overlay(scroll_btn)
-        overlay.set_vexpand(True)
+        paned.set_end_child(self._build_log_box)
+        paned.set_resize_end_child(True)
+        paned.set_shrink_end_child(False)
+        self._projects_paned = paned
 
-        lbox.append(overlay)
-        content.append(lbox)
+        return paned
 
-        self._setup_log_tags()
-        toolbar.set_content(content)
-        self.set_content(toolbar)
-
-        if not cfg.get("unity") or not cfg.get("projects"):
-            GLib.idle_add(self._on_settings, None)
+    def _toggle_build_log(self, show):
+        """Show or hide the build log panel."""
+        self._build_log_box.set_visible(show)
+        # Sync toggle button without triggering callback
+        if self._log_toggle.get_active() != show:
+            self._log_toggle.set_active(show)
+        if show:
+            h = self._projects_paned.get_allocated_height()
+            self._projects_paned.set_position(h // 2)
 
     # ── Project rows (Hub-style) ──
 
@@ -203,13 +438,11 @@ class BuilderWindow(Adw.ApplicationWindow):
         ver = Gtk.Label(label=get_version(proj["path"]), css_classes=["caption"])
         sub.append(ver)
 
-        # APK size
         apk = find_apk(proj)
         if apk:
             mb = os.path.getsize(apk) / (1024 * 1024)
             sub.append(Gtk.Label(label=f"{mb:.0f} MB", css_classes=["dim-label", "caption"]))
 
-        # Last build info
         builds = load_builds_log()
         proj_builds = [b for b in builds if b.get("project") == proj["name"]]
         if proj_builds:
@@ -250,13 +483,11 @@ class BuilderWindow(Adw.ApplicationWindow):
             actions.append(deploy)
             buttons.append(deploy)
 
-        # Health check icon
         scan_btn = Gtk.Button(icon_name="security-medium-symbolic",
                               tooltip_text="Health check", css_classes=["flat"])
         scan_btn.connect("clicked", lambda _, p=proj: self._on_scan(p))
         actions.append(scan_btn)
 
-        # Context menu (three dots)
         menu = Gio.Menu()
         proj_id = proj["name"].replace(" ", "_")
 
@@ -270,19 +501,17 @@ class BuilderWindow(Adw.ApplicationWindow):
         menu.append("Open in Unity", f"win.open-unity-{proj_id}")
         menu.append("Open Build Folder", f"win.folder-{proj_id}")
         menu.append("Open Project Folder", f"win.proj-folder-{proj_id}")
-        menu.append("Edit in Settings", f"win.edit-{proj_id}")
+        menu.append("Clean Build (delete Library)", f"win.clean-{proj_id}")
 
-        # Register actions
         action_list = [
             (f"upload-{proj_id}", lambda *_, p=proj: self._on_upload(p)),
             (f"push-{proj_id}", lambda *_, p=proj: self._on_push_to_device(p)),
             (f"open-unity-{proj_id}", lambda *_, p=proj: self._open_in_unity(p)),
-            (f"scan-{proj_id}", lambda *_, p=proj: self._on_scan(p)),
             (f"folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
                 ["xdg-open", p.get("build_dir") or p["path"]])),
             (f"proj-folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
                 ["xdg-open", p["path"]])),
-            (f"edit-{proj_id}", lambda *_, p=proj: self._on_settings(None, expand=p["name"])),
+            (f"clean-{proj_id}", lambda *_, p=proj: self._on_clean_build(p)),
         ]
         for action_name, callback in action_list:
             action = Gio.SimpleAction.new(action_name, None)
@@ -335,14 +564,8 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     # ── Log ──
 
-    def _setup_log_tags(self):
-        self.log_buffer.create_tag("error", foreground="#e01b24")
-        self.log_buffer.create_tag("warning", foreground="#e5a50a")
-        self.log_buffer.create_tag("success", foreground="#2ec27e")
-        self.log_buffer.create_tag("stage", foreground="#62a0ea", weight=700)
-        self.log_buffer.create_tag("hidden", invisible=True)
-
-    def _get_tag(self, s):
+    @staticmethod
+    def _get_tag(s):
         s = s.strip()
         sl = s.lower()
         if "error" in sl or "FAILED" in s or "unable" in sl or "exception" in sl: return "error"
@@ -351,65 +574,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         if s.startswith("[Stage]") or any(s.startswith(p[1] or "") for p in STAGE_PATTERNS if p[1]): return "stage"
         return None
 
-    def _insert_tagged(self, text, scroll=True):
-        end = self.log_buffer.get_end_iter()
-        tag = self._get_tag(text)
-        if tag:
-            self.log_buffer.insert_with_tags_by_name(end, text, tag)
-        else:
-            self.log_buffer.insert(end, text)
-        if scroll:
-            mk = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
-            self.log_view.scroll_mark_onscreen(mk)
-            self.log_buffer.delete_mark(mk)
-
     def _log(self, t):
-        if not hasattr(self, '_full_log_text'): self._full_log_text = ""
-        self._full_log_text += t
-        # Check if line passes current filter
-        query = self.search_entry.get_text().lower().strip()
-        level = self.level_filter.get_selected()
-        tag = self._get_tag(t)
-        if level == 1 and tag != "error": return
-        if level == 2 and tag not in ("error", "warning"): return
-        if level == 3 and tag != "stage": return
-        if query and query not in t.lower(): return
-        self._insert_tagged(t)
-
-    def _rebuild_log(self, text):
-        """Rebuild log buffer with syntax highlighting."""
-        self.log_buffer.set_text("")
-        for line in text.splitlines(keepends=True):
-            self._insert_tagged(line, scroll=False)
-
-    def _on_log_filter(self, *_):
-        query = self.search_entry.get_text().lower().strip()
-        level = self.level_filter.get_selected()  # 0=All, 1=Errors, 2=Warnings, 3=Stages
-
-        if not query and level == 0:
-            if hasattr(self, '_full_log_text') and self._full_log_text:
-                self._rebuild_log(self._full_log_text)
-            self._scroll_to_bottom()
-            return
-
-        source = getattr(self, '_full_log_text', '') or self.log_buffer.get_text(
-            self.log_buffer.get_start_iter(), self.log_buffer.get_end_iter(), False)
-
-        lines = source.splitlines()
-        if level == 1:
-            lines = [l for l in lines if self._get_tag(l) == "error"]
-        elif level == 2:
-            lines = [l for l in lines if self._get_tag(l) in ("error", "warning")]
-        elif level == 3:
-            lines = [l for l in lines if self._get_tag(l) == "stage"]
-        if query:
-            lines = [l for l in lines if query in l.lower()]
-
-        self._rebuild_log("\n".join(lines))
-
-    def _scroll_to_bottom(self, *_):
-        adj = self.log_scroll.get_vadjustment()
-        adj.set_value(adj.get_upper())
+        self._log_widget.append_line(t)
 
     def _on_stage(self, text, frac):
         if text: self.stage_label.set_text(text)
@@ -434,8 +600,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not unity or not os.path.isfile(unity):
             self._log("Unity editor not found. Check Settings.\n")
             return
-        self.log_buffer.set_text("")
-        self._full_log_text = ""
+        self._log_widget.clear()
+        self._toggle_build_log(True)
         self._set_building(True)
         now = datetime.datetime.now().strftime("%H:%M:%S")
         info = TARGET_INFO[target_key]
@@ -468,7 +634,6 @@ class BuilderWindow(Adw.ApplicationWindow):
                          os.path.getsize(apk) if apk else None,
                          get_build_number(proj["path"]))
 
-        # Notification
         try:
             icon = "dialog-ok-apply" if ok else "dialog-error"
             subprocess.Popen(["notify-send", "-i", icon, APP_NAME,
@@ -481,7 +646,6 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Done" if ok else "Failed")
         self.progress_bar.set_fraction(1.0 if ok else 0)
         self.worker = None
-        # Delay rebuild to let Unity finish moving APK
         GLib.timeout_add(2000, self._build_cards)
 
         if ok and self._build_queue:
@@ -493,10 +657,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not apk: return
         dash = self.cfg.get("apk_dash", "")
         if not dash or not os.path.exists(dash): return
-        # Launch in fully isolated process — clean env without parent GTK state
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("GTK_", "GDK_", "GIO_", "DBUS_SESSION_BUS_PID"))}
-        env["GTK_A11Y"] = "none"  # prevent accessibility bus conflicts
+        env["GTK_A11Y"] = "none"
         subprocess.Popen(["python3", dash, apk], env=env,
                          start_new_session=True,
                          stdin=subprocess.DEVNULL,
@@ -558,22 +721,39 @@ class BuilderWindow(Adw.ApplicationWindow):
     def _on_scan(self, proj):
         show_scan(self, proj)
 
-    def _on_history(self, _):
-        show_history(self)
-
     def _on_cancel(self, _):
         self._build_queue = []
         if self.worker:
             self.worker.cancel()
-            # Restore adb if it was hidden
             self.worker._restore_adb()
         self._set_building(False)
         self.stage_label.set_text("Cancelled")
         self.progress_bar.set_fraction(0)
         self._log("\n  Cancelled by user.\n")
 
-    def _on_settings(self, _, expand=None):
-        dlg = SettingsDialog(self.cfg, self._apply_config, expand_project=expand)
+    def _on_clean_build(self, proj):
+        """Delete Library and Bee folders for a clean rebuild."""
+        import shutil
+        dlg = Adw.AlertDialog()
+        dlg.set_heading(f"Clean {proj['name']}?")
+        dlg.set_body("This will delete Library/ and Bee/ folders.\nNext build will be significantly slower.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", "Clean")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        def on_resp(d, resp):
+            if resp != "ok": return
+            path = proj["path"]
+            deleted = []
+            for folder in ["Library", "Bee"]:
+                p = os.path.join(path, folder)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                    deleted.append(folder)
+            if deleted:
+                self._log(f"Cleaned: {', '.join(deleted)}\n")
+            else:
+                self._log("Nothing to clean\n")
+        dlg.connect("response", on_resp)
         dlg.present(self)
 
     def _apply_config(self, cfg):
