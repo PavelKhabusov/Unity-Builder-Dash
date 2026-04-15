@@ -95,6 +95,12 @@ class LogView(Gtk.Box):
                 kwargs["weight"] = 700
             self._buffer.create_tag(tag_name, **kwargs)
 
+        # Trace folding
+        self._trace_groups = []  # list of {"start_mark", "end_mark", "btn", "visible"}
+        self._in_trace = False
+        self._trace_ended_ago = 99
+        self._buffer.create_tag("trace_filename", foreground="#6e9bcf", scale=0.8, invisible=True)
+
         # Track right-click position for context menu
         self._last_click_line = -1
         rclick = Gtk.GestureClick(button=3)
@@ -142,11 +148,37 @@ class LogView(Gtk.Box):
         """Clear all log content."""
         self._full_lines = []
         self._buffer.set_text("")
+        self._trace_groups = []
+        self._in_trace = False
+        self._trace_ended_ago = 99
 
     def append_line(self, text):
         """Append a line, respecting current filter. Stores raw line for refilter."""
+        s = text.strip()
+        # (Filename:...) — always fold into trace block (comes after trace + empty line)
+        if s.startswith("(Filename:"):
+            in_trace = getattr(self, '_in_trace', False)
+            # Also check if recently exited trace (within last 2 lines)
+            just_left_trace = getattr(self, '_trace_ended_ago', 0) <= 2
+            if in_trace or just_left_trace:
+                self._full_lines.append(text)
+                if not self._paused:
+                    end = self._buffer.get_end_iter()
+                    if not self._buffer.get_tag_table().lookup("trace_hidden"):
+                        self._buffer.create_tag("trace_hidden", invisible=True,
+                                                 foreground="#888888", scale=0.85)
+                    self._buffer.insert_with_tags_by_name(end, text, "trace_hidden")
+                return
+            # No recent trace: merge with previous visible line
+            if self._full_lines:
+                prev = self._full_lines[-1].rstrip("\n")
+                merged = prev + "  " + s + "\n"
+                self._full_lines[-1] = merged
+                if not self._paused:
+                    self._replace_last_line(merged)
+            return
+
         self._full_lines.append(text)
-        # Keep buffer manageable
         if len(self._full_lines) > 10000:
             self._full_lines = self._full_lines[-7000:]
         if not self._paused and self._passes_filter(text):
@@ -161,6 +193,21 @@ class LogView(Gtk.Box):
         self._paused = paused
         if not paused:
             self._rebuild()
+
+    def _replace_last_line(self, merged):
+        """Replace the last displayed line with merged version."""
+        # Find and remove last line in buffer
+        end = self._buffer.get_end_iter()
+        start = end.copy()
+        # Go back to start of last line
+        start.backward_line()
+        # If last line had a child anchor (trace button), go back one more
+        if start.get_child_anchor():
+            start.backward_line()
+        self._buffer.delete(start, end)
+        # Re-insert merged
+        if self._passes_filter(merged):
+            self._insert_tagged(merged, scroll=True)
 
     def scroll_to_bottom(self, *_):
         adj = self._scroll.get_vadjustment()
@@ -193,20 +240,118 @@ class LogView(Gtk.Box):
             return False
         return True
 
+    @staticmethod
+    def _is_trace_line(line):
+        s = line.strip()
+        if not s:
+            return False
+        if s.startswith("(at "):
+            return True
+        return (s.startswith("at ") or
+                s.startswith("UnityEngine.") or s.startswith("System.") or
+                s.startswith("Unity.") or s.startswith("Google.") or
+                s.startswith("Firebase.") or s.startswith("KartAuth.") or
+                (s.startswith("#") and " in " in s) or
+                "--- End of" in s or
+                (s.startswith("0x") and " in " in s) or
+                ("(at " in s and ".cs:" in s))
+
     def _insert_tagged(self, text, scroll=True):
-        end = self._buffer.get_end_iter()
-        tag = self._get_tag(text)
-        if tag:
-            self._buffer.insert_with_tags_by_name(end, text, tag)
+        is_trace = self._is_trace_line(text)
+        if is_trace:
+            self._trace_ended_ago = 0
         else:
-            self._buffer.insert(end, text)
+            self._trace_ended_ago = getattr(self, '_trace_ended_ago', 99) + 1
+
+        # Detect trace block start: previous line was not trace, this one is
+        if is_trace and not getattr(self, '_in_trace', False):
+            self._in_trace = True
+            # Insert toggle button via child anchor
+            end = self._buffer.get_end_iter()
+            anchor = self._buffer.create_child_anchor(end)
+            btn = Gtk.Button(label="▸ trace", css_classes=["flat", "caption"])
+            btn.set_opacity(0.6)
+            btn.set_margin_start(4)
+            # Mark start of trace
+            start_mk = self._buffer.create_mark(None, self._buffer.get_end_iter(), True)
+            group = {"start_mark": start_mk, "end_mark": None, "btn": btn, "visible": False}
+            self._trace_groups.append(group)
+            btn.connect("clicked", lambda _, g=group: self._toggle_trace(g))
+            self._view.add_child_at_anchor(btn, anchor)
+            # Newline after button
+            end = self._buffer.get_end_iter()
+            self._buffer.insert(end, "\n")
+
+        if is_trace:
+            end = self._buffer.get_end_iter()
+            if not self._buffer.get_tag_table().lookup("trace_hidden"):
+                self._buffer.create_tag("trace_hidden", invisible=True,
+                                         foreground="#888888", scale=0.85)
+            tag = self._get_tag(text)
+            if tag:
+                self._buffer.insert_with_tags_by_name(end, text, tag, "trace_hidden")
+            else:
+                self._buffer.insert_with_tags_by_name(end, text, "trace_hidden")
+        else:
+            # End of trace block (but not on empty lines — they appear inside traces)
+            if getattr(self, '_in_trace', False) and text.strip():
+                self._in_trace = False
+                if self._trace_groups:
+                    self._trace_groups[-1]["end_mark"] = self._buffer.create_mark(
+                        None, self._buffer.get_end_iter(), True)
+
+            # Empty line while in trace: hide it too
+            if not text.strip() and getattr(self, '_in_trace', False):
+                end = self._buffer.get_end_iter()
+                if not self._buffer.get_tag_table().lookup("trace_hidden"):
+                    self._buffer.create_tag("trace_hidden", invisible=True,
+                                             foreground="#888888", scale=0.85)
+                self._buffer.insert_with_tags_by_name(end, text, "trace_hidden")
+            else:
+                end = self._buffer.get_end_iter()
+                tag = self._get_tag(text)
+                if tag:
+                    self._buffer.insert_with_tags_by_name(end, text, tag)
+                else:
+                    self._buffer.insert(end, text)
+
         if scroll:
             mk = self._buffer.create_mark(None, self._buffer.get_end_iter(), False)
             self._view.scroll_mark_onscreen(mk)
             self._buffer.delete_mark(mk)
 
+    def _toggle_trace(self, group):
+        """Toggle visibility of a trace block."""
+        group["visible"] = not group["visible"]
+        visible = group["visible"]
+
+        start = self._buffer.get_iter_at_mark(group["start_mark"])
+        if group["end_mark"]:
+            end = self._buffer.get_iter_at_mark(group["end_mark"])
+        else:
+            end = self._buffer.get_end_iter()
+
+        # Find trace_hidden tag
+        tag = self._buffer.get_tag_table().lookup("trace_hidden")
+        if tag:
+            tag_visible = self._buffer.get_tag_table().lookup("trace_visible")
+            if not tag_visible:
+                tag_visible = self._buffer.create_tag("trace_visible",
+                    invisible=False, foreground="#888888", scale=0.85)
+
+            if visible:
+                self._buffer.remove_tag(tag, start, end)
+                self._buffer.apply_tag(tag_visible, start, end)
+                group["btn"].set_label("▾ trace")
+            else:
+                self._buffer.remove_tag(tag_visible, start, end)
+                self._buffer.apply_tag(tag, start, end)
+                group["btn"].set_label("▸ trace")
+
     def _rebuild(self):
         self._buffer.set_text("")
+        self._trace_groups = []
+        self._in_trace = False
         for line in self._full_lines:
             if self._passes_filter(line):
                 self._insert_tagged(line, scroll=False)

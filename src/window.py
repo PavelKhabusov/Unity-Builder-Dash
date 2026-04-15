@@ -9,7 +9,7 @@ from .worker import BuildWorker
 from .settings_page import SettingsPage
 from .history_page import HistoryPage
 from .devices import DevicesPage
-from .dialogs import show_scan
+from .dialogs import show_scan, show_screenshots
 from .log_view import LogView
 from .profiler import ProfilerPage
 
@@ -498,12 +498,22 @@ class BuilderWindow(Adw.ApplicationWindow):
         if "android" in proj.get("targets", []):
             menu.append("Push APK to Device", f"win.push-{proj_id}")
 
-        menu.append("Open in Unity", f"win.open-unity-{proj_id}")
-        menu.append("Open Build Folder", f"win.folder-{proj_id}")
-        menu.append("Open Project Folder", f"win.proj-folder-{proj_id}")
-        menu.append("Run EditMode Tests", f"win.test-edit-{proj_id}")
-        menu.append("Run PlayMode Tests", f"win.test-play-{proj_id}")
-        menu.append("Clean Build (delete Library)", f"win.clean-{proj_id}")
+        open_section = Gio.Menu()
+        open_section.append("Open in Unity", f"win.open-unity-{proj_id}")
+        open_section.append("Open Build Folder", f"win.folder-{proj_id}")
+        open_section.append("Open Project Folder", f"win.proj-folder-{proj_id}")
+        menu.append_section(None, open_section)
+
+        test_section = Gio.Menu()
+        test_section.append("Run EditMode Tests", f"win.test-edit-{proj_id}")
+        test_section.append("Run PlayMode Tests", f"win.test-play-{proj_id}")
+        test_section.append("Select Tests…", f"win.test-dialog-{proj_id}")
+        menu.append_section(None, test_section)
+
+        clean_section = Gio.Menu()
+        clean_section.append("Clear Build Cache", f"win.clear-cache-{proj_id}")
+        clean_section.append("Clean Build (delete Library)", f"win.clean-{proj_id}")
+        menu.append_section(None, clean_section)
 
         action_list = [
             (f"upload-{proj_id}", lambda *_, p=proj: self._on_upload(p)),
@@ -515,6 +525,8 @@ class BuilderWindow(Adw.ApplicationWindow):
                 ["xdg-open", p["path"]])),
             (f"test-edit-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "EditMode")),
             (f"test-play-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "PlayMode")),
+            (f"test-dialog-{proj_id}", lambda *_, p=proj: self._show_test_dialog(p)),
+            (f"clear-cache-{proj_id}", lambda *_, p=proj: self._on_clear_cache(p)),
             (f"clean-{proj_id}", lambda *_, p=proj: self._on_clean_build(p)),
         ]
         for action_name, callback in action_list:
@@ -743,7 +755,133 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.progress_bar.set_fraction(0)
         self._log("\n  Cancelled by user.\n")
 
-    def _on_run_tests(self, proj, platform):
+    def _get_known_fixtures(self, proj):
+        """Extract test fixture names from previous XML results."""
+        fixtures = {}
+        for plat in ("editmode", "playmode"):
+            xml_path = os.path.join(proj["path"], f"test-results-{plat}.xml")
+            if not os.path.isfile(xml_path):
+                continue
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(xml_path)
+                for suite in tree.iter("test-suite"):
+                    if suite.get("type") == "TestFixture":
+                        name = suite.get("name", "")
+                        total = int(suite.get("total", 0))
+                        passed = int(suite.get("passed", 0))
+                        failed = int(suite.get("failed", 0))
+                        plat_name = "EditMode" if plat == "editmode" else "PlayMode"
+                        fixtures[f"{plat_name}:{name}"] = {
+                            "platform": plat_name, "name": name,
+                            "total": total, "passed": passed, "failed": failed
+                        }
+            except: pass
+        return fixtures
+
+    def _show_test_dialog(self, proj):
+        """Show dialog to select test groups and platform."""
+        fixtures = self._get_known_fixtures(proj)
+
+        dlg = Adw.Dialog()
+        dlg.set_title(f"{proj['name']} — Run Tests")
+        dlg.set_content_width(420)
+        dlg.set_content_height(560)
+
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(Adw.HeaderBar())
+
+        page = Adw.PreferencesPage()
+
+        # Platform selection
+        plat_group = Adw.PreferencesGroup(title="Platform")
+        plat_row = Adw.ComboRow(title="Test Platform")
+        plat_model = Gtk.StringList.new(["EditMode", "PlayMode"])
+        plat_row.set_model(plat_model)
+        plat_row.set_selected(1)
+        plat_group.add(plat_row)
+        page.add(plat_group)
+
+        # Filter
+        filter_group = Adw.PreferencesGroup(title="Filter",
+            description="Leave empty to run all, or select fixtures below")
+        filter_entry = Adw.EntryRow(title="Test filter (class or method name)")
+        filter_group.add(filter_entry)
+        page.add(filter_group)
+
+        # Known fixtures — dynamic by platform
+        checks = {}  # key → SwitchRow
+        fixtures_group = Adw.PreferencesGroup(title="Fixtures (last run)")
+        select_all_row = Adw.ActionRow(title="Select All / Deselect All")
+        sel_btn = Gtk.Button(label="All", css_classes=["flat"], valign=Gtk.Align.CENTER)
+        desel_btn = Gtk.Button(label="None", css_classes=["flat"], valign=Gtk.Align.CENTER)
+        select_all_row.add_suffix(sel_btn)
+        select_all_row.add_suffix(desel_btn)
+        fixtures_group.add(select_all_row)
+        page.add(fixtures_group)
+
+        def rebuild_fixtures(*_):
+            """Rebuild fixture switches when platform changes."""
+            plat_name = plat_model.get_string(plat_row.get_selected())
+            # Remove old switches (keep select_all_row)
+            for key in list(checks.keys()):
+                fixtures_group.remove(checks[key])
+            checks.clear()
+
+            items = {k: v for k, v in fixtures.items() if v["platform"] == plat_name}
+            if items:
+                for key, info in items.items():
+                    status = f"{info['passed']}/{info['total']}"
+                    if info["failed"]:
+                        status += f"  ({info['failed']} failed)"
+                    row = Adw.SwitchRow(title=info["name"], subtitle=status, active=True)
+                    fixtures_group.add(row)
+                    checks[key] = row
+                fixtures_group.set_description("")
+            else:
+                fixtures_group.set_description(
+                    f"No {plat_name} results yet — run once to see fixtures")
+
+        def set_all(active):
+            for row in checks.values():
+                row.set_active(active)
+
+        sel_btn.connect("clicked", lambda _: set_all(True))
+        desel_btn.connect("clicked", lambda _: set_all(False))
+        plat_row.connect("notify::selected", rebuild_fixtures)
+        rebuild_fixtures()  # initial
+
+        # Run button
+        run_btn = Gtk.Button(label="Run Tests", css_classes=["suggested-action", "pill"],
+                             halign=Gtk.Align.CENTER)
+        run_btn.set_margin_top(12)
+        run_btn.set_margin_bottom(12)
+
+        def on_run(_):
+            platform = plat_model.get_string(plat_row.get_selected())
+            filter_text = filter_entry.get_text().strip()
+            if not filter_text:
+                active = [v["name"] for k, v in checks.items() if checks[k].get_active()]
+                total = len(checks)
+                # If all selected or none selected → run all (no filter)
+                if active and len(active) < total:
+                    filter_text = "|".join(active)
+            dlg.close()
+            self._on_run_tests(proj, platform, test_filter=filter_text or None)
+
+        run_btn.connect("clicked", on_run)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(page)
+        box.append(run_btn)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_child(box)
+        tb.set_content(scroll)
+        dlg.set_child(tb)
+        dlg.present(self)
+
+    def _on_run_tests(self, proj, platform, test_filter=None):
         """Run Unity tests in batchmode and parse NUnit XML results."""
         unity = get_unity_for_project(self.cfg, proj)
         if not unity or not os.path.isfile(unity):
@@ -806,6 +944,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         if os.path.exists(results_xml):
             os.remove(results_xml)
 
+        filter_label = f" ({test_filter})" if test_filter else ""
+        self.stage_label.set_text(f"Running {platform} tests{filter_label}...")
+
         cmd = [unity, "-batchmode",
                "-disable-assembly-updater",
                "-accept-apiupdate",
@@ -817,6 +958,8 @@ class BuilderWindow(Adw.ApplicationWindow):
                "-testPlatform", platform,
                "-testResults", results_xml,
                "-logFile", "-"]
+        if test_filter:
+            cmd.extend(["-testFilter", test_filter])
         # EditMode doesn't need graphics; PlayMode needs GPU for scene rendering
         if platform == "EditMode":
             cmd.insert(2, "-nographics")
@@ -864,6 +1007,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                 test_completed = False
                 last_line = ""
                 repeat_count = 0
+                screenshots = []
                 for line in proc.stdout:
                     full_log.append(line)
                     s = line.strip()
@@ -879,6 +1023,21 @@ class BuilderWindow(Adw.ApplicationWindow):
                         repeat_count = 0
                         last_line = s
 
+                    # Detect fatal crash / corrupted library
+                    if "Caught fatal signal" in s or "corrupted" in s.lower() or "Fatal Error" in s:
+                        if not compiler_error:
+                            compiler_error = True
+                            if "corrupted" in s.lower():
+                                GLib.idle_add(self._log, "\n  Library corrupted — use Clean Build\n")
+                                GLib.idle_add(self.stage_label.set_text, "Library corrupted")
+                            else:
+                                GLib.idle_add(self._log, "\n  Unity crashed (fatal signal)\n")
+                                GLib.idle_add(self.stage_label.set_text, "Unity crashed")
+                            GLib.idle_add(self.progress_bar.set_fraction, 0)
+                            try: os.killpg(os.getpgid(proc.pid), 9)
+                            except: pass
+                            break
+
                     # Detect Unity lockfile / editor open
                     if "Failed to write file" in s and "EditorUserBuildSettings" in s:
                         if repeat_count == 0:
@@ -890,8 +1049,19 @@ class BuilderWindow(Adw.ApplicationWindow):
                             break
 
                     GLib.idle_add(self._log, line)
+                    # Collect screenshots from TestScreenshot.Capture
+                    if "[Screenshot]" in s:
+                        path = s.split("[Screenshot]")[-1].strip()
+                        if os.path.isfile(path):
+                            screenshots.append(path)
                     if "compiler errors" in s.lower() or "Aborting batchmode" in s:
                         compiler_error = True
+                        GLib.idle_add(self._log, "\n  Compiler errors — aborting\n")
+                        GLib.idle_add(self.stage_label.set_text, "Compiler errors")
+                        GLib.idle_add(self.progress_bar.set_fraction, 0)
+                        try: os.killpg(os.getpgid(proc.pid), 9)
+                        except: pass
+                        break
                     # Count completed tests from NUnit output
                     if any(k in s for k in ("Passed", "Failed", "Skipped", "##utp")):
                         test_done += 1
@@ -907,7 +1077,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                         except: pass
                         GLib.idle_add(self._stop_test_timer)
                         GLib.idle_add(self.cancel_btn.set_sensitive, False)
-                        GLib.idle_add(self._parse_test_results, proj, platform, results_xml, 0)
+                        GLib.idle_add(self._parse_test_results, proj, platform, results_xml, 0, screenshots)
                         # Let Unity finish in background
                         break
 
@@ -931,7 +1101,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                         GLib.idle_add(self.progress_bar.set_fraction, 0)
                         GLib.idle_add(self.status.set_text, f"{proj['name']} — compiler errors")
                     else:
-                        GLib.idle_add(self._parse_test_results, proj, platform, results_xml, proc.returncode)
+                        GLib.idle_add(self._parse_test_results, proj, platform, results_xml, proc.returncode, screenshots)
             except Exception as e:
                 restore_adb()
                 GLib.idle_add(self._stop_test_timer)
@@ -949,7 +1119,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.spinner.stop()
         self.elapsed_label.set_text("")
 
-    def _parse_test_results(self, proj, platform, xml_path, exit_code):
+    def _parse_test_results(self, proj, platform, xml_path, exit_code, screenshots=None):
         """Parse NUnit XML test results and display summary."""
         self.progress_bar.set_fraction(1.0 if exit_code == 0 else 0)
 
@@ -1025,9 +1195,41 @@ class BuilderWindow(Adw.ApplicationWindow):
             h[f"{proj['name']}_test_{platform}"] = int(duration)
             save_history(h)
 
+            # Show screenshots gallery
+            if screenshots:
+                self._log(f"\n  Screenshots ({len(screenshots)}):\n")
+                for sp in screenshots:
+                    self._log(f"    {os.path.basename(sp)}\n")
+                show_screenshots(self, screenshots, proj["name"], platform)
+
         except ET.ParseError as e:
             self._log(f"Failed to parse results: {e}\n")
             self.stage_label.set_text("Parse error")
+
+    def _on_clear_cache(self, proj):
+        """Delete only Bee/artifacts — fixes most compilation cache issues."""
+        import shutil
+        path = proj["path"]
+        targets = [
+            os.path.join(path, "Library", "Bee", "artifacts"),
+            os.path.join(path, "Library", "ScriptAssemblies"),
+        ]
+        deleted = []
+        for p in targets:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+                deleted.append(os.path.relpath(p, path))
+        # Also remove lockfile
+        lock = os.path.join(path, "Temp", "UnityLockfile")
+        if os.path.exists(lock):
+            try:
+                os.remove(lock)
+                deleted.append("Temp/UnityLockfile")
+            except: pass
+        if deleted:
+            self._log(f"Cache cleared: {', '.join(deleted)}\n")
+        else:
+            self._log("Cache already clean\n")
 
     def _on_clean_build(self, proj):
         """Delete Library and Bee folders for a clean rebuild."""

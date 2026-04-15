@@ -237,15 +237,46 @@ def _find_log(build_entry):
     if not name or not date:
         return None
     ts = date.replace("-", "").replace(" ", "_").replace(":", "")
-    pattern = os.path.join(logs_dir, f"{name}_{ts}*.log")
-    matches = sorted(glob.glob(pattern))
-    if matches:
-        return matches[-1]
-    prefix = os.path.join(logs_dir, f"{name}_{ts[:8]}")
-    matches = sorted(glob.glob(prefix + "*.log"))
-    if matches:
-        return matches[-1]
-    return None
+    is_test = build_entry.get("type") == "test"
+
+    # Get all logs for this project
+    all_logs = sorted(glob.glob(os.path.join(logs_dir, f"{name}_*.log")))
+    if is_test:
+        target = build_entry.get("target", "").replace("test-", "")
+        candidates = [f for f in all_logs if "_test_" in f and target in f]
+    else:
+        candidates = [f for f in all_logs if "_test_" not in f]
+
+    if not candidates:
+        return None
+
+    # Exact match: timestamp prefix
+    for f in candidates:
+        if ts in os.path.basename(f):
+            return f
+
+    # Closest match: find log with nearest timestamp
+    # ts format: "20260415_1132" — compare with filename timestamps
+    import re
+    best = None
+    best_diff = float("inf")
+    try:
+        entry_mins = int(ts[:8]) * 1440 + int(ts[9:11]) * 60 + int(ts[11:13])
+    except (ValueError, IndexError):
+        return candidates[-1]
+
+    for f in candidates:
+        m = re.search(r'(\d{8})_(\d{6})', os.path.basename(f))
+        if m:
+            try:
+                f_mins = int(m.group(1)) * 1440 + int(m.group(2)[:2]) * 60 + int(m.group(2)[2:4])
+                diff = abs(f_mins - entry_mins)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = f
+            except ValueError:
+                pass
+    return best
 
 
 # ── Chart drawing ──
