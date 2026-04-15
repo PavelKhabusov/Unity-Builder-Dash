@@ -13,11 +13,17 @@ A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, 
 ### Projects
 - **Build** multiple Unity projects (Android APK, iOS Xcode) with one click
 - **Build All** — sequential builds across all configured projects
-- **Real-time build log** — colored output with search, level filter (Errors/Warnings/Stages), word wrap
+- **Run Tests** — EditMode and PlayMode tests via Unity Test Runner (batchmode)
+  - Real-time progress counter, ETA based on previous runs
+  - NUnit XML result parsing with pass/fail/skip summary
+  - Failed test details with error messages
+- **Real-time build log** — colored output with search, level filter, word wrap, copy
 - **Progress bar** with ETA based on previous builds
 - **Auto-increment toggle** — build with or without version bump
+- **Clean Build** — delete Library/Bee folders from context menu
 - **Upload to server** — FTP upload with per-project host, directory, and rename pattern
 - **Deploy to device** via [APK Dash](https://github.com/PavelKhabusov/APK-Dash) integration
+- **Drag & drop APK** — drop .apk onto Devices tab to install
 - **Desktop notifications** on build completion
 
 ### Devices
@@ -29,17 +35,22 @@ A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, 
   - Open profiler for specific app
   - Search/filter apps
 - **Install APK / Push file** to device
+- **Drag & drop APK** — drop .apk file to install on first connected device
 - **Screenshot** — capture and open
-- **Inline logcat** — real-time log viewer with app filter, level filter, search, pause
+- **Cast (scrcpy)** — screen mirroring via scrcpy
+- **Device Info** — model, Android version, CPU, storage, display resolution
+- **Inline logcat** — real-time log viewer with app filter, level filter, search, pause, copy
 - **Shell** — open terminal with `adb shell`
 - **Files** — open native file manager (MTP)
 - **WiFi / Airplane mode** toggle
 - **Restart ADB / Kill MTP** conflicts
 
 ### History
-- **Build history** — interactive chart (duration + APK size over time)
-- **Filters** — by project, success only, chart mode (duration/size/both), X axis (build #/time)
-- **Log viewer** — open build log files
+- **Tabs: Builds / Tests** — separate views with dedicated charts
+- **Build chart** — duration + APK size over time (smooth lines)
+- **Test chart** — passed/failed stacked bars per run
+- **Filters** — by project, success only, X axis (build #/time)
+- **Built-in log viewer** — open logs in-app with search, filter, copy
 
 ### Profiler
 - **Real-time performance monitoring** with live charts

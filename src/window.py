@@ -784,7 +784,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         if os.path.exists(results_xml):
             os.remove(results_xml)
 
-        cmd = [unity, "-batchmode", "-nographics",
+        cmd = [unity, "-batchmode",
                "-disable-assembly-updater",
                "-accept-apiupdate",
                "-DisableDirectConnection",
@@ -795,6 +795,9 @@ class BuilderWindow(Adw.ApplicationWindow):
                "-testPlatform", platform,
                "-testResults", results_xml,
                "-logFile", "-"]
+        # EditMode doesn't need graphics; PlayMode needs GPU for scene rendering
+        if platform == "EditMode":
+            cmd.insert(2, "-nographics")
 
         # Kill adb server to avoid conflicts
         try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)

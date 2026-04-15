@@ -1,5 +1,5 @@
 """Reusable log viewer widget with search, level filter, word wrap, and color tags."""
-from gi.repository import Gtk
+from gi.repository import Gtk, Gio
 
 
 # Tag configs: (name, foreground_color)
@@ -94,6 +94,24 @@ class LogView(Gtk.Box):
             if tag_name == "stage":
                 kwargs["weight"] = 700
             self._buffer.create_tag(tag_name, **kwargs)
+
+        # Track right-click position for context menu
+        self._last_click_line = -1
+        rclick = Gtk.GestureClick(button=3)
+        rclick.connect("pressed", self._on_track_click)
+        self._view.add_controller(rclick)
+
+        # Context menu: "Show in context" for filtered view
+        menu_model = Gio.Menu()
+        menu_model.append("Show in Context", "logview.show-context")
+        self._view.set_extra_menu(menu_model)
+
+        self._ctx_action = Gio.SimpleAction.new("show-context", None)
+        self._ctx_action.connect("activate", self._on_show_context)
+        self._ctx_action.set_enabled(False)
+        group = Gio.SimpleActionGroup()
+        group.add_action(self._ctx_action)
+        self._view.insert_action_group("logview", group)
 
         self._scroll = Gtk.ScrolledWindow(vexpand=True)
         self._scroll.set_child(self._view)
@@ -196,6 +214,11 @@ class LogView(Gtk.Box):
 
     def _on_filter(self, *_):
         self._rebuild()
+        self._update_ctx_action()
+
+    def _update_ctx_action(self):
+        has_filter = bool(self._search.get_text().strip()) or self._level_filter.get_selected() != 0
+        self._ctx_action.set_enabled(has_filter)
 
     def _on_copy(self, _):
         """Copy currently visible (filtered) log text to clipboard."""
@@ -206,6 +229,56 @@ class LogView(Gtk.Box):
             clipboard = display.get_clipboard()
             from gi.repository import Gdk
             clipboard.set(text)
+
+    def _on_track_click(self, gesture, n_press, x, y):
+        """Track right-click position for context menu action."""
+        bx, by = self._view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
+        ok, it = self._view.get_iter_at_location(bx, by)
+        if ok:
+            self._last_click_line = it.get_line()
+
+    def _on_show_context(self, *_):
+        """Show clicked line in full unfiltered log."""
+        line_num = self._last_click_line
+        if line_num < 0:
+            return
+        ok, start = self._buffer.get_iter_at_line(line_num)
+        if not ok:
+            return
+        end = start.copy()
+        end.forward_to_line_end()
+        clicked_text = self._buffer.get_text(start, end, False).strip()
+        if not clicked_text:
+            return
+
+        # Find this line in full log
+        target_idx = None
+        for i, full_line in enumerate(self._full_lines):
+            if clicked_text in full_line:
+                target_idx = i
+                break
+        if target_idx is None:
+            return
+
+        # Clear filters
+        self._search.set_text("")
+        self._level_filter.set_selected(0)
+        self._rebuild()
+
+        # Scroll after GTK layout update
+        def do_scroll():
+            ok, it = self._buffer.get_iter_at_line(target_idx)
+            if ok:
+                mk = self._buffer.create_mark("ctx", it, True)
+                self._view.scroll_mark_onscreen(mk)
+                end = it.copy()
+                end.forward_to_line_end()
+                self._buffer.select_range(it, end)
+                self._buffer.delete_mark(mk)
+            return False
+
+        from gi.repository import GLib
+        GLib.idle_add(do_scroll)
 
     def _on_wrap(self, btn):
         self._view.set_wrap_mode(
