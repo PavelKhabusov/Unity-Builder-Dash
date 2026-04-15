@@ -508,7 +508,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         test_section = Gio.Menu()
         test_section.append("Run EditMode Tests", f"win.test-edit-{proj_id}")
         test_section.append("Run PlayMode Tests", f"win.test-play-{proj_id}")
-        test_section.append("Select Tests…", f"win.test-dialog-{proj_id}")
+        test_section.append("Select Tests…", f"win.test-pick-{proj_id}")
         menu.append_section(None, test_section)
 
         clean_section = Gio.Menu()
@@ -526,7 +526,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                 ["xdg-open", p["path"]])),
             (f"test-edit-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "EditMode")),
             (f"test-play-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "PlayMode")),
-            (f"test-dialog-{proj_id}", lambda *_, p=proj: self._show_test_dialog(p)),
+            (f"test-pick-{proj_id}", lambda *_, p=proj: self._show_test_picker(p)),
             (f"clear-cache-{proj_id}", lambda *_, p=proj: self._on_clear_cache(p)),
             (f"clean-{proj_id}", lambda *_, p=proj: self._on_clean_build(p)),
         ]
@@ -850,7 +850,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         sel_btn.connect("clicked", lambda _: set_all(True))
         desel_btn.connect("clicked", lambda _: set_all(False))
         plat_row.connect("notify::selected", rebuild_fixtures)
-        rebuild_fixtures()  # initial
+        print("[test_picker] calling rebuild_fixtures initially")
+        rebuild_fixtures()
+        print("[test_picker] initial call done")  # initial
 
         # Run button
         run_btn = Gtk.Button(label="Run Tests", css_classes=["suggested-action", "pill"],
@@ -879,6 +881,210 @@ class BuilderWindow(Adw.ApplicationWindow):
         scroll = Gtk.ScrolledWindow(vexpand=True)
         scroll.set_child(box)
         tb.set_content(scroll)
+        dlg.set_child(tb)
+        dlg.present(self)
+
+    def _scan_tests(self, proj_path, platform):
+        """Scan .cs test files for [Test]/[UnityTest] methods."""
+        import re as _re
+        import glob as _glob
+        test_dir = os.path.join(proj_path, "Assets")
+        cs_files = set()
+        for pat in ["**/Tests/**/*.cs"]:
+            cs_files.update(_glob.glob(os.path.join(test_dir, pat), recursive=True))
+        
+        # Filter by platform based on directory
+        filtered = set()
+        for f in cs_files:
+            if platform == "EditMode" and ("Editor" in f or "EditMode" in f):
+                filtered.add(f)
+            elif platform == "PlayMode" and "Editor" not in f:
+                filtered.add(f)
+        
+        tests = []
+        for cs_file in sorted(filtered):
+            try:
+                with open(cs_file, errors="replace") as f:
+                    lines = f.readlines()
+            except: continue
+            current_class = ""
+            next_is_test = False
+            for line in lines:
+                cm = _re.match(r'.*class\s+(\w+)', line)
+                if cm:
+                    current_class = cm.group(1)
+                if "[Test]" in line or "[UnityTest]" in line:
+                    next_is_test = True
+                    continue
+                if next_is_test:
+                    mm = _re.match(r'\s+public\s+\S+\s+(\w+)\s*\(', line)
+                    if mm:
+                        tests.append({
+                            "class": current_class,
+                            "method": mm.group(1),
+                            "full": f"{current_class}.{mm.group(1)}",
+                            "file": os.path.basename(cs_file),
+                        })
+                    next_is_test = False
+        return tests
+
+    def _show_test_picker(self, proj, platform=None):
+        """Show dialog to select platform and tests to run."""
+        dlg = Adw.Dialog()
+        dlg.set_title(f"{proj['name']} — Run Tests")
+        dlg.set_content_width(520)
+        dlg.set_content_height(650)
+
+        tb = Adw.ToolbarView()
+        tb.add_top_bar(Adw.HeaderBar())
+
+        page = Adw.PreferencesPage()
+
+        # Platform selector
+        plat_grp = Adw.PreferencesGroup(title="Platform")
+        plat_row = Adw.ComboRow(title="Test Platform")
+        plat_row.set_model(Gtk.StringList.new(["EditMode", "PlayMode"]))
+        plat_row.set_selected(1 if platform == "PlayMode" else 0)
+        plat_grp.add(plat_row)
+        filter_entry = Adw.EntryRow(title="Test filter (class or method name)")
+        plat_grp.add(filter_entry)
+        page.add(plat_grp)
+
+        fixture_grp = [None]  # mutable ref
+        checks = []
+        state = {"tests": []}
+
+        def rebuild_fixtures(*_):
+          print(f"[rebuild_fixtures] CALLED, platform idx={plat_row.get_selected()}")
+          try:
+            # Remove old group
+            if fixture_grp[0]:
+                page.remove(fixture_grp[0])
+            checks.clear()
+
+            sel_platform = ["EditMode", "PlayMode"][plat_row.get_selected()]
+            grp = Adw.PreferencesGroup(title=f"Fixtures ({sel_platform})")
+
+            # Try XML results first
+            xml_path = os.path.join(proj["path"], f"test-results-{sel_platform.lower()}.xml")
+            test_names = []
+            if os.path.isfile(xml_path):
+                import xml.etree.ElementTree as ET
+                try:
+                    tree = ET.parse(xml_path)
+                    for tc in tree.getroot().iter("test-case"):
+                        name = tc.get("fullname", tc.get("name", ""))
+                        result = tc.get("result", "")
+                        if name:
+                            test_names.append({"name": name, "result": result})
+                except: pass
+
+            if not test_names:
+                scanned = self._scan_tests(proj["path"], sel_platform)
+                test_names = [{"name": t["full"], "result": ""} for t in scanned]
+                if not scanned:
+                    print(f"[test_picker] WARNING: 0 tests found for {sel_platform} in {proj['path']}")
+
+            if not test_names:
+                grp.set_description(f"No {sel_platform} tests found — run once to see fixtures")
+            else:
+                grp.set_description(f"{len(test_names)} tests")
+
+            state["tests"] = test_names
+
+            # Group by class
+            by_class = {}
+            for t in test_names:
+                cls = t["name"].rsplit(".", 1)[0] if "." in t["name"] else "Other"
+                by_class.setdefault(cls, []).append(t)
+
+            for cls, class_tests in by_class.items():
+                passed = sum(1 for t in class_tests if t["result"] == "Passed")
+                failed = sum(1 for t in class_tests if t["result"] == "Failed")
+                total = len(class_tests)
+                sub = f"{passed}/{total} passed" if passed else f"{total} tests"
+                if failed: sub += f", {failed} failed"
+
+                exp = Adw.ExpanderRow(title=cls, subtitle=sub)
+                if failed:
+                    exp.add_prefix(Gtk.Image.new_from_icon_name("dialog-error-symbolic"))
+                elif passed == total and total > 0:
+                    exp.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
+
+                class_check = Gtk.CheckButton(active=True, valign=Gtk.Align.CENTER)
+                exp.add_suffix(class_check)
+
+                method_checks = []
+                for t in class_tests:
+                    method = t["name"].split(".")[-1] if "." in t["name"] else t["name"]
+                    row = Adw.SwitchRow(title=method, active=True)
+                    if t["result"] == "Passed":
+                        row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
+                    elif t["result"] == "Failed":
+                        row.add_prefix(Gtk.Image.new_from_icon_name("dialog-error-symbolic"))
+                    exp.add_row(row)
+                    checks.append((row, t["name"], row))
+                    method_checks.append(row)
+
+                # Class checkbox toggles all methods
+                def toggle_class(btn, mc=method_checks):
+                    active = btn.get_active()
+                    for r in mc:
+                        r.set_active(active)
+                class_check.connect("toggled", toggle_class)
+
+                grp.add(exp)
+
+            # Select all / none
+            sel_row = Adw.ActionRow(title="Select All / Deselect All")
+            all_btn = Gtk.Button(label="All", css_classes=["flat"], valign=Gtk.Align.CENTER)
+            none_btn = Gtk.Button(label="None", css_classes=["flat"], valign=Gtk.Align.CENTER)
+            all_btn.connect("clicked", lambda _: [r.set_active(True) for c, n, r in checks])
+            none_btn.connect("clicked", lambda _: [r.set_active(False) for c, n, r in checks])
+            sel_row.add_suffix(all_btn)
+            sel_row.add_suffix(none_btn)
+            grp.add(sel_row)
+
+            fixture_grp[0] = grp
+            page.add(grp)
+          except Exception as e:
+            print(f"[rebuild_fixtures] ERROR: {e}")
+            import traceback; traceback.print_exc()
+
+        plat_row.connect("notify::selected", rebuild_fixtures)
+        print("[test_picker] calling rebuild_fixtures initially")
+        rebuild_fixtures()
+        print("[test_picker] initial call done")
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_child(page)
+
+        # Run button
+        run_btn = Gtk.Button(label="Run Tests", css_classes=["suggested-action"],
+                             halign=Gtk.Align.CENTER)
+        run_btn.set_margin_top(12)
+        run_btn.set_margin_bottom(16)
+
+        def on_run(_):
+            sel_platform = ["EditMode", "PlayMode"][plat_row.get_selected()]
+            manual_filter = filter_entry.get_text().strip()
+            if manual_filter:
+                test_filter = manual_filter
+            else:
+                selected = [name for ch, name, row in checks if row.get_active()]
+                if not selected or len(selected) == len(state["tests"]):
+                    test_filter = None
+                else:
+                    test_filter = "||".join(selected)
+            dlg.close()
+            self._on_run_tests(proj, sel_platform, test_filter=test_filter)
+
+        run_btn.connect("clicked", on_run)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vbox.append(scroll)
+        vbox.append(run_btn)
+        tb.set_content(vbox)
         dlg.set_child(tb)
         dlg.present(self)
 
@@ -961,6 +1167,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                "-logFile", "-"]
         if test_filter:
             cmd.extend(["-testFilter", test_filter])
+            self._log(f"Filter: {test_filter}\n\n")
         # EditMode doesn't need graphics; PlayMode needs GPU for scene rendering
         if platform == "EditMode":
             cmd.insert(2, "-nographics")
