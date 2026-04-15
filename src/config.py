@@ -17,7 +17,8 @@ DEFAULT_CONFIG = {
         "remote_dir": "",
         "rename_pattern": "{name}_mq3_{build}.apk"
     },
-    "projects": []
+    "projects": [],
+    "log_filters": []  # strings to exclude from build/test logs
 }
 
 # ── Config I/O ──

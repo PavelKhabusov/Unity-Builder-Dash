@@ -1,7 +1,7 @@
 """Main application window with sidebar navigation."""
 import os, subprocess, datetime, time, threading
 from gi.repository import Gtk, Adw, GLib, Gio
-from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS
+from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS, SKIP_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
                      get_unity_for_project, upload_apk, save_test_entry, APP_DIR)
@@ -377,7 +377,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._log_widget = LogView(
             levels=["All", "Errors", "Warnings", "Stages"],
             get_tag=self._get_tag,
-            extra_end=[log_close])
+            extra_end=[log_close],
+            exclude_patterns=self.cfg.get("log_filters", []))
         self._build_log_box.append(self._log_widget)
 
         self._build_log_box.set_visible(False)
@@ -1023,20 +1024,19 @@ class BuilderWindow(Adw.ApplicationWindow):
                         repeat_count = 0
                         last_line = s
 
-                    # Detect fatal crash / corrupted library
-                    if "Caught fatal signal" in s or "corrupted" in s.lower() or "Fatal Error" in s:
+                    # Detect fatal crash
+                    if "Caught fatal signal" in s:
                         if not compiler_error:
                             compiler_error = True
-                            if "corrupted" in s.lower():
-                                GLib.idle_add(self._log, "\n  Library corrupted — use Clean Build\n")
-                                GLib.idle_add(self.stage_label.set_text, "Library corrupted")
-                            else:
-                                GLib.idle_add(self._log, "\n  Unity crashed (fatal signal)\n")
-                                GLib.idle_add(self.stage_label.set_text, "Unity crashed")
+                            GLib.idle_add(self._log, "\n  Unity crashed (fatal signal)\n")
+                            GLib.idle_add(self.stage_label.set_text, "Unity crashed")
                             GLib.idle_add(self.progress_bar.set_fraction, 0)
                             try: os.killpg(os.getpgid(proc.pid), 9)
                             except: pass
                             break
+                    # VirtualArtifacts corrupted — warn but don't kill, let Unity try to continue
+                    if "Fatal Error!" in s and "corrupted" in s.lower():
+                        GLib.idle_add(self.stage_label.set_text, "VirtualArtifacts error (continuing...)")
 
                     # Detect Unity lockfile / editor open
                     if "Failed to write file" in s and "EditorUserBuildSettings" in s:
@@ -1048,16 +1048,25 @@ class BuilderWindow(Adw.ApplicationWindow):
                             except: pass
                             break
 
+                    # Skip noisy Unity lines
+                    if any(p in s for p in SKIP_PATTERNS):
+                        full_log.append(line)
+                        continue
+
                     GLib.idle_add(self._log, line)
                     # Collect screenshots from TestScreenshot.Capture
                     if "[Screenshot]" in s:
                         path = s.split("[Screenshot]")[-1].strip()
                         if os.path.isfile(path):
                             screenshots.append(path)
-                    if "compiler errors" in s.lower() or "Aborting batchmode" in s:
+                    if "compiler errors" in s.lower() or "Aborting batchmode due to failure" in s:
                         compiler_error = True
                         GLib.idle_add(self._log, "\n  Compiler errors — aborting\n")
                         GLib.idle_add(self.stage_label.set_text, "Compiler errors")
+                    elif "Aborting batchmode due to fatal error" in s:
+                        compiler_error = True
+                        GLib.idle_add(self._log, "\n  Fatal error — Library may be corrupted, try Clean Build\n")
+                        GLib.idle_add(self.stage_label.set_text, "Fatal error")
                         GLib.idle_add(self.progress_bar.set_fraction, 0)
                         try: os.killpg(os.getpgid(proc.pid), 9)
                         except: pass
@@ -1112,6 +1121,10 @@ class BuilderWindow(Adw.ApplicationWindow):
         threading.Thread(target=run_tests, daemon=True).start()
 
     def _stop_test_timer(self):
+        # Save elapsed before clearing
+        import time as _time
+        if hasattr(self, '_test_start') and self._test_start:
+            self._test_elapsed = int(_time.time() - self._test_start)
         if hasattr(self, '_test_timer_id') and self._test_timer_id:
             GLib.source_remove(self._test_timer_id)
             self._test_timer_id = None
@@ -1141,12 +1154,8 @@ class BuilderWindow(Adw.ApplicationWindow):
             failed = int(root.get("failed", 0))
             skipped = int(root.get("skipped", 0))
             xml_duration = float(root.get("duration", 0))
-            # Real elapsed time (includes Unity startup/compile)
-            import time as _time
-            if hasattr(self, '_test_start') and self._test_start:
-                duration = int(_time.time() - self._test_start)
-            else:
-                duration = int(xml_duration)
+            # Real elapsed time (saved before timer was stopped)
+            duration = getattr(self, '_test_elapsed', 0) or int(xml_duration)
 
             self._log(f"\n{'='*50}\n")
             self._log(f"  {platform} Test Results: {passed} passed")
@@ -1260,3 +1269,4 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.cfg = cfg
         self._build_cards()
         self.empty.set_visible(not cfg.get("projects"))
+        self._log_widget.set_exclude_patterns(cfg.get("log_filters", []))

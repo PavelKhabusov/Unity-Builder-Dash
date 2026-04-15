@@ -62,6 +62,20 @@ class SettingsPage(Gtk.Box):
         grp.add(self.theme_row)
         page.add(grp)
 
+        # ── Log Filters ──
+        filter_grp = Adw.PreferencesGroup(title="Log Filters",
+            description="Lines containing these strings will be hidden from build/test logs (with their stack traces)")
+        add_filter_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
+        add_filter_btn.add_css_class("flat")
+        add_filter_btn.connect("clicked", self._add_filter_row)
+        filter_grp.set_header_suffix(add_filter_btn)
+
+        self._filter_grp = filter_grp
+        self._filter_rows = []
+        for f in cfg.get("log_filters", []):
+            self._add_filter_row(None, f)
+        page.add(filter_grp)
+
         # ── About ──
         about_grp = Adw.PreferencesGroup(title="About")
 
@@ -203,6 +217,19 @@ class SettingsPage(Gtk.Box):
         self.proj_rows.append(entry)
         self.proj_grp.add(exp)
 
+    def _add_filter_row(self, _, text=""):
+        row = Adw.EntryRow(title="Exclude pattern")
+        row.set_text(text)
+        remove_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                                css_classes=["flat"])
+        def do_remove(_, r=row):
+            self._filter_grp.remove(r)
+            self._filter_rows.remove(r)
+        remove_btn.connect("clicked", do_remove)
+        row.add_suffix(remove_btn)
+        self._filter_rows.append(row)
+        self._filter_grp.add(row)
+
     def _add_project(self, _):
         self._add_project_row()
 
@@ -244,11 +271,13 @@ class SettingsPage(Gtk.Box):
                 if pw: up["password"] = pw
                 p["upload"] = up
             projects.append(p)
+        log_filters = [r.get_text().strip() for r in self._filter_rows if r.get_text().strip()]
         self.cfg = {
             "unity": self.unity_row.get_text().strip(),
             "apk_dash": self.dash_row.get_text().strip(),
             "theme": theme_map.get(self.theme_row.get_selected(), "system"),
             "projects": projects,
+            "log_filters": log_filters,
         }
         save_config(self.cfg)
         self.on_save(self.cfg)

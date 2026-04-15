@@ -30,7 +30,7 @@ class LogView(Gtk.Box):
     get_tag(line) should return a tag name string (e.g. "error") or None.
     """
 
-    def __init__(self, levels=None, get_tag=None, margin=12, extra_start=None, extra_end=None):
+    def __init__(self, levels=None, get_tag=None, margin=12, extra_start=None, extra_end=None, exclude_patterns=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
         if margin:
             self.set_margin_top(4)
@@ -41,6 +41,7 @@ class LogView(Gtk.Box):
         self._get_tag = get_tag or (lambda _: None)
         self._full_lines = []  # all raw lines for refilter
         self._paused = False
+        self._exclude_patterns = exclude_patterns or []
 
         # ── Filter bar ──
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -152,9 +153,26 @@ class LogView(Gtk.Box):
         self._in_trace = False
         self._trace_ended_ago = 99
 
+    def set_exclude_patterns(self, patterns):
+        """Update exclude patterns at runtime."""
+        self._exclude_patterns = patterns or []
+
     def append_line(self, text):
         """Append a line, respecting current filter. Stores raw line for refilter."""
         s = text.strip()
+
+        # Skip lines matching exclude patterns (and suppress following trace)
+        if self._exclude_patterns and s:
+            for pat in self._exclude_patterns:
+                if pat in s:
+                    self._skip_until_non_trace = True
+                    return
+        # If skipping after excluded line, skip trace lines too
+        if getattr(self, '_skip_until_non_trace', False):
+            if not s or self._is_trace_line(text) or s.startswith("(Filename:"):
+                return
+            self._skip_until_non_trace = False
+
         # (Filename:...) — always fold into trace block (comes after trace + empty line)
         if s.startswith("(Filename:"):
             in_trace = getattr(self, '_in_trace', False)
