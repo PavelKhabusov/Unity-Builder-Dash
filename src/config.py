@@ -70,12 +70,14 @@ def save_build_entry(project_name, target, success, duration, apk_size=None, bui
         "build": build_number,
         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
+    if test_cases:
+        log[-1]["test_cases"] = test_cases
     # Keep last 100
     if len(log) > 100: log = log[-100:]
     with open(BUILDS_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
 
-def save_test_entry(project_name, platform, passed, failed, skipped, total, duration):
+def save_test_entry(project_name, platform, passed, failed, skipped, total, duration, test_cases=None):
     log = load_builds_log()
     log.append({
         "project": project_name,
@@ -89,6 +91,8 @@ def save_test_entry(project_name, platform, passed, failed, skipped, total, dura
         "total": total,
         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
+    if test_cases:
+        log[-1]["test_cases"] = test_cases
     if len(log) > 100: log = log[-100:]
     with open(BUILDS_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)

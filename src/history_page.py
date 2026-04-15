@@ -127,18 +127,66 @@ class HistoryPage(Gtk.Box):
                 if skipped:
                     result += f", {skipped} skipped"
 
-                row = Adw.ActionRow(
-                    title=f"{t['project']} — {t.get('target', '?').replace('test-', '')}",
-                    subtitle=f"{t.get('date', '?')}  {dm}:{ds:02d}  {result}")
-                row.add_prefix(Gtk.Image.new_from_icon_name(icon))
-                log = _find_log(t)
-                if log:
-                    log_btn = Gtk.Button(icon_name="document-open-symbolic",
-                                         tooltip_text="Open log", valign=Gtk.Align.CENTER,
-                                         css_classes=["flat"])
-                    log_btn.connect("clicked", lambda _, p=log: _open_log_viewer(self, p))
-                    row.add_suffix(log_btn)
-                grp.add(row)
+                test_cases = t.get("test_cases", [])
+                if test_cases:
+                    # Expandable row with test case details
+                    exp = Adw.ExpanderRow(
+                        title=f"{t['project']} — {t.get('target', '?').replace('test-', '')}",
+                        subtitle=f"{t.get('date', '?')}  {dm}:{ds:02d}  {result}")
+                    exp.add_prefix(Gtk.Image.new_from_icon_name(icon))
+
+                    # Failed tests first, then passed
+                    failed_tc = [tc for tc in test_cases if tc["result"] == "Failed"]
+                    passed_tc = [tc for tc in test_cases if tc["result"] == "Passed"]
+                    skipped_tc = [tc for tc in test_cases if tc["result"] not in ("Failed", "Passed")]
+
+                    for tc in failed_tc:
+                        short = tc["name"].split(".")[-1] if "." in tc["name"] else tc["name"]
+                        msg = tc.get("message", "")
+                        r = Adw.ActionRow(title=short, subtitle=msg or tc["name"])
+                        r.set_subtitle_selectable(True)
+                        r.add_prefix(Gtk.Image.new_from_icon_name("dialog-error-symbolic"))
+                        copy_text = f"{tc['name']}\n{msg}" if msg else tc["name"]
+                        cp_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                                            tooltip_text="Copy", valign=Gtk.Align.CENTER,
+                                            css_classes=["flat"])
+                        cp_btn.connect("clicked", lambda _, t=copy_text: _copy_to_clipboard(self, t))
+                        r.add_suffix(cp_btn)
+                        exp.add_row(r)
+
+                    for tc in passed_tc:
+                        short = tc["name"].split(".")[-1] if "." in tc["name"] else tc["name"]
+                        r = Adw.ActionRow(title=short, subtitle=tc["name"])
+                        r.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
+                        exp.add_row(r)
+
+                    for tc in skipped_tc:
+                        short = tc["name"].split(".")[-1] if "." in tc["name"] else tc["name"]
+                        r = Adw.ActionRow(title=short, subtitle=f"{tc['result']} — {tc['name']}")
+                        r.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+                        exp.add_row(r)
+
+                    log = _find_log(t)
+                    if log:
+                        log_btn = Gtk.Button(icon_name="document-open-symbolic",
+                                             tooltip_text="Open log", valign=Gtk.Align.CENTER,
+                                             css_classes=["flat"])
+                        log_btn.connect("clicked", lambda _, p=log: _open_log_viewer(self, p))
+                        exp.add_suffix(log_btn)
+                    grp.add(exp)
+                else:
+                    row = Adw.ActionRow(
+                        title=f"{t['project']} — {t.get('target', '?').replace('test-', '')}",
+                        subtitle=f"{t.get('date', '?')}  {dm}:{ds:02d}  {result}")
+                    row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+                    log = _find_log(t)
+                    if log:
+                        log_btn = Gtk.Button(icon_name="document-open-symbolic",
+                                             tooltip_text="Open log", valign=Gtk.Align.CENTER,
+                                             css_classes=["flat"])
+                        log_btn.connect("clicked", lambda _, p=log: _open_log_viewer(self, p))
+                        row.add_suffix(log_btn)
+                    grp.add(row)
             page.add(grp)
         else:
             grp = Adw.PreferencesGroup(title=f"Builds ({len(filtered[-20:])})")
@@ -431,3 +479,10 @@ def _open_log_viewer(parent, path):
     tb.set_content(lv)
     dlg.set_child(tb)
     dlg.present(parent.get_root())
+
+
+def _copy_to_clipboard(widget, text):
+    display = widget.get_display()
+    if display:
+        from gi.repository import Gdk
+        display.get_clipboard().set(text)

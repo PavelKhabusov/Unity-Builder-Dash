@@ -756,6 +756,28 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.progress_bar.pulse()
         self._test_proc = None
         self.cancel_btn.set_sensitive(True)
+
+        # Check if Unity Editor is open on this project
+        import subprocess as _sp
+        try:
+            ps = _sp.run(["pgrep", "-af", "Unity.*" + proj["path"].replace("/", ".")[-20:]],
+                         capture_output=True, text=True, timeout=3)
+            for line in ps.stdout.splitlines():
+                if "-batchmode" not in line and "Unity" in line and proj["path"][-15:] in line:
+                    self._log("Warning: Unity Editor may be open for this project\n")
+                    break
+        except: pass
+
+        # Kill any stale batchmode processes for this project
+        try:
+            ps = _sp.run(["pgrep", "-f", f"Unity.*-runTests.*{proj['path']}"],
+                         capture_output=True, text=True, timeout=3)
+            for pid in ps.stdout.strip().splitlines():
+                pid = pid.strip()
+                if pid.isdigit():
+                    os.kill(int(pid), 9)
+                    self._log(f"Killed stale test process (PID {pid})\n")
+        except: pass
         self.status.set_text(f"{proj['name']} / {platform} Tests")
 
         # Timer + ETA
@@ -840,10 +862,34 @@ class BuilderWindow(Adw.ApplicationWindow):
                 compiler_error = False
                 test_done = 0
                 test_completed = False
+                last_line = ""
+                repeat_count = 0
                 for line in proc.stdout:
                     full_log.append(line)
-                    GLib.idle_add(self._log, line)
                     s = line.strip()
+
+                    # Suppress repeated lines (spam)
+                    if s == last_line and s:
+                        repeat_count += 1
+                        if repeat_count == 3:
+                            GLib.idle_add(self._log, f"  ... (repeating, suppressed)\n")
+                        if repeat_count >= 3:
+                            continue
+                    else:
+                        repeat_count = 0
+                        last_line = s
+
+                    # Detect Unity lockfile / editor open
+                    if "Failed to write file" in s and "EditorUserBuildSettings" in s:
+                        if repeat_count == 0:
+                            GLib.idle_add(self._log, "\n  Unity Editor is open — close it and retry\n")
+                            GLib.idle_add(self.stage_label.set_text, "Unity Editor is open")
+                            compiler_error = True
+                            try: os.killpg(os.getpgid(proc.pid), 9)
+                            except: pass
+                            break
+
+                    GLib.idle_add(self._log, line)
                     if "compiler errors" in s.lower() or "Aborting batchmode" in s:
                         compiler_error = True
                     # Count completed tests from NUnit output
@@ -942,20 +988,28 @@ class BuilderWindow(Adw.ApplicationWindow):
             self._log(f"  ({total} total, {dm}:{ds:02d} total, tests {xml_duration:.1f}s)\n")
             self._log(f"{'='*50}\n\n")
 
-            # List failed tests
-            if failed:
-                for tc in root.iter("test-case"):
-                    if tc.get("result") == "Failed":
-                        name = tc.get("fullname", tc.get("name", "?"))
-                        msg = ""
-                        failure = tc.find("failure")
-                        if failure is not None:
-                            msg_el = failure.find("message")
-                            if msg_el is not None and msg_el.text:
-                                msg = msg_el.text.strip().split("\n")[0]
-                        self._log(f"  FAIL: {name}\n")
-                        if msg:
-                            self._log(f"        {msg}\n")
+            # Collect all test case results
+            test_cases = []
+            for tc in root.iter("test-case"):
+                name = tc.get("fullname", tc.get("name", "?"))
+                result = tc.get("result", "?")
+                tc_dur = tc.get("duration", "0")
+                entry = {"name": name, "result": result, "duration": tc_dur}
+                if result == "Failed":
+                    failure = tc.find("failure")
+                    if failure is not None:
+                        msg_el = failure.find("message")
+                        if msg_el is not None and msg_el.text:
+                            entry["message"] = msg_el.text.strip().split("\n")[0]
+                test_cases.append(entry)
+
+            # Log failed tests
+            failed_cases = [t for t in test_cases if t["result"] == "Failed"]
+            if failed_cases:
+                for t in failed_cases:
+                    self._log(f"  FAIL: {t['name']}\n")
+                    if t.get("message"):
+                        self._log(f"        {t['message']}\n")
                 self._log("\n")
 
             status = f"{passed}/{total} passed" if not failed else f"{failed} FAILED"
@@ -963,8 +1017,9 @@ class BuilderWindow(Adw.ApplicationWindow):
             dm, ds = divmod(duration, 60)
             self.status.set_text(f"{proj['name']} — {status} ({dm}:{ds:02d})")
 
-            # Save to history
-            save_test_entry(proj["name"], platform, passed, failed, skipped, total, duration)
+            # Save to history (with test case details)
+            save_test_entry(proj["name"], platform, passed, failed, skipped, total, duration,
+                            test_cases=test_cases)
             # Save duration for ETA
             h = load_history()
             h[f"{proj['name']}_test_{platform}"] = int(duration)
