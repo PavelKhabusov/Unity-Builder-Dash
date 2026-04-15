@@ -121,9 +121,50 @@ class BuildWorker:
                 if "[Build] FAILED" in s or "Scripts have compiler errors" in s or "Aborting batchmode" in s:
                     build_failed = True
 
+                # Stop reading once build result is known
+                if build_ok or build_failed:
+                    try:
+                        el = self.elapsed_str()
+                        if build_ok and not self.cancelled:
+                            # Wait for APK to appear
+                            import time as _time
+                            apk = None
+                            for _ in range(10):
+                                try:
+                                    apk = find_apk(self.project)
+                                    if apk and os.path.isfile(apk):
+                                        break
+                                except OSError:
+                                    pass
+                                _time.sleep(1)
+                            try:
+                                sz = f" ({os.path.getsize(apk)/(1024*1024):.0f} MB)" if apk else ""
+                            except OSError:
+                                sz = ""
+                            GLib.idle_add(self.log_cb, f"\n  Done!{sz} {el}\n")
+                            GLib.idle_add(self.done_cb, True)
+                        elif not self.cancelled:
+                            GLib.idle_add(self.log_cb, f"\n  Failed {el}\n")
+                            GLib.idle_add(self.done_cb, False)
+                    except Exception as e:
+                        GLib.idle_add(self.log_cb, f"\n  Done! {self.elapsed_str()}\n")
+                        GLib.idle_add(self.done_cb, build_ok)
+                    self._save_log(full_log)
+                    self._restore_adb()
+                    return
+
                 if any(p in s for p in SKIP_PATTERNS): continue
                 for pat, lbl in STAGE_PATTERNS:
                     if pat in s:
+                        # Don't go backwards in stages (e.g. Asset Pipeline Refresh)
+                        if lbl:
+                            try:
+                                stage_num = int(lbl.split("/")[0].replace("(", ""))
+                                if stage_num < getattr(self, '_current_stage', 0):
+                                    break
+                                self._current_stage = stage_num
+                            except (ValueError, IndexError):
+                                pass
                         GLib.idle_add(self.stage_cb, lbl or s, -1.0)
                         break
                 pm = PROGRESS_RE.search(s)
@@ -131,23 +172,6 @@ class BuildWorker:
                     c, t = int(pm.group(1)), int(pm.group(2))
                     if t > 0: GLib.idle_add(self.stage_cb, None, min(c/t, 1.0))
                 GLib.idle_add(self.log_cb, line)
-
-                # Stop reading once build result is known — but report done immediately
-                if build_ok or build_failed:
-                    # Report result now, let Unity finish cleanup in background
-                    el = self.elapsed_str()
-                    if build_ok and not self.cancelled:
-                        apk = find_apk(self.project)
-                        sz = f" ({os.path.getsize(apk)/(1024*1024):.0f} MB)" if apk else ""
-                        GLib.idle_add(self.log_cb, f"\n  Done!{sz} {el}\n")
-                        GLib.idle_add(self.done_cb, True)
-                    elif not self.cancelled:
-                        GLib.idle_add(self.log_cb, f"\n  Failed {el}\n")
-                        GLib.idle_add(self.done_cb, False)
-                    self._save_log(full_log)
-                    self.process.wait()
-                    self._restore_adb()
-                    return
 
             self.process.wait()
         except Exception as e:

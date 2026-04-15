@@ -632,42 +632,51 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.worker.start()
 
     def _on_done(self, ok):
-        name = self.worker.project["name"]
-        proj = self.worker.project
-        c = self.cards[name]
-        c["status"].set_text("Done" if ok else "Failed")
-        c["version"].set_text(get_version(proj["path"]))
-        if c["deploy"]:
-            c["deploy"].set_sensitive(find_apk(proj) is not None)
-
-        duration = int(time.time() - self.worker.start_time) if self.worker.start_time else 0
-        if ok and self.worker.start_time:
-            h = load_history()
-            h[f"{name}_{self.worker.target}"] = duration
-            save_history(h)
-
-        apk = find_apk(proj) if ok else None
-        save_build_entry(name, self.worker.target, ok, duration,
-                         os.path.getsize(apk) if apk else None,
-                         get_build_number(proj["path"]))
-
         try:
-            icon = "dialog-ok-apply" if ok else "dialog-error"
-            subprocess.Popen(["notify-send", "-i", icon, APP_NAME,
-                              f"{name}: {'done' if ok else 'failed'} ({self.worker.elapsed_str()})"])
-        except: pass
+            name = self.worker.project["name"]
+            proj = self.worker.project
+            c = self.cards[name]
+            c["status"].set_text("Done" if ok else "Failed")
+            c["version"].set_text(get_version(proj["path"]))
+            if c["deploy"]:
+                c["deploy"].set_sensitive(find_apk(proj) is not None)
 
-        el = self.worker.elapsed_str()
-        self._set_building(False)
-        self.status.set_text(f"{name}  {'done' if ok else 'failed'}  {el}")
-        self.stage_label.set_text("Done" if ok else "Failed")
-        self.progress_bar.set_fraction(1.0 if ok else 0)
-        self.worker = None
-        GLib.timeout_add(2000, self._build_cards)
+            duration = int(time.time() - self.worker.start_time) if self.worker.start_time else 0
+            if ok and self.worker.start_time:
+                h = load_history()
+                h[f"{name}_{self.worker.target}"] = duration
+                save_history(h)
 
-        if ok and self._build_queue:
-            p, t = self._build_queue.pop(0)
-            self._start(p, t)
+            apk = find_apk(proj) if ok else None
+            try:
+                apk_size = os.path.getsize(apk) if apk and os.path.isfile(apk) else None
+            except OSError:
+                apk_size = None
+            save_build_entry(name, self.worker.target, ok, duration,
+                             apk_size, get_build_number(proj["path"]))
+
+            try:
+                icon = "dialog-ok-apply" if ok else "dialog-error"
+                subprocess.Popen(["notify-send", "-i", icon, APP_NAME,
+                                  f"{name}: {'done' if ok else 'failed'} ({self.worker.elapsed_str()})"])
+            except: pass
+
+            el = self.worker.elapsed_str()
+            self.status.set_text(f"{name}  {'done' if ok else 'failed'}  {el}")
+
+            if ok and self._build_queue:
+                p, t = self._build_queue.pop(0)
+                self._start(p, t)
+        except Exception as e:
+            print(f"[_on_done] ERROR: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            # ALWAYS stop building state
+            self._set_building(False)
+            self.stage_label.set_text("Done" if ok else "Failed")
+            self.progress_bar.set_fraction(1.0 if ok else 0)
+            self.worker = None
+            GLib.timeout_add(2000, self._build_cards)
 
     def _on_deploy(self, proj):
         apk = find_apk(proj)

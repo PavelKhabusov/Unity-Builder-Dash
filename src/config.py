@@ -71,8 +71,6 @@ def save_build_entry(project_name, target, success, duration, apk_size=None, bui
         "build": build_number,
         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
-    if test_cases:
-        log[-1]["test_cases"] = test_cases
     # Keep last 100
     if len(log) > 100: log = log[-100:]
     with open(BUILDS_LOG_PATH, "w") as f:
