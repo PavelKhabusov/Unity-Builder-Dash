@@ -67,6 +67,11 @@ class LogView(Gtk.Box):
         wrap_toggle.connect("toggled", self._on_wrap)
         search_box.append(wrap_toggle)
 
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                              tooltip_text="Copy visible log", css_classes=["flat"])
+        copy_btn.connect("clicked", self._on_copy)
+        search_box.append(copy_btn)
+
         # Extra widgets at end
         for w in (extra_end or []):
             search_box.append(w)
@@ -191,6 +196,16 @@ class LogView(Gtk.Box):
 
     def _on_filter(self, *_):
         self._rebuild()
+
+    def _on_copy(self, _):
+        """Copy currently visible (filtered) log text to clipboard."""
+        text = self._buffer.get_text(
+            self._buffer.get_start_iter(), self._buffer.get_end_iter(), False)
+        display = self._view.get_display()
+        if display:
+            clipboard = display.get_clipboard()
+            from gi.repository import Gdk
+            clipboard.set(text)
 
     def _on_wrap(self, btn):
         self._view.set_wrap_mode(

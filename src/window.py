@@ -4,7 +4,7 @@ from gi.repository import Gtk, Adw, GLib, Gio
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
-                     get_unity_for_project, upload_apk)
+                     get_unity_for_project, upload_apk, save_test_entry, APP_DIR)
 from .worker import BuildWorker
 from .settings_page import SettingsPage
 from .history_page import HistoryPage
@@ -501,6 +501,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         menu.append("Open in Unity", f"win.open-unity-{proj_id}")
         menu.append("Open Build Folder", f"win.folder-{proj_id}")
         menu.append("Open Project Folder", f"win.proj-folder-{proj_id}")
+        menu.append("Run EditMode Tests", f"win.test-edit-{proj_id}")
+        menu.append("Run PlayMode Tests", f"win.test-play-{proj_id}")
         menu.append("Clean Build (delete Library)", f"win.clean-{proj_id}")
 
         action_list = [
@@ -511,6 +513,8 @@ class BuilderWindow(Adw.ApplicationWindow):
                 ["xdg-open", p.get("build_dir") or p["path"]])),
             (f"proj-folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
                 ["xdg-open", p["path"]])),
+            (f"test-edit-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "EditMode")),
+            (f"test-play-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "PlayMode")),
             (f"clean-{proj_id}", lambda *_, p=proj: self._on_clean_build(p)),
         ]
         for action_name, callback in action_list:
@@ -726,10 +730,246 @@ class BuilderWindow(Adw.ApplicationWindow):
         if self.worker:
             self.worker.cancel()
             self.worker._restore_adb()
-        self._set_building(False)
+            self._set_building(False)
+        if hasattr(self, '_test_proc') and self._test_proc:
+            try:
+                os.killpg(os.getpgid(self._test_proc.pid), 9)
+            except ProcessLookupError:
+                pass
+            self._test_proc = None
+            self._stop_test_timer()
+            self.cancel_btn.set_sensitive(False)
         self.stage_label.set_text("Cancelled")
         self.progress_bar.set_fraction(0)
         self._log("\n  Cancelled by user.\n")
+
+    def _on_run_tests(self, proj, platform):
+        """Run Unity tests in batchmode and parse NUnit XML results."""
+        unity = get_unity_for_project(self.cfg, proj)
+        if not unity or not os.path.isfile(unity):
+            self._log("Unity editor not found. Check Settings.\n")
+            return
+
+        self._log_widget.clear()
+        self._toggle_build_log(True)
+        self.stage_label.set_text(f"Running {platform} tests...")
+        self.progress_bar.pulse()
+        self._test_proc = None
+        self.cancel_btn.set_sensitive(True)
+        self.status.set_text(f"{proj['name']} / {platform} Tests")
+
+        # Timer + ETA
+        import time as _time
+        self._test_start = _time.time()
+        test_key = f"{proj['name']}_test_{platform}"
+        prev_duration = load_history().get(test_key)
+
+        def tick_test():
+            if not hasattr(self, '_test_start') or self._test_start is None:
+                return False
+            elapsed = int(_time.time() - self._test_start)
+            m, s = divmod(elapsed, 60)
+            if prev_duration and prev_duration > elapsed:
+                rm, rs = divmod(prev_duration - elapsed, 60)
+                self.elapsed_label.set_text(f"{m}:{s:02d}  ~{rm}:{rs:02d} left")
+            else:
+                self.elapsed_label.set_text(f"{m}:{s:02d}")
+            return True
+
+        self.spinner.start()
+        self._test_timer_id = GLib.timeout_add(1000, tick_test)
+
+        results_xml = os.path.join(proj["path"], f"test-results-{platform.lower()}.xml")
+        # Remove old results
+        if os.path.exists(results_xml):
+            os.remove(results_xml)
+
+        cmd = [unity, "-batchmode", "-nographics",
+               "-disable-assembly-updater",
+               "-accept-apiupdate",
+               "-DisableDirectConnection",
+               "-skipMissingProjectID",
+               "-skipMissingUPID",
+               "-projectPath", proj["path"],
+               "-runTests",
+               "-testPlatform", platform,
+               "-testResults", results_xml,
+               "-logFile", "-"]
+
+        # Kill adb server to avoid conflicts
+        try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
+        except: pass
+
+        lock = os.path.join(proj["path"], "Temp", "UnityLockfile")
+        if os.path.exists(lock):
+            os.remove(lock)
+
+        # Hide ADB to skip device scan (like build worker)
+        unity_adb = os.path.join(os.path.dirname(unity),
+            "Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb")
+        adb_hidden = unity_adb + ".disabled"
+        adb_was_hidden = False
+        if proj.get("hide_adb") and os.path.exists(unity_adb):
+            try:
+                os.rename(unity_adb, adb_hidden)
+                adb_was_hidden = True
+            except: pass
+
+        def restore_adb():
+            if adb_was_hidden and not os.path.exists(unity_adb) and os.path.exists(adb_hidden):
+                try: os.rename(adb_hidden, unity_adb)
+                except: pass
+
+        # Log file
+        import datetime as _dt
+        logs_dir = os.path.join(APP_DIR, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(logs_dir, f"{proj['name']}_{ts}_test_{platform}.log")
+
+        def run_tests():
+            full_log = []
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, preexec_fn=os.setsid)
+                self._test_proc = proc
+                compiler_error = False
+                test_done = 0
+                test_completed = False
+                for line in proc.stdout:
+                    full_log.append(line)
+                    GLib.idle_add(self._log, line)
+                    s = line.strip()
+                    if "compiler errors" in s.lower() or "Aborting batchmode" in s:
+                        compiler_error = True
+                    # Count completed tests from NUnit output
+                    if any(k in s for k in ("Passed", "Failed", "Skipped", "##utp")):
+                        test_done += 1
+                        GLib.idle_add(self.stage_label.set_text,
+                                      f"Running {platform} tests... ({test_done} done)")
+                    # Detect test completion — don't wait for Unity to fully exit
+                    if "Test run completed" in s:
+                        test_completed = True
+                        # Save log and show results immediately
+                        try:
+                            with open(log_path, "w") as f:
+                                f.writelines(full_log)
+                        except: pass
+                        GLib.idle_add(self._stop_test_timer)
+                        GLib.idle_add(self.cancel_btn.set_sensitive, False)
+                        GLib.idle_add(self._parse_test_results, proj, platform, results_xml, 0)
+                        # Let Unity finish in background
+                        break
+
+                # Wait for process to actually exit
+                proc.wait()
+                self._test_proc = None
+                restore_adb()
+
+                # Save final log
+                try:
+                    with open(log_path, "w") as f:
+                        f.writelines(full_log)
+                except: pass
+
+                if not test_completed:
+                    GLib.idle_add(self._stop_test_timer)
+                    GLib.idle_add(self.cancel_btn.set_sensitive, False)
+                    if compiler_error:
+                        GLib.idle_add(self._log, "\n  Tests aborted: compiler errors in project\n")
+                        GLib.idle_add(self.stage_label.set_text, "Tests failed: compiler errors")
+                        GLib.idle_add(self.progress_bar.set_fraction, 0)
+                        GLib.idle_add(self.status.set_text, f"{proj['name']} — compiler errors")
+                    else:
+                        GLib.idle_add(self._parse_test_results, proj, platform, results_xml, proc.returncode)
+            except Exception as e:
+                restore_adb()
+                GLib.idle_add(self._stop_test_timer)
+                GLib.idle_add(self._log, f"Error: {e}\n")
+                GLib.idle_add(self.stage_label.set_text, "Test error")
+                GLib.idle_add(self.progress_bar.set_fraction, 0)
+
+        threading.Thread(target=run_tests, daemon=True).start()
+
+    def _stop_test_timer(self):
+        if hasattr(self, '_test_timer_id') and self._test_timer_id:
+            GLib.source_remove(self._test_timer_id)
+            self._test_timer_id = None
+        self._test_start = None
+        self.spinner.stop()
+        self.elapsed_label.set_text("")
+
+    def _parse_test_results(self, proj, platform, xml_path, exit_code):
+        """Parse NUnit XML test results and display summary."""
+        self.progress_bar.set_fraction(1.0 if exit_code == 0 else 0)
+
+        if not os.path.isfile(xml_path):
+            self._log(f"\nNo results file generated (exit code {exit_code})\n")
+            self.stage_label.set_text("Tests failed (no results)")
+            self.progress_bar.set_fraction(0)
+            self.status.set_text(f"{proj['name']} — no test results")
+            return
+
+        import xml.etree.ElementTree as ET
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+
+            # NUnit3 format
+            total = int(root.get("total", 0))
+            passed = int(root.get("passed", 0))
+            failed = int(root.get("failed", 0))
+            skipped = int(root.get("skipped", 0))
+            xml_duration = float(root.get("duration", 0))
+            # Real elapsed time (includes Unity startup/compile)
+            import time as _time
+            if hasattr(self, '_test_start') and self._test_start:
+                duration = int(_time.time() - self._test_start)
+            else:
+                duration = int(xml_duration)
+
+            self._log(f"\n{'='*50}\n")
+            self._log(f"  {platform} Test Results: {passed} passed")
+            if failed:
+                self._log(f", {failed} FAILED")
+            if skipped:
+                self._log(f", {skipped} skipped")
+            dm, ds = divmod(duration, 60)
+            self._log(f"  ({total} total, {dm}:{ds:02d} total, tests {xml_duration:.1f}s)\n")
+            self._log(f"{'='*50}\n\n")
+
+            # List failed tests
+            if failed:
+                for tc in root.iter("test-case"):
+                    if tc.get("result") == "Failed":
+                        name = tc.get("fullname", tc.get("name", "?"))
+                        msg = ""
+                        failure = tc.find("failure")
+                        if failure is not None:
+                            msg_el = failure.find("message")
+                            if msg_el is not None and msg_el.text:
+                                msg = msg_el.text.strip().split("\n")[0]
+                        self._log(f"  FAIL: {name}\n")
+                        if msg:
+                            self._log(f"        {msg}\n")
+                self._log("\n")
+
+            status = f"{passed}/{total} passed" if not failed else f"{failed} FAILED"
+            self.stage_label.set_text(f"{platform}: {status}")
+            dm, ds = divmod(duration, 60)
+            self.status.set_text(f"{proj['name']} — {status} ({dm}:{ds:02d})")
+
+            # Save to history
+            save_test_entry(proj["name"], platform, passed, failed, skipped, total, duration)
+            # Save duration for ETA
+            h = load_history()
+            h[f"{proj['name']}_test_{platform}"] = int(duration)
+            save_history(h)
+
+        except ET.ParseError as e:
+            self._log(f"Failed to parse results: {e}\n")
+            self.stage_label.set_text("Parse error")
 
     def _on_clean_build(self, proj):
         """Delete Library and Bee folders for a clean rebuild."""

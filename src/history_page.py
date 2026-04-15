@@ -1,23 +1,35 @@
-"""History page — build history as a full page instead of dialog."""
+"""History page — build & test history with tabs, charts, log viewer."""
 import math, os, subprocess, glob
 from gi.repository import Gtk, Adw
 from .config import load_builds_log, APP_DIR
+from .log_view import LogView
 
 
 class HistoryPage(Gtk.Box):
-    """Full-page build history with chart and list."""
+    """Tabbed history: Builds and Tests with charts and lists."""
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        self._state = {"project": None, "success_only": False,
-                       "chart_mode": 0, "x_mode": 0}
+        self._state = {"project": None, "success_only": False, "x_mode": 0}
 
-        # ── Filters ──
+        # ── Tabs + Filters (one row) ──
         filter_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
                              halign=Gtk.Align.CENTER)
         filter_box.set_margin_top(8)
         filter_box.set_margin_bottom(4)
+
+        tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        tab_box.add_css_class("linked")
+        self._tab_builds = Gtk.ToggleButton(label="Builds")
+        self._tab_tests = Gtk.ToggleButton(label="Tests")
+        self._tab_builds.set_active(True)
+        self._tab_tests.set_group(self._tab_builds)
+        self._tab_builds.connect("toggled", lambda _: self._redraw())
+        self._tab_tests.connect("toggled", lambda _: self._redraw())
+        tab_box.append(self._tab_builds)
+        tab_box.append(self._tab_tests)
+        filter_box.append(tab_box)
 
         self._proj_dropdown = Gtk.DropDown.new_from_strings(["All"])
         self._proj_dropdown.set_selected(0)
@@ -27,12 +39,6 @@ class HistoryPage(Gtk.Box):
         self._success_toggle = Gtk.CheckButton(label="Success only")
         self._success_toggle.connect("toggled", self._on_success_toggled)
         filter_box.append(self._success_toggle)
-
-        self._chart_mode = Gtk.DropDown.new_from_strings(
-            ["Duration + Size", "Duration", "Size"])
-        self._chart_mode.set_selected(0)
-        self._chart_mode.connect("notify::selected", self._on_chart_mode)
-        filter_box.append(self._chart_mode)
 
         self._x_mode = Gtk.DropDown.new_from_strings(["Build #", "Time"])
         self._x_mode.set_selected(0)
@@ -58,18 +64,24 @@ class HistoryPage(Gtk.Box):
         self._builds = []
 
     def refresh(self):
-        """Reload data and redraw."""
         self._builds = load_builds_log()
         self._projects = sorted(set(b.get("project", "") for b in self._builds))
-        # Update dropdown
         items = ["All"] + self._projects
         self._proj_dropdown.set_model(Gtk.StringList.new(items))
         self._proj_dropdown.set_selected(0)
         self._state["project"] = None
         self._redraw()
 
+    def _is_tests_tab(self):
+        return self._tab_tests.get_active()
+
     def _get_filtered(self):
+        is_test = self._is_tests_tab()
         filtered = self._builds
+        if is_test:
+            filtered = [b for b in filtered if b.get("type") == "test"]
+        else:
+            filtered = [b for b in filtered if b.get("type") != "test"]
         if self._state["project"]:
             filtered = [b for b in filtered if b.get("project") == self._state["project"]]
         if self._state["success_only"]:
@@ -78,40 +90,76 @@ class HistoryPage(Gtk.Box):
 
     def _redraw(self):
         filtered = self._get_filtered()
-        mode = self._state["chart_mode"]
         xm = self._state["x_mode"]
-        self._chart.set_draw_func(
-            lambda area, cr, w, h, m=mode, x=xm: _draw_chart(cr, w, h, filtered, m, x))
+        is_test = self._is_tests_tab()
+
+        if is_test:
+            self._chart.set_draw_func(
+                lambda area, cr, w, h: _draw_test_chart(cr, w, h, filtered, xm))
+        else:
+            self._chart.set_draw_func(
+                lambda area, cr, w, h: _draw_build_chart(cr, w, h, filtered, xm))
         self._chart.queue_draw()
 
         while (c := self._list_container.get_first_child()):
             self._list_container.remove(c)
 
         if not filtered:
-            self._list_container.append(
-                Adw.StatusPage(title="No builds yet", vexpand=True))
+            label = "No tests yet" if is_test else "No builds yet"
+            self._list_container.append(Adw.StatusPage(title=label, vexpand=True))
             return
 
         page = Adw.PreferencesPage()
-        grp = Adw.PreferencesGroup(title=f"{len(filtered[-20:])} builds")
-        for b in reversed(filtered[-20:]):
-            icon = "object-select-symbolic" if b.get("success") else "dialog-error-symbolic"
-            size = f"  {b['apk_size_mb']} MB" if b.get("apk_size_mb") else ""
-            dm, ds = divmod(b.get("duration", 0), 60)
-            row = Adw.ActionRow(
-                title=f"{b['project']} — {b.get('target', '?')}",
-                subtitle=f"{b.get('date', '?')}  {dm}:{ds:02d}{size}  build {b.get('build', '?')}"
-            )
-            row.add_prefix(Gtk.Image.new_from_icon_name(icon))
-            log = _find_log(b)
-            if log:
-                log_btn = Gtk.Button(icon_name="document-open-symbolic",
-                                     tooltip_text="Open log", valign=Gtk.Align.CENTER,
-                                     css_classes=["flat"])
-                log_btn.connect("clicked", lambda _, p=log: subprocess.Popen(["xdg-open", p]))
-                row.add_suffix(log_btn)
-            grp.add(row)
-        page.add(grp)
+
+        if is_test:
+            grp = Adw.PreferencesGroup(title=f"Tests ({len(filtered[-20:])})")
+            for t in reversed(filtered[-20:]):
+                passed = t.get("passed", 0)
+                failed = t.get("failed", 0)
+                total = t.get("total", 0)
+                skipped = t.get("skipped", 0)
+                dm, ds = divmod(t.get("duration", 0), 60)
+                icon = "object-select-symbolic" if t.get("success") else "dialog-error-symbolic"
+
+                result = f"{passed}/{total} passed"
+                if failed:
+                    result += f", {failed} failed"
+                if skipped:
+                    result += f", {skipped} skipped"
+
+                row = Adw.ActionRow(
+                    title=f"{t['project']} — {t.get('target', '?').replace('test-', '')}",
+                    subtitle=f"{t.get('date', '?')}  {dm}:{ds:02d}  {result}")
+                row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+                log = _find_log(t)
+                if log:
+                    log_btn = Gtk.Button(icon_name="document-open-symbolic",
+                                         tooltip_text="Open log", valign=Gtk.Align.CENTER,
+                                         css_classes=["flat"])
+                    log_btn.connect("clicked", lambda _, p=log: _open_log_viewer(self, p))
+                    row.add_suffix(log_btn)
+                grp.add(row)
+            page.add(grp)
+        else:
+            grp = Adw.PreferencesGroup(title=f"Builds ({len(filtered[-20:])})")
+            for b in reversed(filtered[-20:]):
+                icon = "object-select-symbolic" if b.get("success") else "dialog-error-symbolic"
+                size = f"  {b['apk_size_mb']} MB" if b.get("apk_size_mb") else ""
+                dm, ds = divmod(b.get("duration", 0), 60)
+                row = Adw.ActionRow(
+                    title=f"{b['project']} — {b.get('target', '?')}",
+                    subtitle=f"{b.get('date', '?')}  {dm}:{ds:02d}{size}  build {b.get('build', '?')}")
+                row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+                log = _find_log(b)
+                if log:
+                    log_btn = Gtk.Button(icon_name="document-open-symbolic",
+                                         tooltip_text="Open log", valign=Gtk.Align.CENTER,
+                                         css_classes=["flat"])
+                    log_btn.connect("clicked", lambda _, p=log: _open_log_viewer(self, p))
+                    row.add_suffix(log_btn)
+                grp.add(row)
+            page.add(grp)
+
         self._list_container.append(page)
 
     # ── Filter callbacks ──
@@ -125,16 +173,12 @@ class HistoryPage(Gtk.Box):
         self._state["success_only"] = btn.get_active()
         self._redraw()
 
-    def _on_chart_mode(self, *_):
-        self._state["chart_mode"] = self._chart_mode.get_selected()
-        self._redraw()
-
     def _on_x_mode(self, *_):
         self._state["x_mode"] = self._x_mode.get_selected()
         self._redraw()
 
 
-# ── Helpers (moved from dialogs.py) ──
+# ── Helpers ──
 
 def _find_log(build_entry):
     logs_dir = os.path.join(APP_DIR, "logs")
@@ -156,7 +200,7 @@ def _find_log(build_entry):
     return None
 
 
-# ── Chart drawing (moved from dialogs.py) ──
+# ── Chart drawing ──
 
 def _draw_smooth_line(cr, points):
     if len(points) < 2:
@@ -189,7 +233,8 @@ def _draw_smooth_fill(cr, points, baseline_y):
     cr.close_path()
 
 
-def _draw_chart(cr, w, h, builds, mode=0, x_mode=0):
+def _draw_build_chart(cr, w, h, builds, x_mode=0):
+    """Draw build duration + APK size chart."""
     data = [b for b in builds if b.get("duration", 0) > 0]
     if len(data) < 2:
         return
@@ -212,9 +257,6 @@ def _draw_chart(cr, w, h, builds, mode=0, x_mode=0):
     cr.rectangle(0, 0, w, h)
     cr.fill()
 
-    show_size = mode != 1
-    show_dur = mode != 2
-
     cr.set_line_width(0.5)
     for i in range(5):
         y = pad_t + ch * i / 4
@@ -222,14 +264,13 @@ def _draw_chart(cr, w, h, builds, mode=0, x_mode=0):
         cr.move_to(pad_l, y)
         cr.line_to(w - pad_r, y)
         cr.stroke()
-        if show_dur:
-            val = max_dur - dur_range * i / 4
-            m, s = divmod(int(val), 60)
-            cr.set_source_rgba(0.38, 0.63, 0.92, 0.6)
-            cr.set_font_size(9)
-            cr.move_to(2, y + 3)
-            cr.show_text(f"{m}:{s:02d}")
-        if pos_sizes and show_size:
+        val = max_dur - dur_range * i / 4
+        m, s = divmod(int(val), 60)
+        cr.set_source_rgba(0.38, 0.63, 0.92, 0.6)
+        cr.set_font_size(9)
+        cr.move_to(2, y + 3)
+        cr.show_text(f"{m}:{s:02d}")
+        if pos_sizes:
             sv = max_size - size_range * i / 4
             cr.set_source_rgba(0.92, 0.63, 0.18, 0.6)
             cr.move_to(w - pad_r + 4, y + 3)
@@ -247,7 +288,8 @@ def _draw_chart(cr, w, h, builds, mode=0, x_mode=0):
 
     bottom = pad_t + ch
 
-    if pos_sizes and show_size:
+    # Size curve (orange)
+    if pos_sizes:
         size_xy = [(x_for(i), y_size(s)) for i, s in enumerate(sizes) if s > 0]
         if len(size_xy) >= 2:
             _draw_smooth_fill(cr, size_xy, bottom)
@@ -262,31 +304,130 @@ def _draw_chart(cr, w, h, builds, mode=0, x_mode=0):
                 cr.arc(x, y, 3, 0, math.tau)
                 cr.fill()
 
+    # Duration curve (blue)
     dur_xy = [(x_for(i), y_dur(d)) for i, d in enumerate(durations)]
-    if show_dur:
-        _draw_smooth_fill(cr, dur_xy, bottom)
-        cr.set_source_rgba(0.38, 0.63, 0.92, 0.12)
+    _draw_smooth_fill(cr, dur_xy, bottom)
+    cr.set_source_rgba(0.38, 0.63, 0.92, 0.12)
+    cr.fill()
+    _draw_smooth_line(cr, dur_xy)
+    cr.set_source_rgba(0.38, 0.63, 0.92, 0.9)
+    cr.set_line_width(2)
+    cr.stroke()
+    for i, (x, y) in enumerate(dur_xy):
+        if data[i].get("success"):
+            cr.set_source_rgba(0.18, 0.76, 0.49, 1)
+        else:
+            cr.set_source_rgba(0.88, 0.11, 0.14, 1)
+        cr.arc(x, y, 4, 0, math.tau)
         cr.fill()
-        _draw_smooth_line(cr, dur_xy)
-        cr.set_source_rgba(0.38, 0.63, 0.92, 0.9)
-        cr.set_line_width(2)
-        cr.stroke()
-        for i, (x, y) in enumerate(dur_xy):
-            if data[i].get("success"):
-                cr.set_source_rgba(0.18, 0.76, 0.49, 1)
-            else:
-                cr.set_source_rgba(0.88, 0.11, 0.14, 1)
-            cr.arc(x, y, 4, 0, math.tau)
-            cr.fill()
 
-    pts = dur_xy if show_dur else [(x_for(i), 0) for i in range(len(data))]
+    # Bottom labels
     cr.set_source_rgba(1, 1, 1, 0.4)
     cr.set_font_size(9)
     step = max(1, len(data) // 6)
     for i in range(0, len(data), step):
-        cr.move_to(pts[i][0] - 8, h - 5)
+        cr.move_to(dur_xy[i][0] - 8, h - 5)
         if x_mode == 1:
             date = data[i].get("date", "")
             cr.show_text(date[11:16] if len(date) > 14 else date[-5:])
         else:
             cr.show_text(str(data[i].get("build", "")))
+
+
+def _draw_test_chart(cr, w, h, builds, x_mode=0):
+    """Draw test results: green=passed, red=failed stacked bars."""
+    data = [b for b in builds if b.get("total", 0) > 0]
+    if not data:
+        return
+    data = data[-20:]
+
+    pad_l, pad_r, pad_t, pad_b = 45, 15, 20, 25
+    cw = w - pad_l - pad_r
+    ch = h - pad_t - pad_b
+
+    max_total = max(b.get("total", 1) for b in data)
+
+    cr.set_source_rgba(0.15, 0.15, 0.18, 1)
+    cr.rectangle(0, 0, w, h)
+    cr.fill()
+
+    cr.set_line_width(0.5)
+    for i in range(5):
+        y = pad_t + ch * i / 4
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.move_to(pad_l, y)
+        cr.line_to(w - pad_r, y)
+        cr.stroke()
+        val = max_total - max_total * i / 4
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.set_font_size(9)
+        cr.move_to(2, y + 3)
+        cr.show_text(f"{val:.0f}")
+
+    bar_w = max(4, cw / len(data) * 0.6)
+    gap = cw / max(len(data), 1)
+
+    for i, b in enumerate(data):
+        x = pad_l + i * gap + gap / 2 - bar_w / 2
+        passed = b.get("passed", 0)
+        failed = b.get("failed", 0)
+
+        ph = (passed / max_total) * ch if max_total else 0
+        cr.set_source_rgba(0.18, 0.76, 0.49, 0.9)
+        cr.rectangle(x, pad_t + ch - ph, bar_w, ph)
+        cr.fill()
+
+        fh = (failed / max_total) * ch if max_total else 0
+        if fh > 0:
+            cr.set_source_rgba(0.88, 0.11, 0.14, 0.9)
+            cr.rectangle(x, pad_t + ch - ph - fh, bar_w, fh)
+            cr.fill()
+
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.set_font_size(9)
+        if x_mode == 1:
+            date = b.get("date", "")
+            label = date[11:16] if len(date) > 14 else date[-5:]
+        else:
+            label = str(i + 1)
+        cr.move_to(x, h - 5)
+        cr.show_text(label)
+
+def _open_log_viewer(parent, path):
+    """Open a log file in a built-in viewer dialog with search, filter, copy."""
+    try:
+        with open(path, errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        return
+
+    name = os.path.basename(path)
+    dlg = Adw.Dialog()
+    dlg.set_title(name)
+    dlg.set_content_width(800)
+    dlg.set_content_height(600)
+
+    tb = Adw.ToolbarView()
+    tb.add_top_bar(Adw.HeaderBar())
+
+    def get_log_tag(line):
+        sl = line.strip().lower()
+        if "error" in sl or "failed" in sl or "exception" in sl:
+            return "error"
+        if "warning" in sl:
+            return "warning"
+        if "[build] ok" in sl or "done!" in sl or "passed" in sl.split(":")[0]:
+            return "success"
+        if line.strip().startswith("[Stage]") or "stage" in sl[:20]:
+            return "stage"
+        return None
+
+    lv = LogView(levels=["All", "Errors", "Warnings"], get_tag=get_log_tag, margin=8)
+
+    # Load content
+    for line in content.splitlines(keepends=True):
+        lv.append_line(line)
+
+    tb.set_content(lv)
+    dlg.set_child(tb)
+    dlg.present(parent.get_root())

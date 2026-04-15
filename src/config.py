@@ -75,6 +75,25 @@ def save_build_entry(project_name, target, success, duration, apk_size=None, bui
     with open(BUILDS_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
 
+def save_test_entry(project_name, platform, passed, failed, skipped, total, duration):
+    log = load_builds_log()
+    log.append({
+        "project": project_name,
+        "target": f"test-{platform}",
+        "type": "test",
+        "success": failed == 0,
+        "duration": int(duration),
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "total": total,
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
+    if len(log) > 100: log = log[-100:]
+    with open(BUILDS_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+
+
 # ── Project utilities ──
 
 def find_apk(proj):
