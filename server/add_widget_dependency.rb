@@ -1,19 +1,19 @@
 # Widget integration script — adds a WidgetKit app extension target to the
-# Unity-exported Xcode project. Invoked by IOSbuild.scpt after Unity export.
+# Unity-exported Xcode project. Invoked by ios_build.scpt after Unity export.
 #
 # Fully env-driven — no hardcoded identity. Values come from ENV vars set
-# by IOSbuild.scpt (patched on Install from Unity Builder Dash). Fallbacks
+# by ios_build.scpt (patched on Install from Unity Builder Dash). Fallbacks
 # are placeholder-safe so the script still runs if env is unset.
 
 require 'xcodeproj'
 
 # Work dir resolution order:
 #   1. ARGV[0]          explicit override when invoked manually
-#   2. ENV['WORK_DIR']  set by IOSbuild.scpt (patched on install)
-#   3. script's own dir install_mac_server places this .rb next to IOS/
+#   2. ENV['WORK_DIR']  set by ios_build.scpt (patched on install)
+#   3. script's own dir install_mac_server places this .rb next to iOS/
 script_dir   = File.dirname(File.expand_path(__FILE__))
 work_dir     = ARGV[0] || ENV['WORK_DIR'] || script_dir
-project_path = File.join(work_dir, 'IOS', 'Unity-iPhone.xcodeproj')
+project_path = File.join(work_dir, 'iOS', 'Unity-iPhone.xcodeproj')
 
 # Widget config from env (set by Settings → Install on Mac)
 BUNDLE_ID     = ENV['WIDGET_BUNDLE_ID']   || 'com.example.myapp.widget'

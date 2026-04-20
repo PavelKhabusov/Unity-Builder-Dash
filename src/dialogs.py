@@ -281,7 +281,7 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     setup_row.add_suffix(setup_btn)
 
     install_row = Adw.ActionRow(title="Install on Mac",
-        subtitle="Copy IOSbuild.scpt + patches to the Mac work folder")
+        subtitle="Copy ios_build.scpt + patches to the Mac work folder")
     install_btn = Gtk.Button(label="Install", valign=Gtk.Align.CENTER)
     install_btn.connect("clicked", lambda _b: threading.Thread(
         target=install_mac_server,

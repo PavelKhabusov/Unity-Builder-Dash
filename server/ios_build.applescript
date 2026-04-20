@@ -1,25 +1,25 @@
 (*
- IOSbuild.applescript — source for IOSbuild.scpt (Unity Builder Dash iOS remote).
+ ios_build.applescript — source for ios_build.scpt (Unity Builder Dash iOS remote).
 
  Compiled into .scpt on the Mac by server/patch_scpt.sh after substituting
  the {{PLACEHOLDERS}} below with values from config.json. The host (Linux or
- Windows) scp's IOS.zip into {{WORK_DIR}}/IOS.zip before invoking a command.
+ Windows) scp's iOS.zip into {{WORK_DIR}}/iOS.zip before invoking a command.
 
  Placeholders (all rewritten by patch_scpt.sh from env vars):
    {{WORK_DIR}}          Mac-side base folder (scripts + build artefacts)
-   {{WIDGET_FOLDER}}     Folder name next to IOS/ with widget sources
+   {{WIDGET_FOLDER}}     Folder name next to iOS/ with widget sources
    {{WIDGET_BUNDLE_ID}}  Widget CFBundleIdentifier
    {{WIDGET_TEAM_ID}}    Apple Developer Team ID for widget signing
    {{WIDGET_TARGET}}     Xcode target name for the widget (e.g. URLImageWidget)
    {{APP_GROUP_ID}}      App Group ID shared between app and widget
    {{SMB_USER}}          Windows SMB user (optional, Windows host only)
    {{SMB_PASS}}          Windows SMB password (optional, Windows host only)
-   {{SMB_BUILD_PATH}}    Relative path on SMB share to build/IOS.zip parent
+   {{SMB_BUILD_PATH}}    Relative path on SMB share to build/iOS.zip parent
 
  Commands (argv[0]):
    run:<device>              stopTerminal + xcodebuild-test on <device>
    runFull:<device>          unpack + run:<device>
-   unpack                    unzip IOS.zip, pod install, add widget
+   unpack                    unzip iOS.zip, pod install, add widget
    stop                      kill active Terminal job
    clearCache                remove Xcode DerivedData / .pcm
    clearBuild                xcodebuild clean
@@ -27,7 +27,7 @@
    addWidget                 re-run add_widget_dependency.rb
    connectMac-<winIp>-<mac>  (Windows host only) SMB-mount winIp, save winIp
                              into config.json. Linux hosts don't need this
-                             since they scp IOS.zip directly.
+                             since they scp iOS.zip directly.
 *)
 
 property IPADDRESS : "127.0.0.1"
@@ -83,13 +83,13 @@ end clearCache
 
 on clearBuild()
 	tell application "Terminal"
-		do script my nccmd("cd {{WORK_DIR}}/IOS && xcodebuild clean && rm -rf ./build/Build")
+		do script my nccmd("cd {{WORK_DIR}}/iOS && xcodebuild clean && rm -rf ./build/Build")
 	end tell
 end clearBuild
 
 on addWidgetToProject()
 	set widgetSource to "{{WORK_DIR}}/{{WIDGET_FOLDER}}/Widgets/"
-	set projectPath to "{{WORK_DIR}}/IOS/"
+	set projectPath to "{{WORK_DIR}}/iOS/"
 	set widgetDest to projectPath & "Widgets/"
 	set entitlementsFile to projectPath & "Unity-iPhone.entitlements"
 	set widgetPlist to projectPath & "Widgets/Info.plist"
@@ -121,7 +121,7 @@ on addWidgetToProject()
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & widgetPlist & ";
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & widgetPlist & ";
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string {{WIDGET_BUNDLE_ID}}' " & widgetPlist & ";
-cd {{WORK_DIR}}/IOS;
+cd {{WORK_DIR}}/iOS;
 gem install xcodeproj --no-document;
 WIDGET_BUNDLE_ID='{{WIDGET_BUNDLE_ID}}' WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' WIDGET_TARGET_NAME='{{WIDGET_TARGET}}' ruby {{WORK_DIR}}/add_widget_dependency.rb;
 "
@@ -133,7 +133,7 @@ end addWidgetToProject
 on updatePod()
 	tell application "Terminal"
 		activate
-		do script my nccmd("cd {{WORK_DIR}}/IOS && \\
+		do script my nccmd("cd {{WORK_DIR}}/iOS && \\
 			pod cache clean --all && \\
 			rm -rf Pods && \\
 			rm -rf Podfile.lock && \\
@@ -153,8 +153,8 @@ on unpack()
 		close windows
 	end tell
 
-	-- Delete old IOS/ directory if present (shell is reliable with missing paths)
-	do shell script "rm -rf " & quoted form of "{{WORK_DIR}}/IOS"
+	-- Delete old iOS/ directory if present (shell is reliable with missing paths)
+	do shell script "rm -rf " & quoted form of "{{WORK_DIR}}/iOS"
 
 	-- Empty trash (best-effort)
 	try
@@ -163,20 +163,20 @@ on unpack()
 		end tell
 	end try
 
-	-- If local IOS.zip is missing but SMB mount has it, copy over. Silent fallback.
+	-- If local iOS.zip is missing but SMB mount has it, copy over. Silent fallback.
 	try
-		do shell script "test -f " & quoted form of "{{WORK_DIR}}/IOS.zip"
+		do shell script "test -f " & quoted form of "{{WORK_DIR}}/iOS.zip"
 	on error
 		try
-			do shell script "cp /Volumes/Users/{{SMB_BUILD_PATH}}/IOS.zip " & quoted form of "{{WORK_DIR}}/IOS.zip"
+			do shell script "cp /Volumes/Users/{{SMB_BUILD_PATH}}/iOS.zip " & quoted form of "{{WORK_DIR}}/iOS.zip"
 		end try
 	end try
 
 	-- Verify zip is here before unzipping
 	try
-		do shell script "test -f " & quoted form of "{{WORK_DIR}}/IOS.zip"
+		do shell script "test -f " & quoted form of "{{WORK_DIR}}/iOS.zip"
 	on error
-		display dialog "Error: IOS.zip not found in {{WORK_DIR}}. Did the host SCP fail?" buttons {"OK"} default button "OK"
+		display dialog "Error: iOS.zip not found in {{WORK_DIR}}. Did the host SCP fail?" buttons {"OK"} default button "OK"
 		return
 	end try
 
@@ -189,7 +189,7 @@ on unpack()
 	-- host isn't listening. After it's done, push the captured output via nc.
 	set unzipLog to ""
 	try
-		set unzipLog to (do shell script "cd " & quoted form of "{{WORK_DIR}}" & " && unzip -o IOS.zip 2>&1")
+		set unzipLog to (do shell script "cd " & quoted form of "{{WORK_DIR}}" & " && unzip -o iOS.zip 2>&1")
 	on error errMsg
 		try
 			do shell script "echo " & quoted form of ("unzip failed: " & errMsg) & " | nc -w 1 " & IPADDRESS & " 8080"
@@ -206,9 +206,25 @@ on unpack()
 		do shell script "echo 'unpack: unzip done' | nc -w 1 " & IPADDRESS & " 8080"
 	end try
 
+	-- Patch Podfile: force IPHONEOS_DEPLOYMENT_TARGET=12.0 for all pods so
+	-- Xcode stops warning about old minimum targets from legacy pods.
+	-- Idempotent — grep checks if the hook is already present.
+	set podfilePatch to "
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
+    end
+  end
+end
+"
+	try
+		do shell script "grep -q 'IPHONEOS_DEPLOYMENT_TARGET' " & quoted form of "{{WORK_DIR}}/iOS/Podfile" & " || echo " & quoted form of podfilePatch & " >> " & quoted form of "{{WORK_DIR}}/iOS/Podfile"
+	end try
+
 	tell application "Terminal"
 		activate
-		do script my nccmd("cd {{WORK_DIR}}/IOS && pod install")
+		do script my nccmd("cd {{WORK_DIR}}/iOS && pod install")
 	end tell
 	delay 25
 
@@ -223,11 +239,11 @@ end unpack
 on runDevice(deviceName)
 	stopTerminal()
 	tell application "Terminal"
-		do script my nccmd("cd {{WORK_DIR}}/IOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' test")
+		do script my nccmd("cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates test")
 	end tell
 end runDevice
 
--- ── Windows-host legacy: SMB mount for reading IOS.zip from a shared folder ──
+-- ── Windows-host legacy: SMB mount for reading iOS.zip from a shared folder ──
 -- Linux and Windows-10+ hosts should use scp instead and ignore these handlers.
 
 on splitString(someString)

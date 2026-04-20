@@ -310,12 +310,12 @@ class SettingsPage(Gtk.Box):
                 p["upload"] = up
             projects.append(p)
         log_filters = [r.get_text().strip() for r in self._filter_rows if r.get_text().strip()]
-        self.cfg = {
-            "unity": self.unity_row.get_text().strip(),
-            "apk_dash": self.dash_row.get_text().strip(),
-            "theme": theme_map.get(self.theme_row.get_selected(), "system"),
-            "projects": projects,
-            "log_filters": log_filters,
-        }
+        # Update only the fields this page owns — preserve anything else
+        # (ios_remote, upload, custom keys) that other UIs manage in-place.
+        self.cfg["unity"] = self.unity_row.get_text().strip()
+        self.cfg["apk_dash"] = self.dash_row.get_text().strip()
+        self.cfg["theme"] = theme_map.get(self.theme_row.get_selected(), "system")
+        self.cfg["projects"] = projects
+        self.cfg["log_filters"] = log_filters
         save_config(self.cfg)
         self.on_save(self.cfg)

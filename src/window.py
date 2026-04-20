@@ -786,7 +786,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         if ok and needs_scp:
             GLib.idle_add(self.stage_label.set_text, f"{status_text} — uploading")
             remote = ios_remote.get_remote_cfg(self.cfg)
-            zip_path = os.path.join(build_dir, "IOS.zip")
+            zip_path = os.path.join(build_dir, "iOS.zip")
             ok = ios_remote.scp_to_mac(zip_path, remote, log_cb=self._log)
 
         if ok and osa_arg is not None:

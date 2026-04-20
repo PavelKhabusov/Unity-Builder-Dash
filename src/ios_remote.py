@@ -1,8 +1,8 @@
 """Remote iOS build pipeline: zip → scp → ssh osascript on Mac.
 
 Replaces the Windows-side of CrazyMegaBuilder for Linux hosts. The Mac side
-(IOSbuild.scpt) runs unchanged except for a small patch that skips the SMB
-mount if IOS.zip is already on the Desktop (see server/ folder).
+(ios_build.scpt) runs unchanged except for a small patch that skips the SMB
+mount if iOS.zip is already on the Desktop (see server/ folder).
 """
 import os, signal, socket, subprocess, threading, zipfile
 from gi.repository import GLib
@@ -16,13 +16,13 @@ DEFAULT_REMOTE = {
     "mac_auth": "key",                 # "key" | "password"
     "mac_key_path": "~/.ssh/id_ed25519",
     "mac_password": "",
-    "mac_work_dir": "/Users/pavel/Desktop",  # Mac-side base: .scpt, IOS.zip, IOS/ all live here
+    "mac_work_dir": "/Users/pavel/Desktop",  # Mac-side base: .scpt, iOS.zip, iOS/ all live here
     "progress_port": 8080,
     # When True, ssh is spawned in an external terminal emulator instead of
     # being captured in-app. Mirrors CMB's "Окно терминала" toggle.
     "external_terminal": False,
     # Widget config — piped through as env vars to add_widget_dependency.rb
-    # and sed-substituted into IOSbuild.applescript by patch_scpt.sh.
+    # and sed-substituted into ios_build.applescript by patch_scpt.sh.
     "widget_bundle_id":     "com.example.myapp.widget",
     "widget_team_id":       "XXXXXXXXXX",
     "widget_target_name":   "URLImageWidget",
@@ -136,7 +136,7 @@ def _find_terminal():
     return None, None
 
 # Fixed device list (matches CrazyMegaBuilder). Labels shown in dropdown,
-# values are the osascript target names expected by IOSbuild.scpt.
+# values are the osascript target names expected by ios_build.scpt.
 DEVICES = [
     ("iPhone 12 mini", "RuniPhone12miniFull"),
     ("iPhone 13 mini", "RuniPhone13miniFull"),
@@ -150,8 +150,8 @@ def get_remote_cfg(cfg):
     # Derive Mac paths from mac_work_dir. Explicit overrides in config still win.
     work = (r.get("mac_work_dir") or "/Users/pavel/Desktop").rstrip("/")
     r["mac_work_dir"] = work
-    r.setdefault("mac_script_path", f"{work}/IOSbuild.scpt")
-    r.setdefault("mac_zip_dest",    f"{work}/IOS.zip")
+    r.setdefault("mac_script_path", f"{work}/ios_build.scpt")
+    r.setdefault("mac_zip_dest",    f"{work}/iOS.zip")
     return r
 
 
@@ -161,9 +161,9 @@ def ios_build_subdir(build_dir):
     """Find the iOS Xcode project folder inside build_dir.
 
     Unity's BuildScript.BuildiOS writes to '{build_dir}/iOS' (lowercase 'i').
-    CrazyMegaBuilder originally used 'IOS' (uppercase). Accept either.
+    CrazyMegaBuilder originally used 'iOS' (uppercase). Accept either.
     """
-    for name in ("iOS", "IOS", "ios"):
+    for name in ("iOS", "iOS", "ios"):
         p = os.path.join(build_dir, name)
         if os.path.isdir(p):
             return p, name
@@ -171,30 +171,30 @@ def ios_build_subdir(build_dir):
 
 
 def make_ios_zip(build_dir, log_cb=None):
-    """Zip {build_dir}/iOS/ → {build_dir}/IOS.zip with 'iOS/' as archive root.
+    """Zip {build_dir}/iOS/ → {build_dir}/iOS.zip with 'iOS/' as archive root.
 
-    The archive is laid out so `unzip IOS.zip` on the Mac produces an 'iOS/'
-    directory directly, which IOSbuild.scpt expects at /Users/pavel/Desktop/IOS/.
+    The archive is laid out so `unzip iOS.zip` on the Mac produces an 'iOS/'
+    directory directly, which ios_build.scpt expects at /Users/pavel/Desktop/iOS/.
     """
     src, _name = ios_build_subdir(build_dir)
     if not src:
         raise FileNotFoundError(
             f"iOS Xcode project not found in {build_dir} (expected iOS/ subfolder)")
-    zip_path = os.path.join(build_dir, "IOS.zip")
+    zip_path = os.path.join(build_dir, "iOS.zip")
     if os.path.exists(zip_path):
         os.remove(zip_path)
 
     if log_cb:
-        GLib.idle_add(log_cb, f"Zipping {src} → IOS.zip...\n")
+        GLib.idle_add(log_cb, f"Zipping {src} → iOS.zip...\n")
 
-    # Archive root name is always 'IOS' so the Mac side unzips to Desktop/IOS/
-    # regardless of whether Unity wrote 'iOS' (Kartoteka) or 'IOS' (CMB legacy).
+    # Archive root name is always 'iOS' so the Mac side unzips to Desktop/iOS/
+    # regardless of whether Unity wrote 'iOS' (Kartoteka) or 'iOS' (CMB legacy).
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
         for root, _dirs, files in os.walk(src):
             for f in files:
                 full = os.path.join(root, f)
                 rel = os.path.relpath(full, src)
-                zf.write(full, os.path.join("IOS", rel))
+                zf.write(full, os.path.join("iOS", rel))
 
     size_mb = os.path.getsize(zip_path) / (1024 * 1024)
     if log_cb:
@@ -405,7 +405,7 @@ def install_mac_server(remote, log_cb=None):
     # Locate the server/ folder next to src/ in the app root
     here = os.path.dirname(os.path.abspath(__file__))
     server_dir = os.path.join(os.path.dirname(here), "server")
-    files = ["IOSbuild.applescript", "add_widget_dependency.rb", "patch_scpt.sh",
+    files = ["ios_build.applescript", "add_widget_dependency.rb", "patch_scpt.sh",
              "mac_console.applescript"]
     missing = [f for f in files if not os.path.isfile(os.path.join(server_dir, f))]
     if missing:
@@ -468,9 +468,9 @@ def install_mac_server(remote, log_cb=None):
     except Exception as e:
         if log_cb: GLib.idle_add(log_cb, f"  config.json write error: {e}\n")
 
-    if log_cb: GLib.idle_add(log_cb, "Compiling IOSbuild.applescript on Mac...\n")
+    if log_cb: GLib.idle_add(log_cb, "Compiling ios_build.applescript on Mac...\n")
     # Pass all placeholders so patch_scpt.sh can substitute them and osacompile
-    # IOSbuild.applescript → IOSbuild.scpt. No decompile/sed trickery needed.
+    # ios_build.applescript → ios_build.scpt. No decompile/sed trickery needed.
     env = {
         "WORK_DIR":           dest_dir,
         "WIDGET_BUNDLE_ID":   remote.get("widget_bundle_id")    or "com.example.myapp.widget",

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compile server/IOSbuild.applescript into IOSbuild.scpt on the Mac,
+# Compile server/ios_build.applescript into ios_build.scpt on the Mac,
 # substituting {{PLACEHOLDERS}} with values from env vars.
 #
 # Called by install_mac_server (over SSH) after the source + helpers are
@@ -21,8 +21,8 @@ set -e
 
 WORK_DIR="${WORK_DIR:-$HOME/Desktop}"
 WORK_DIR="${WORK_DIR%/}"
-SRC="$WORK_DIR/IOSbuild.applescript"
-DEST="$WORK_DIR/IOSbuild.scpt"
+SRC="$WORK_DIR/ios_build.applescript"
+DEST="$WORK_DIR/ios_build.scpt"
 
 [ -f "$SRC" ] || { echo "Source not found: $SRC" >&2; exit 1; }
 
@@ -31,7 +31,7 @@ esc() {
     printf '%s' "$1" | sed -e 's/[\\/&|]/\\&/g'
 }
 
-TMP="$(mktemp -t IOSbuild).applescript"
+TMP="$(mktemp -t ios_build).applescript"
 sed \
   -e "s|{{WORK_DIR}}|$(esc "$WORK_DIR")|g" \
   -e "s|{{WIDGET_BUNDLE_ID}}|$(esc "${WIDGET_BUNDLE_ID:-com.example.myapp.widget}")|g" \
@@ -57,3 +57,10 @@ if [ -f "$CONSOLE_SRC" ]; then
     osacompile -o "$CONSOLE_APP" "$CONSOLE_SRC"
     echo "Compiled: $CONSOLE_APP"
 fi
+
+# Clean up source files once compiled — leave only the runnable binaries
+# (and add_widget_dependency.rb which is still called at runtime by the .scpt).
+rm -f "$SRC" "$CONSOLE_SRC"
+# patch_scpt.sh is self-deleting last; no-op error is fine if it's already gone.
+rm -f "$0" 2>/dev/null || true
+echo "Cleaned up source files"

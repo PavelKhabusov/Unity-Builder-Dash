@@ -97,7 +97,7 @@ def build_ios_settings_groups(cfg, save_cfg, log_cb=None):
     conn_grp.add(setup_row)
 
     install_row = Adw.ActionRow(title="Install on Mac",
-        subtitle="Copies IOSbuild.scpt + scripts to the work folder and patches them")
+        subtitle="Copies ios_build.scpt + scripts to the work folder and patches them")
     install_btn = Gtk.Button(label="Install", valign=Gtk.Align.CENTER)
     def _on_install(_b):
         r = get_remote_cfg(cfg)
@@ -108,7 +108,7 @@ def build_ios_settings_groups(cfg, save_cfg, log_cb=None):
 
     # ── Widget group ──
     widget_grp = Adw.PreferencesGroup(title="iOS Widget",
-        description="Applied to IOSbuild.scpt and add_widget_dependency.rb on next Install")
+        description="Applied to ios_build.scpt and add_widget_dependency.rb on next Install")
 
     def _mk(title, key, fallback):
         row = Adw.EntryRow(title=title)

@@ -1,8 +1,8 @@
 (*
- mac_console.applescript — native macOS GUI console for IOSbuild.scpt.
+ mac_console.applescript — native macOS GUI console for ios_build.scpt.
 
  Compiled to mac_console.app by patch_scpt.sh at install time. Lives next to
- IOSbuild.scpt in the Mac work folder. Double-click the .app to open a
+ ios_build.scpt in the Mac work folder. Double-click the .app to open a
  native `choose from list` panel showing live status and action shortcuts.
 
  Zero extra dependencies — uses macOS's built-in AppleScript runtime.
@@ -60,18 +60,18 @@ on statusLine()
 
 	set iosInfo to "(not unpacked)"
 	try
-		set sizeStr to (do shell script "du -sh " & quoted form of (w & "/IOS") & " 2>/dev/null | cut -f1")
+		set sizeStr to (do shell script "du -sh " & quoted form of (w & "/iOS") & " 2>/dev/null | cut -f1")
 		if sizeStr is not "" then set iosInfo to sizeStr
 	end try
 
 	set zipInfo to "(missing)"
 	try
-		set zipSize to (do shell script "du -h " & quoted form of (w & "/IOS.zip") & " 2>/dev/null | cut -f1")
+		set zipSize to (do shell script "du -h " & quoted form of (w & "/iOS.zip") & " 2>/dev/null | cut -f1")
 		if zipSize is not "" then set zipInfo to zipSize
 	end try
 
 	return "📁 " & w & return & ¬
-		"🌐 Host IP: " & hostIP & "    📦 IOS/: " & iosInfo & "    🗜 IOS.zip: " & zipInfo
+		"🌐 Host IP: " & hostIP & "    📦 iOS/: " & iosInfo & "    🗜 iOS.zip: " & zipInfo
 end statusLine
 
 -- Fire-and-forget: fork osascript in the background so the console stays
@@ -79,7 +79,7 @@ end statusLine
 -- $WORK_DIR/mac_console.log for post-mortem.
 on runAction(cmd)
 	set w to my getWorkDir()
-	set scpt to w & "/IOSbuild.scpt"
+	set scpt to w & "/ios_build.scpt"
 	set logFile to w & "/mac_console.log"
 	try
 		do shell script "nohup osascript " & quoted form of scpt & " " & quoted form of cmd & " >> " & quoted form of logFile & " 2>&1 &"

@@ -1,19 +1,19 @@
 # iOS Remote Build Server (Mac side)
 
 Files that live **on the Mac** to make the iOS popup in Unity Builder Dash work.
-The host (Linux/Windows/another Mac) pushes `IOS.zip` to the Mac via SCP, then
-invokes `IOSbuild.scpt` over SSH. The script unzips, runs `pod install`,
+The host (Linux/Windows/another Mac) pushes `iOS.zip` to the Mac via SCP, then
+invokes `ios_build.scpt` over SSH. The script unzips, runs `pod install`,
 integrates the widget, builds via `xcodebuild`, and installs on the iOS device.
 
 ## Contents
 
 | File | Purpose |
 |---|---|
-| `IOSbuild.applescript` | **Source** with `{{PLACEHOLDERS}}`. Compiled to `IOSbuild.scpt` on the Mac at install time. |
+| `ios_build.applescript` | **Source** with `{{PLACEHOLDERS}}`. Compiled to `ios_build.scpt` on the Mac at install time. |
 | `add_widget_dependency.rb` | Adds the WidgetKit extension target to the Unity-exported Xcode project. Fully env-driven (BUNDLE_ID / TEAM_ID / WIDGET_TARGET_NAME come from your `config.json`). |
-| `patch_scpt.sh` | Substitutes placeholders in `IOSbuild.applescript` with env-var values and runs `osacompile` to produce `IOSbuild.scpt`. |
+| `patch_scpt.sh` | Substitutes placeholders in `ios_build.applescript` with env-var values and runs `osacompile` to produce `ios_build.scpt`. |
 
-`IOSbuild.scpt` is **not** checked in — it's generated from source on your Mac.
+`ios_build.scpt` is **not** checked in — it's generated from source on your Mac.
 
 ## Quick setup
 
@@ -46,7 +46,7 @@ Everything is saved to `config.json` (gitignored, safe to share minus `mac_passw
 Still in Settings → iOS (or via the 🔑 popover in the iOS action popup):
 
 1. **Set up** — generates `~/.ssh/id_ed25519` if missing and runs `ssh-copy-id` to the Mac (needs `sshpass` locally and your Mac password filled in). After this, passwordless SSH works.
-2. **Install on Mac** — SCPs `IOSbuild.applescript`, `add_widget_dependency.rb`, `patch_scpt.sh` into your work folder on the Mac, then runs `patch_scpt.sh` remotely to compile `IOSbuild.scpt` with your values substituted.
+2. **Install on Mac** — SCPs `ios_build.applescript`, `add_widget_dependency.rb`, `patch_scpt.sh` into your work folder on the Mac, then runs `patch_scpt.sh` remotely to compile `ios_build.scpt` with your values substituted.
 
 Re-run **Install on Mac** whenever you change widget/work-folder/devices — the `.scpt` gets regenerated.
 
@@ -80,13 +80,13 @@ Only needed for: initial `ssh-copy-id` (Set up button), and running with
 
 ## Commands the Mac understands
 
-Sent as first argument to `osascript ~/<work_dir>/IOSbuild.scpt <command>`.
+Sent as first argument to `osascript ~/<work_dir>/ios_build.scpt <command>`.
 
 | Command | Meaning |
 |---|---|
 | `run:<device>` | `stopTerminal` + `xcodebuild test -destination 'platform=iOS,name=<device>'` |
 | `runFull:<device>` | `unpack` + `run:<device>` |
-| `unpack` | unzip `IOS.zip`, `pod install`, add widget |
+| `unpack` | unzip `iOS.zip`, `pod install`, add widget |
 | `stop` | kill active Terminal job |
 | `clearCache` | remove Xcode `DerivedData` / `.pcm` |
 | `clearBuild` | `xcodebuild clean` + `rm -rf ./build/Build` |
@@ -128,7 +128,7 @@ as Linux — no SMB share / XAMPP required. If you still prefer the legacy SMB
 flow (e.g. to avoid SCP large-zip overhead on slow networks), fill in the
 `smb_user` / `smb_password` / `smb_build_path` fields in `config.json` and
 send the `connectMac-<winIp>-<macIp>` command once per session. The Mac
-`unpack` handler falls back to copying `IOS.zip` from the SMB mount if no
+`unpack` handler falls back to copying `iOS.zip` from the SMB mount if no
 local zip is found in the work folder.
 
 ## Troubleshooting
@@ -137,12 +137,12 @@ local zip is found in the work folder.
 
 **Mac status dot stays grey / red** — open the iOS popup, click **Connect** (notification + audible feedback on Mac confirms the round trip), check the inline log for the exact error.
 
-**`osascript` hangs with no output** — macOS is waiting for an Automation permission prompt. Open Terminal on the Mac directly: `osascript ~/<work_dir>/IOSbuild.scpt 'run:iPhone 12 mini'`, approve the prompts, then retry from the host.
+**`osascript` hangs with no output** — macOS is waiting for an Automation permission prompt. Open Terminal on the Mac directly: `osascript ~/<work_dir>/ios_build.scpt 'run:iPhone 12 mini'`, approve the prompts, then retry from the host.
 
-**"IOS.zip not found" on Mac** — the SCP step failed silently; check `mac_work_dir` in Settings → iOS matches an existing folder and that SSH has write permission there.
+**"iOS.zip not found" on Mac** — the SCP step failed silently; check `mac_work_dir` in Settings → iOS matches an existing folder and that SSH has write permission there.
 
 **Widget build fails** — verify `gem install xcodeproj` completed on the Mac and that your widget source folder sits at `$WORK_DIR/$WIDGET_FOLDER/Widgets/` (e.g. `/Users/pavel/Desktop/Kartoteka/kartoteka.widget/Widgets/`). Copy the folder there manually if moving from the old `~/Desktop/kartoteka.widget/` path.
 
 **Progress bar doesn't fill during build** — the Mac side sends progress via `nc $IPADDRESS:8080`. Check: firewall on the host isn't blocking 8080, and `$WORK_DIR/ip_address.txt` on the Mac contains the host's IP (auto-written by every SSH invocation via `$SSH_CLIENT`).
 
-**Changed `mac_work_dir` and things break** — click **Install on Mac** again in Settings to re-deploy + recompile `IOSbuild.scpt` with the new paths.
+**Changed `mac_work_dir` and things break** — click **Install on Mac** again in Settings to re-deploy + recompile `ios_build.scpt` with the new paths.
