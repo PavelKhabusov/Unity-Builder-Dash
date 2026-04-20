@@ -221,20 +221,47 @@ on unpack()
 		do shell script "sed -i '' -E 's|/home/[^\"]*/[Ii][Oo][Ss]/|$(SRCROOT)/|g' " & quoted form of "{{WORK_DIR}}/iOS/Unity-iPhone.xcodeproj/project.pbxproj"
 	end try
 
-	-- Patch Podfile: force IPHONEOS_DEPLOYMENT_TARGET=12.0 for all pods so
-	-- Xcode stops warning about old minimum targets from legacy pods.
-	-- Idempotent — grep checks if the hook is already present.
+	-- Patch Podfile post_install:
+	--   IPHONEOS_DEPLOYMENT_TARGET=12.0 — silence old-target warnings from legacy pods
+	--   ENABLE_USER_SCRIPT_SANDBOXING=NO — Xcode 15+ sandboxing breaks gRPC-Core
+	--     libtool step with "Command Libtool failed with a nonzero exit code";
+	--     gRPC's header-symlink script phase can't write inside the sandbox.
+	--   ALWAYS_OUT_OF_DATE=YES on script phases — silences Xcode's
+	--     "Run script build phase will be run during every build" warnings
+	--     emitted for Unity's GameAssembly + gRPC/BoringSSL/abseil.
+	-- Versioned marker ("# ubd-post-install v2") lets us re-patch when we
+	-- add settings in a newer version without duplicating the block.
 	set podfilePatch to "
+# ubd-post-install v2
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     target.build_configurations.each do |config|
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
+      config.build_settings['ENABLE_USER_SCRIPT_SANDBOXING'] = 'NO'
+    end
+    target.build_phases.each do |phase|
+      if phase.respond_to?(:shell_script)
+        phase.always_out_of_date = '1'
+      end
     end
   end
 end
 "
+	-- Python strips any old post_install / legacy ubd-post-install block
+	-- from Podfile, then appends the current one. Idempotent across runs.
+	set pyStrip to "
+import re, sys
+p = '{{WORK_DIR}}/iOS/Podfile'
+s = open(p).read()
+# Drop any previous ubd-post-install block (with its marker comment) and
+# any legacy bare post_install hook we may have appended earlier.
+s = re.sub(r'\\n# ubd-post-install v\\d+\\n\\s*post_install do .*?\\nend\\n', '\\n', s, flags=re.S)
+s = re.sub(r'\\npost_install do \\|installer\\|\\s*\\n\\s*installer\\.pods_project\\.targets\\.each.*?\\n\\s*end\\s*\\n\\s*end\\s*\\n\\s*end\\s*\\n', '\\n', s, flags=re.S)
+open(p,'w').write(s.rstrip() + '\\n')
+"
 	try
-		do shell script "grep -q 'IPHONEOS_DEPLOYMENT_TARGET' " & quoted form of "{{WORK_DIR}}/iOS/Podfile" & " || echo " & quoted form of podfilePatch & " >> " & quoted form of "{{WORK_DIR}}/iOS/Podfile"
+		do shell script "python3 -c " & quoted form of pyStrip
+		do shell script "printf '%s' " & quoted form of podfilePatch & " >> " & quoted form of "{{WORK_DIR}}/iOS/Podfile"
 	end try
 
 	tell application "Terminal"
@@ -264,9 +291,16 @@ end runDevice
 
 -- Build + install (no test-runner). App icon lands on the device; user
 -- taps to launch normally, avoiding xctest's init quirks.
+--
+-- Destination uses the specific device *name*, not 'generic/platform=iOS'.
+-- Why: devicectl install verifies the embedded provisioning profile includes
+-- the device's UDID. A generic build uses a profile without any UDIDs
+-- attached → install fails with CoreDeviceError 1002 "No provider was found."
+-- Pinning to the device makes `-allowProvisioningUpdates` register this UDID
+-- and bake it into the profile embedded in the .app.
 on installDevice(deviceName)
 	stopTerminal()
-	set cmd to "cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'generic/platform=iOS' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
+	set cmd to "cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
 	tell application "Terminal"
 		do script my nccmd(cmd)
 	end tell

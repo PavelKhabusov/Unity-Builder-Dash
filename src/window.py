@@ -254,9 +254,16 @@ class BuilderWindow(Adw.ApplicationWindow):
                 # streamed output is never silently hidden.
                 self._toggle_build_log(True)
                 self._log(t)
+            def _ios_progress_bulk(lines):
+                # Bulk path: hand the whole flush to LogView so it can insert
+                # under a single user-action (one GTK layout pass per flush).
+                # Per-line _log would re-layout thousands of times per build.
+                self._toggle_build_log(True)
+                self._log_widget.append_lines(lines)
             self._ios_progress_listener = ios_remote.ProgressListener(
                 ios_cfg.get("progress_port", 8080),
                 log_cb=_ios_progress_log,
+                log_bulk_cb=_ios_progress_bulk,
                 progress_cb=self.progress_bar.set_fraction)
             self._ios_progress_listener.start()
 
@@ -673,8 +680,12 @@ class BuilderWindow(Adw.ApplicationWindow):
     def _show_ios_popup(self, proj):
         if not hasattr(self, "_ios_progress_listener"):
             port = ios_remote.get_remote_cfg(self.cfg).get("progress_port", 8080)
+            def _bulk(lines):
+                self._toggle_build_log(True)
+                self._log_widget.append_lines(lines)
             self._ios_progress_listener = ios_remote.ProgressListener(
                 port, log_cb=self._log,
+                log_bulk_cb=_bulk,
                 progress_cb=self.progress_bar.set_fraction)
             self._ios_progress_listener.start()
 
@@ -799,7 +810,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.worker = BuildWorker(
             self.cfg, proj, "ios",
             self._log, after_unity, self._on_stage,
-            auto_increment=self.increment_toggle.get_active())
+            auto_increment=self.increment_toggle.get_active(),
+            log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 
     def _ios_post_build(self, proj, needs_zip, needs_scp, osa_arg,
@@ -875,7 +887,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Starting Unity...")
         self.worker = BuildWorker(self.cfg, proj, target_key,
                                   self._log, self._on_done, self._on_stage,
-                                  auto_increment=self.increment_toggle.get_active())
+                                  auto_increment=self.increment_toggle.get_active(),
+                                  log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 
     def _on_done(self, ok):

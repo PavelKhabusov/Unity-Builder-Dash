@@ -529,9 +529,13 @@ class ProgressListener:
     The .scpt sends lines like 'Stage [3/10]: Xcode archive' via netcat to the
     host's IP. We decode '[n/m]' for the progress bar and pass lines to log_cb.
     """
-    def __init__(self, port, log_cb=None, progress_cb=None):
+    def __init__(self, port, log_cb=None, progress_cb=None, log_bulk_cb=None):
         self.port = port
+        # log_cb: per-line fallback. log_bulk_cb: gets the whole batch list at
+        # once → used to drive LogView.append_lines under a single GTK
+        # user-action (one layout pass per flush instead of per line).
         self.log_cb = log_cb
+        self.log_bulk_cb = log_bulk_cb
         self.progress_cb = progress_cb
         self._sock = None
         self._thread = None
@@ -619,17 +623,24 @@ class ProgressListener:
             if pending_bee[0] is not None:
                 pending_lines.append(pending_bee[0] + "\n")
                 pending_bee[0] = None
-            if pending_lines and self.log_cb:
+            if pending_lines and (self.log_bulk_cb or self.log_cb):
                 batch = pending_lines[:]
                 pending_lines.clear()
                 # Single idle_add per batch — main-thread wake count drops
-                # from per-line to ~20 Hz.
+                # from per-line to ~20 Hz. Prefer log_bulk_cb so LogView can
+                # hand the whole batch to append_lines() under one
+                # begin/end_user_action (one GTK layout pass per flush).
+                bulk = self.log_bulk_cb
+                cb = self.log_cb
                 def _deliver(lines=batch):
-                    cb = self.log_cb
-                    if cb is None: return False
-                    for ln in lines:
-                        try: cb(ln)
-                        except Exception: pass
+                    try:
+                        if bulk is not None:
+                            bulk(lines)
+                        elif cb is not None:
+                            for ln in lines:
+                                try: cb(ln)
+                                except Exception: pass
+                    except Exception: pass
                     return False
                 GLib.idle_add(_deliver)
             if pending_frac[0] is not None and self.progress_cb:

@@ -6,12 +6,13 @@ from .config import find_apk, get_unity_for_project, APP_DIR
 
 
 class BuildWorker:
-    def __init__(self, cfg, project, target, log_cb, done_cb, stage_cb, auto_increment=True):
+    def __init__(self, cfg, project, target, log_cb, done_cb, stage_cb, auto_increment=True, log_bulk_cb=None):
         self.cfg = cfg
         self.unity = get_unity_for_project(cfg, project)
         self.project = project
         self.target = target
         self.log_cb = log_cb
+        self.log_bulk_cb = log_bulk_cb
         self.done_cb = done_cb
         self.stage_cb = stage_cb
         self.auto_increment = auto_increment
@@ -106,6 +107,31 @@ class BuildWorker:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_path = os.path.join(logs_dir, f"{self.project['name']}_{ts}.log")
 
+        # Batch stdout lines at ~20 Hz to keep the GTK main thread from
+        # drowning in per-line idle_add calls (tens of thousands per build
+        # freeze the app when the tab is restored).
+        import time as _t
+        pending = []
+        last_flush = [0.0]
+        def flush():
+            if not pending: return
+            batch = pending[:]
+            pending.clear()
+            last_flush[0] = _t.monotonic()
+            bulk = self.log_bulk_cb
+            cb = self.log_cb
+            def _deliver(lines=batch):
+                try:
+                    if bulk is not None:
+                        bulk(lines)
+                    elif cb is not None:
+                        for ln in lines:
+                            try: cb(ln)
+                            except Exception: pass
+                except Exception: pass
+                return False
+            GLib.idle_add(_deliver)
+
         try:
             self.process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -171,12 +197,16 @@ class BuildWorker:
                 if pm:
                     c, t = int(pm.group(1)), int(pm.group(2))
                     if t > 0: GLib.idle_add(self.stage_cb, None, min(c/t, 1.0))
-                GLib.idle_add(self.log_cb, line)
+                pending.append(line)
+                if _t.monotonic() - last_flush[0] >= 0.05:
+                    flush()
 
+            flush()
             self.process.wait()
         except Exception as e:
             GLib.idle_add(self.log_cb, f"\n  Error: {e}\n")
         finally:
+            flush()
             self._save_log(full_log)
             self._restore_adb()
 
