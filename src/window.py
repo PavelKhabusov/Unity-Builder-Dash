@@ -9,9 +9,11 @@ from .worker import BuildWorker
 from .settings_page import SettingsPage
 from .history_page import HistoryPage
 from .devices import DevicesPage
-from .dialogs import show_scan, show_screenshots
+from .dialogs import show_scan, show_screenshots, show_ios_popup
 from .log_view import LogView
 from .profiler import ProfilerPage
+from . import ios_remote
+from .config import save_config
 
 
 # Sidebar items: (id, icon, label)
@@ -471,7 +473,10 @@ class BuilderWindow(Adw.ApplicationWindow):
             if not t_info: continue
             btn = Gtk.Button(icon_name=t_info["icon"],
                              tooltip_text=f"Build {t_info['label']}", css_classes=["flat"])
-            btn.connect("clicked", lambda _, p=proj, t=t_key: self._on_build(p, t))
+            if t_key == "ios":
+                btn.connect("clicked", lambda _, p=proj: self._show_ios_popup(p))
+            else:
+                btn.connect("clicked", lambda _, p=proj, t=t_key: self._on_build(p, t))
             actions.append(btn)
             buttons.append(btn)
 
@@ -604,6 +609,169 @@ class BuilderWindow(Adw.ApplicationWindow):
     def _on_build(self, proj, target_key):
         self._build_queue = []
         self._start(proj, target_key)
+
+    # ── iOS remote pipeline (CrazyMegaBuilder integration) ──
+
+    def _show_ios_popup(self, proj):
+        if not hasattr(self, "_ios_progress_listener"):
+            port = ios_remote.get_remote_cfg(self.cfg).get("progress_port", 8080)
+            self._ios_progress_listener = ios_remote.ProgressListener(
+                port, log_cb=self._log,
+                progress_cb=self.progress_bar.set_fraction)
+            self._ios_progress_listener.start()
+
+        # Auto-show the log panel whenever the popup writes something so users
+        # see connection/SCP/SSH output without manually expanding the panel.
+        def log_with_panel(t):
+            self._toggle_build_log(True)
+            self._log(t)
+
+        show_ios_popup(
+            self, proj, self.cfg,
+            on_action=lambda aid, dt, p=proj: self._on_ios_action(p, aid, dt),
+            save_cfg=save_config,
+            log_cb=log_with_panel)
+
+    # action_id → (needs_unity, needs_zip, needs_scp, osa_arg_of_device, label)
+    _IOS_ACTIONS = {
+        "full":          (True,  True,  True,  lambda dev: dev,   "Full build"),
+        "xcode":         (False, False, False, lambda dev: dev,   "Xcode build"),
+        "without_xcode": (True,  True,  True,  lambda _: "unpack","Build without Xcode"),
+        "archive":       (False, True,  False, lambda _: None,    "Pack zip"),
+        "unpack":        (False, False, False, lambda _: "unpack","Unpack on Mac"),
+        "all":           (False, True,  True,  lambda _: "unpack","Pack & unpack"),
+        "stop":          (False, False, False, lambda _: "stop",  "Stop"),
+        "clear_cache":   (False, False, False, lambda _: "clearCache", "Clear .pcm cache"),
+        "add_widget":    (False, False, False, lambda _: "addWidget",  "Add widget"),
+        "clear_build":   (False, False, False, lambda _: "clearBuild", "Clean build"),
+        "update_pod":    (False, False, False, lambda _: "updatePod",  "Update Pod"),
+    }
+
+    def _on_ios_action(self, proj, action_id, device_target):
+        spec = self._IOS_ACTIONS.get(action_id)
+        if not spec:
+            self._log(f"Unknown iOS action: {action_id}\n")
+            return
+        needs_unity, needs_zip, needs_scp, osa_fn, label = spec
+        osa_arg = osa_fn(device_target)
+
+        # Show what's running in the main status bar so it's visible after the
+        # popup closes.
+        dev_label = ""
+        for lbl, tgt in ios_remote.DEVICES:
+            if tgt == device_target:
+                dev_label = f" — {lbl}"
+                break
+        status_text = f"iOS: {label}{dev_label}"
+
+        # Stop kills the currently running remote SSH (and cancels unity if any)
+        if action_id == "stop":
+            if self.worker:
+                self.worker.cancel()
+            runner = getattr(self, "_ios_runner", None)
+            if runner:
+                runner.stop()
+            self.stage_label.set_text("iOS: stop")
+            # Still send "stop" to Mac in case a Terminal job is running there
+            self._ios_run_remote(osa_arg)
+            return
+
+        remote = ios_remote.get_remote_cfg(self.cfg)
+        if (needs_scp or osa_arg) and not remote.get("mac_ip"):
+            self._log("Mac IP is empty — set it in the iOS popup.\n")
+            return
+
+        self._toggle_build_log(True)
+        self.status.set_text(f"{proj['name']}  {status_text}")
+        self.stage_label.set_text(status_text)
+
+        if needs_unity:
+            # Run Unity iOS build first, then chain zip/scp/ssh on success
+            self._start_ios_build(proj, needs_zip, needs_scp, osa_arg, status_text)
+        else:
+            # Pure post-build pipeline (runs off the UI thread)
+            threading.Thread(
+                target=self._ios_post_build,
+                args=(proj, needs_zip, needs_scp, osa_arg, False, status_text),
+                daemon=True).start()
+
+    def _start_ios_build(self, proj, needs_zip, needs_scp, osa_arg, status_text):
+        """Run Unity iOS build, then chain into zip/scp/ssh."""
+        unity = get_unity_for_project(self.cfg, proj)
+        if not unity or not os.path.isfile(unity):
+            self._log("Unity editor not found. Check Settings.\n")
+            return
+        self._log_widget.clear()
+        self._set_building(True)
+        self.cards[proj["name"]]["status"].set_text("Building...")
+        self.progress_bar.set_fraction(0)
+        self.stage_label.set_text(f"{status_text} — Unity")
+
+        def after_unity(ok):
+            if not ok:
+                self._on_done(False)
+                return
+            # Keep "Building..." state through the remote phase
+            threading.Thread(
+                target=self._ios_post_build,
+                args=(proj, needs_zip, needs_scp, osa_arg, True, status_text),
+                daemon=True).start()
+
+        self.worker = BuildWorker(
+            self.cfg, proj, "ios",
+            self._log, after_unity, self._on_stage,
+            auto_increment=self.increment_toggle.get_active())
+        self.worker.start()
+
+    def _ios_post_build(self, proj, needs_zip, needs_scp, osa_arg,
+                        already_building=False, status_text="iOS remote"):
+        """Zip → scp → ssh osascript. Runs on a background thread."""
+        if not already_building:
+            GLib.idle_add(self._set_building, True)
+            GLib.idle_add(self.progress_bar.set_fraction, 0)
+        GLib.idle_add(self.stage_label.set_text, status_text)
+
+        done = (self._on_done if already_building else self._ios_cleanup)
+
+        ok = True
+        build_dir = proj.get("build_dir") or os.path.join(proj["path"], "Builds")
+
+        if needs_zip:
+            GLib.idle_add(self.stage_label.set_text, f"{status_text} — zipping")
+            try:
+                ios_remote.make_ios_zip(build_dir, log_cb=self._log)
+            except Exception as e:
+                GLib.idle_add(self._log, f"Zip failed: {e}\n")
+                ok = False
+
+        if ok and needs_scp:
+            GLib.idle_add(self.stage_label.set_text, f"{status_text} — uploading")
+            remote = ios_remote.get_remote_cfg(self.cfg)
+            zip_path = os.path.join(build_dir, "IOS.zip")
+            ok = ios_remote.scp_to_mac(zip_path, remote, log_cb=self._log)
+
+        if ok and osa_arg is not None:
+            GLib.idle_add(self.stage_label.set_text, f"{status_text} — Mac")
+            self._ios_run_remote(
+                osa_arg, on_remote_done=lambda rok: GLib.idle_add(done, rok))
+            return  # done fires from RemoteRunner callback
+
+        GLib.idle_add(done, ok)
+
+    def _ios_run_remote(self, osa_arg, on_remote_done=None):
+        remote = ios_remote.get_remote_cfg(self.cfg)
+        runner = ios_remote.RemoteRunner(
+            remote, log_cb=self._log,
+            done_cb=on_remote_done,
+            progress_cb=self.progress_bar.set_fraction)
+        self._ios_runner = runner
+        runner.run(osa_arg)
+
+    def _ios_cleanup(self, ok):
+        """UI reset after a pure-remote (non-Unity) iOS action."""
+        self._set_building(False)
+        self.stage_label.set_text("Done" if ok else "Failed")
+        self.progress_bar.set_fraction(1.0 if ok else 0)
 
     def _on_build_all(self, _):
         q = [(p, t) for p in self.cfg["projects"] for t in p["targets"] if t == "android"]

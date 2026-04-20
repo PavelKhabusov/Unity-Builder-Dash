@@ -1,0 +1,486 @@
+"""Remote iOS build pipeline: zip → scp → ssh osascript on Mac.
+
+Replaces the Windows-side of CrazyMegaBuilder for Linux hosts. The Mac side
+(IOSbuild.scpt) runs unchanged except for a small patch that skips the SMB
+mount if IOS.zip is already on the Desktop (see server/ folder).
+"""
+import os, signal, socket, subprocess, threading, zipfile
+from gi.repository import GLib
+
+
+# ── Defaults ──
+
+DEFAULT_REMOTE = {
+    "mac_ip": "",
+    "mac_user": "pavel",
+    "mac_auth": "key",                 # "key" | "password"
+    "mac_key_path": "~/.ssh/id_ed25519",
+    "mac_password": "",
+    "mac_work_dir": "/Users/pavel/Desktop",  # Mac-side base: .scpt, IOS.zip, IOS/ all live here
+    "progress_port": 8080,
+    # When True, ssh is spawned in an external terminal emulator instead of
+    # being captured in-app. Mirrors CMB's "Окно терминала" toggle.
+    "external_terminal": False,
+}
+
+
+def _has_tool(name):
+    import shutil
+    return shutil.which(name) is not None
+
+
+# ── SSH key setup helpers ──
+
+def generate_ssh_key(key_path="~/.ssh/id_ed25519", log_cb=None):
+    """Create an ed25519 key at key_path if missing. Returns True on success."""
+    key_path = os.path.expanduser(key_path)
+    if os.path.exists(key_path):
+        if log_cb: GLib.idle_add(log_cb, f"Key exists: {key_path}\n")
+        return True
+    ssh_dir = os.path.dirname(key_path)
+    os.makedirs(ssh_dir, exist_ok=True)
+    try: os.chmod(ssh_dir, 0o700)
+    except OSError: pass
+    try:
+        r = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "", "-q"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            if log_cb: GLib.idle_add(log_cb, f"Generated key: {key_path}\n")
+            return True
+        if log_cb: GLib.idle_add(log_cb, f"ssh-keygen failed: {r.stderr}\n")
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"ssh-keygen error: {e}\n")
+    return False
+
+
+def copy_key_to_mac(remote, password, log_cb=None):
+    """Run ssh-copy-id to install our public key on the Mac. Requires sshpass."""
+    if not _has_tool("sshpass"):
+        if log_cb:
+            GLib.idle_add(log_cb,
+                "sshpass not installed. Install it first:\n"
+                "  Arch:   sudo pacman -S sshpass\n"
+                "  Debian: sudo apt install sshpass\n")
+        return False
+    if not password:
+        if log_cb: GLib.idle_add(log_cb, "Mac password is empty\n")
+        return False
+    if not remote.get("mac_ip"):
+        if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
+        return False
+
+    key_path = os.path.expanduser(remote.get("mac_key_path", "~/.ssh/id_ed25519"))
+    pub = key_path + ".pub"
+    if not os.path.exists(pub):
+        if not generate_ssh_key(key_path, log_cb):
+            return False
+
+    cmd = ["sshpass", "-p", password, "ssh-copy-id",
+           "-i", pub,
+           "-o", "StrictHostKeyChecking=accept-new",
+           f'{remote["mac_user"]}@{remote["mac_ip"]}']
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            if log_cb:
+                GLib.idle_add(log_cb,
+                    f"Key installed on {remote['mac_ip']} — SSH key auth ready\n")
+            return True
+        err = (r.stderr or r.stdout).strip()
+        if log_cb: GLib.idle_add(log_cb, f"ssh-copy-id failed: {err}\n")
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"ssh-copy-id error: {e}\n")
+    return False
+
+
+def _find_terminal():
+    """Return (cmd, exec_flag) for the first available terminal emulator."""
+    for term, flag in [("gnome-terminal", "--"), ("konsole", "-e"),
+                       ("xfce4-terminal", "-x"), ("alacritty", "-e"),
+                       ("kitty", "--"), ("xterm", "-e")]:
+        try:
+            if subprocess.run(["which", term], capture_output=True,
+                              timeout=2).returncode == 0:
+                return term, flag
+        except Exception:
+            continue
+    return None, None
+
+# Fixed device list (matches CrazyMegaBuilder). Labels shown in dropdown,
+# values are the osascript target names expected by IOSbuild.scpt.
+DEVICES = [
+    ("iPhone 12 mini", "RuniPhone12miniFull"),
+    ("iPhone 13 mini", "RuniPhone13miniFull"),
+    ("iPad Pro",       "RuniPadProFull"),
+]
+
+
+def get_remote_cfg(cfg):
+    r = dict(DEFAULT_REMOTE)
+    r.update(cfg.get("ios_remote", {}) or {})
+    # Derive Mac paths from mac_work_dir. Explicit overrides in config still win.
+    work = (r.get("mac_work_dir") or "/Users/pavel/Desktop").rstrip("/")
+    r["mac_work_dir"] = work
+    r.setdefault("mac_script_path", f"{work}/IOSbuild.scpt")
+    r.setdefault("mac_zip_dest",    f"{work}/IOS.zip")
+    return r
+
+
+# ── Zip ──
+
+def ios_build_subdir(build_dir):
+    """Find the iOS Xcode project folder inside build_dir.
+
+    Unity's BuildScript.BuildiOS writes to '{build_dir}/iOS' (lowercase 'i').
+    CrazyMegaBuilder originally used 'IOS' (uppercase). Accept either.
+    """
+    for name in ("iOS", "IOS", "ios"):
+        p = os.path.join(build_dir, name)
+        if os.path.isdir(p):
+            return p, name
+    return None, None
+
+
+def make_ios_zip(build_dir, log_cb=None):
+    """Zip {build_dir}/iOS/ → {build_dir}/IOS.zip with 'iOS/' as archive root.
+
+    The archive is laid out so `unzip IOS.zip` on the Mac produces an 'iOS/'
+    directory directly, which IOSbuild.scpt expects at /Users/pavel/Desktop/IOS/.
+    """
+    src, _name = ios_build_subdir(build_dir)
+    if not src:
+        raise FileNotFoundError(
+            f"iOS Xcode project not found in {build_dir} (expected iOS/ subfolder)")
+    zip_path = os.path.join(build_dir, "IOS.zip")
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    if log_cb:
+        GLib.idle_add(log_cb, f"Zipping {src} → IOS.zip...\n")
+
+    # Archive root name is always 'IOS' so the Mac side unzips to Desktop/IOS/
+    # regardless of whether Unity wrote 'iOS' (Kartoteka) or 'IOS' (CMB legacy).
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for root, _dirs, files in os.walk(src):
+            for f in files:
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, src)
+                zf.write(full, os.path.join("IOS", rel))
+
+    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    if log_cb:
+        GLib.idle_add(log_cb, f"  Done ({size_mb:.0f} MB)\n")
+    return zip_path
+
+
+# ── SSH / SCP primitives ──
+
+def _ssh_common_opts(remote):
+    opts = ["-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=30"]
+    if remote["mac_auth"] == "key" and remote.get("mac_key_path"):
+        opts += ["-i", os.path.expanduser(remote["mac_key_path"])]
+    return opts
+
+
+def _wrap_sshpass(remote, cmd):
+    """If password auth is configured, prepend sshpass."""
+    if remote["mac_auth"] == "password" and remote.get("mac_password"):
+        return ["sshpass", "-p", remote["mac_password"]] + cmd
+    return cmd
+
+
+def test_connection(remote, log_cb=None):
+    """Try `ssh user@host echo ok` — returns True on success.
+
+    On success, also fires a native macOS notification so the user visually
+    sees the handshake on the Mac side.
+    """
+    if not remote.get("mac_ip"):
+        if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
+        return False
+    # `echo ok` tells us we're in; then display a Notification Center banner
+    # on the Mac and play the Glass sound as visual + audible confirmation.
+    remote_cmd = (
+        'echo ok && osascript -e '
+        '\'display notification "Unity Builder Dash connected" '
+        'with title "iOS Remote" sound name "Glass"\''
+    )
+    cmd = ["ssh"] + _ssh_common_opts(remote) + [
+        "-o", "BatchMode=yes" if remote["mac_auth"] == "key" else "BatchMode=no",
+        f'{remote["mac_user"]}@{remote["mac_ip"]}', remote_cmd]
+    cmd = _wrap_sshpass(remote, cmd)
+    if log_cb: GLib.idle_add(log_cb, f"Testing SSH to {remote['mac_user']}@{remote['mac_ip']}...\n")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        ok = r.returncode == 0 and "ok" in r.stdout
+        if log_cb:
+            msg = "Connected (notification shown on Mac)\n" if ok \
+                  else f"Failed: {r.stderr.strip() or r.stdout.strip()}\n"
+            GLib.idle_add(log_cb, msg)
+        return ok
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"SSH error: {e}\n")
+        return False
+
+
+def scp_to_mac(zip_path, remote, log_cb=None):
+    """Upload zip to {mac_zip_dest}. Returns True on success."""
+    dest = f'{remote["mac_user"]}@{remote["mac_ip"]}:{remote["mac_zip_dest"]}'
+    cmd = ["scp"] + _ssh_common_opts(remote) + [zip_path, dest]
+    cmd = _wrap_sshpass(remote, cmd)
+    if log_cb: GLib.idle_add(log_cb, f"Uploading to {remote['mac_ip']}...\n")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode == 0:
+            if log_cb: GLib.idle_add(log_cb, "  Upload done\n")
+            return True
+        if log_cb:
+            GLib.idle_add(log_cb, f"  Upload failed: {r.stderr.strip()}\n")
+        return False
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"  Upload error: {e}\n")
+        return False
+
+
+# ── Remote osascript runner ──
+
+class RemoteRunner:
+    """Runs `ssh user@mac osascript <script> <target>`, streams output to log_cb.
+
+    Keeps a reference to the subprocess so it can be killed via `stop()`.
+    One instance per run; create a new one for each action.
+    """
+    def __init__(self, remote, log_cb=None, done_cb=None, progress_cb=None):
+        self.remote = remote
+        self.log_cb = log_cb
+        self.done_cb = done_cb
+        self.progress_cb = progress_cb
+        self.process = None
+        self.cancelled = False
+
+    def run(self, target_arg):
+        """Start SSH + osascript in a background thread."""
+        threading.Thread(target=self._run, args=(target_arg,), daemon=True).start()
+
+    def _build_cmd(self, target_arg):
+        r = self.remote
+        script = r["mac_script_path"]
+        if target_arg:
+            remote_cmd = f"osascript '{script}' '{target_arg}'"
+        else:
+            remote_cmd = f"osascript '{script}'"
+        cmd = ["ssh"] + _ssh_common_opts(r) + [
+            f'{r["mac_user"]}@{r["mac_ip"]}', remote_cmd]
+        return _wrap_sshpass(r, cmd)
+
+    def _run(self, target_arg):
+        cmd = self._build_cmd(target_arg)
+        external = bool(self.remote.get("external_terminal"))
+        if self.log_cb:
+            GLib.idle_add(self.log_cb, f"→ osascript {target_arg or '(no arg)'}\n")
+
+        if external:
+            term, flag = _find_terminal()
+            if not term:
+                if self.log_cb:
+                    GLib.idle_add(self.log_cb,
+                        "No terminal emulator found — falling back in-app\n")
+                external = False
+
+        try:
+            if external:
+                full = [term, flag] + cmd
+                self.process = subprocess.Popen(full, preexec_fn=os.setsid)
+                self.process.wait()
+                ok = (self.process.returncode == 0) and not self.cancelled
+            else:
+                self.process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, preexec_fn=os.setsid)
+                for line in self.process.stdout:
+                    if self.cancelled:
+                        break
+                    if self.log_cb:
+                        GLib.idle_add(self.log_cb, line)
+                self.process.wait()
+                ok = (self.process.returncode == 0) and not self.cancelled
+        except Exception as e:
+            if self.log_cb:
+                GLib.idle_add(self.log_cb, f"SSH error: {e}\n")
+            ok = False
+        if self.done_cb:
+            GLib.idle_add(self.done_cb, ok)
+
+    def stop(self):
+        self.cancelled = True
+        if self.process:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+
+
+def install_mac_server(remote, log_cb=None):
+    """Copy server/ files to the Mac's Desktop and run patch_scpt.sh there.
+
+    Equivalent to the manual install steps from server/README.md §3+§5, but
+    done in one shot after SSH key auth is already working.
+    """
+    if not remote.get("mac_ip"):
+        if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
+        return False
+
+    # Locate the server/ folder next to src/ in the app root
+    here = os.path.dirname(os.path.abspath(__file__))
+    server_dir = os.path.join(os.path.dirname(here), "server")
+    files = ["IOSbuild.scpt", "add_widget_dependency.rb", "patch_scpt.sh"]
+    missing = [f for f in files if not os.path.isfile(os.path.join(server_dir, f))]
+    if missing:
+        if log_cb:
+            GLib.idle_add(log_cb, f"Missing in server/: {', '.join(missing)}\n")
+        return False
+
+    host = f'{remote["mac_user"]}@{remote["mac_ip"]}'
+    dest_dir = remote["mac_work_dir"]
+
+    if log_cb: GLib.idle_add(log_cb, f"Installing on Mac → {dest_dir}/\n")
+
+    # Ensure target folder exists on Mac
+    mk_cmd = ["ssh"] + _ssh_common_opts(remote) + [
+        host, f'mkdir -p "{dest_dir}"']
+    mk_cmd = _wrap_sshpass(remote, mk_cmd)
+    try:
+        subprocess.run(mk_cmd, capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+    scp_cmd = ["scp"] + _ssh_common_opts(remote) + \
+        [os.path.join(server_dir, f) for f in files] + [f"{host}:{dest_dir}/"]
+    scp_cmd = _wrap_sshpass(remote, scp_cmd)
+    try:
+        r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            if log_cb:
+                GLib.idle_add(log_cb, f"scp failed: {r.stderr.strip()}\n")
+            return False
+        if log_cb:
+            GLib.idle_add(log_cb, f"  Copied {len(files)} files\n")
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"scp error: {e}\n")
+        return False
+
+    if log_cb: GLib.idle_add(log_cb, "Running patch_scpt.sh on Mac...\n")
+    # Pass WORK_DIR so patch_scpt.sh rewrites hardcoded /Users/pavel/Desktop paths
+    patch_cmd = ["ssh"] + _ssh_common_opts(remote) + [
+        host, f'WORK_DIR="{dest_dir}" bash "{dest_dir}/patch_scpt.sh" "{dest_dir}/IOSbuild.scpt"']
+    patch_cmd = _wrap_sshpass(remote, patch_cmd)
+    try:
+        r = subprocess.run(patch_cmd, capture_output=True, text=True, timeout=60)
+        if log_cb:
+            out = (r.stdout + r.stderr).strip()
+            for line in out.splitlines():
+                GLib.idle_add(log_cb, f"  {line}\n")
+        if r.returncode == 0:
+            if log_cb: GLib.idle_add(log_cb, "Mac ready.\n")
+            return True
+        return False
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"ssh patch error: {e}\n")
+        return False
+
+
+def open_ssh_terminal(remote, log_cb=None):
+    """Open an interactive SSH session to the Mac in an external terminal."""
+    if not remote.get("mac_ip"):
+        if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
+        return
+    term, flag = _find_terminal()
+    if not term:
+        if log_cb:
+            GLib.idle_add(log_cb, "No terminal emulator found (gnome-terminal/konsole/xterm)\n")
+        return
+    ssh_cmd = ["ssh"] + _ssh_common_opts(remote) + [
+        f'{remote["mac_user"]}@{remote["mac_ip"]}']
+    ssh_cmd = _wrap_sshpass(remote, ssh_cmd)
+    try:
+        subprocess.Popen([term, flag] + ssh_cmd, start_new_session=True)
+        if log_cb: GLib.idle_add(log_cb, f"Opened {term} with SSH\n")
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"Failed to open terminal: {e}\n")
+
+
+# ── Progress listener (TCP:8080) ──
+
+class ProgressListener:
+    """Listens on TCP port for progress strings from the Mac-side AppleScript.
+
+    The .scpt sends lines like 'Stage [3/10]: Xcode archive' via netcat to the
+    host's IP. We decode '[n/m]' for the progress bar and pass lines to log_cb.
+    """
+    def __init__(self, port, log_cb=None, progress_cb=None):
+        self.port = port
+        self.log_cb = log_cb
+        self.progress_cb = progress_cb
+        self._sock = None
+        self._thread = None
+        self._running = False
+
+    def start(self):
+        if self._running:
+            return
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", self.port))
+            self._sock.listen(1)
+            self._sock.settimeout(1.0)
+        except Exception as e:
+            if self.log_cb:
+                GLib.idle_add(self.log_cb, f"Progress listener failed: {e}\n")
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        import re
+        progress_re = re.compile(r"\[(\d+)\s*/\s*(\d+)")
+        while self._running:
+            try:
+                client, _addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                with client:
+                    buf = b""
+                    while self._running:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            text = line.decode("utf-8", errors="replace").strip()
+                            if not text:
+                                continue
+                            if self.log_cb:
+                                GLib.idle_add(self.log_cb, text + "\n")
+                            m = progress_re.search(text)
+                            if m and self.progress_cb:
+                                cur, total = int(m.group(1)), int(m.group(2))
+                                if total > 0:
+                                    GLib.idle_add(self.progress_cb, min(cur/total, 1.0))
+            except Exception:
+                pass
+
+    def stop(self):
+        self._running = False
+        if self._sock:
+            try: self._sock.close()
+            except: pass
+            self._sock = None
