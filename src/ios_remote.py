@@ -602,12 +602,48 @@ class ProgressListener:
         self._thread.start()
 
     def _loop(self):
-        import re
-        progress_re = re.compile(r"\[(\d+)\s*/\s*(\d+)")
+        import re, time as _time
+        progress_re = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)")
+        bee_re = re.compile(r"^\[\s*\d+\s*/\s*\d+\s+\d+[ms]?\]")
+
+        # Batch ALL incoming lines in a list and flush to GTK at ~20 Hz. This
+        # turns 1000s of idle_add calls per build into ~40, and lets LogView
+        # group the inserts under begin/end_user_action (single layout pass).
+        pending_lines = []     # list of strings (already newline-terminated)
+        pending_frac = [None]  # most recent progress fraction
+        pending_bee = [None]   # last seen Bee line (coalesced — only latest matters)
+        last_flush = [0.0]
+
+        def flush():
+            # Inject the latest Bee line at the end so it's the last visible one
+            if pending_bee[0] is not None:
+                pending_lines.append(pending_bee[0] + "\n")
+                pending_bee[0] = None
+            if pending_lines and self.log_cb:
+                batch = pending_lines[:]
+                pending_lines.clear()
+                # Single idle_add per batch — main-thread wake count drops
+                # from per-line to ~20 Hz.
+                def _deliver(lines=batch):
+                    cb = self.log_cb
+                    if cb is None: return False
+                    for ln in lines:
+                        try: cb(ln)
+                        except Exception: pass
+                    return False
+                GLib.idle_add(_deliver)
+            if pending_frac[0] is not None and self.progress_cb:
+                GLib.idle_add(self.progress_cb, pending_frac[0])
+                pending_frac[0] = None
+            last_flush[0] = _time.monotonic()
+            return False
+
         while self._running:
             try:
                 client, _addr = self._sock.accept()
             except socket.timeout:
+                if pending_lines or pending_bee[0] or pending_frac[0]:
+                    flush()
                 continue
             except OSError:
                 break
@@ -624,13 +660,19 @@ class ProgressListener:
                             text = line.decode("utf-8", errors="replace").strip()
                             if not text:
                                 continue
-                            if self.log_cb:
-                                GLib.idle_add(self.log_cb, text + "\n")
                             m = progress_re.search(text)
-                            if m and self.progress_cb:
+                            if m:
                                 cur, total = int(m.group(1)), int(m.group(2))
                                 if total > 0:
-                                    GLib.idle_add(self.progress_cb, min(cur/total, 1.0))
+                                    pending_frac[0] = min(cur / total, 1.0)
+                            if bee_re.match(text):
+                                pending_bee[0] = text  # coalesce — keep only the latest
+                            else:
+                                pending_lines.append(text + "\n")
+                        # Time-based flush, roughly 20 Hz
+                        if _time.monotonic() - last_flush[0] >= 0.05:
+                            flush()
+                    flush()  # on disconnect drain whatever's left
             except Exception:
                 pass
 

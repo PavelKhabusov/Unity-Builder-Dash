@@ -181,6 +181,19 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
 
     menu_box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
 
+    # Run with test runner — off by default (plain install via devicectl,
+    # app icon appears on device, no auto-launch). On = xcodebuild test:
+    # auto-launches via xctest harness (more output but init quirks).
+    with_test_check = Gtk.CheckButton(label="Run with test runner (auto-launch)",
+        margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
+    with_test_check.set_active(
+        bool((cfg.get("ios_remote") or {}).get("run_with_test", False)))
+    def _on_with_test_toggle(b):
+        cfg.setdefault("ios_remote", {})["run_with_test"] = b.get_active()
+        save_cfg(cfg)
+    with_test_check.connect("toggled", _on_with_test_toggle)
+    menu_box.append(with_test_check)
+
     terminal_check = Gtk.CheckButton(label="External terminal window",
         margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
     terminal_check.set_active(
@@ -342,12 +355,14 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
         return devices_list[0][1]
 
     build_row.add_suffix(dev_dropdown)
-    for lbl, action_id, css in [
-        ("Full",       "full",          ["suggested-action"]),
-        ("Xcode",      "xcode",         []),
-        ("No Xcode",   "without_xcode", []),
+    for lbl, action_id, css, tip in [
+        ("Full",       "full",          ["suggested-action"], "Unity build → zip → scp → unpack (pods+widget) → build on Mac"),
+        ("Xcode",      "xcode",         [],                    "Skip Unity: unpack (pods+widget) + build on Mac with existing zip"),
+        ("Build",      "build_only",    [],                    "Just xcodebuild on existing iOS/ — no unpack, no pods, no widget"),
+        ("No Xcode",   "without_xcode", [],                    "Unity build → zip → scp → unpack only (no build)"),
     ]:
-        b = Gtk.Button(label=lbl, css_classes=css, valign=Gtk.Align.CENTER)
+        b = Gtk.Button(label=lbl, css_classes=css, valign=Gtk.Align.CENTER,
+                       tooltip_text=tip)
         b.connect("clicked",
             lambda _w, a=action_id: _fire(a, _dev_target()))
         build_row.add_suffix(b)

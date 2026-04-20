@@ -67,18 +67,15 @@ on stopTerminal()
 end stopTerminal
 
 on clearCache()
-	set pcmFolder to (path to library folder from user domain as text) & "Developer:Xcode:DerivedData:ModuleCache.noindex"
-	tell application "Finder"
-		set pcmFiles to (every file of folder pcmFolder whose name ends with ".pcm")
-		repeat with aFile in pcmFiles
-			delete aFile
-		end repeat
-		set derivedDataFolder to (path to library folder from user domain as text) & "Developer:Xcode:DerivedData"
-		set unityFolders to (every folder of folder derivedDataFolder whose name contains "Unity-iPhone")
-		repeat with unityFolder in unityFolders
-			delete unityFolder
-		end repeat
-	end tell
+	-- Silent bulk delete via shell. Finder's `delete` moves items to Trash
+	-- one-by-one and plays a sound per file — with hundreds of .pcm that's
+	-- a painful stream of whooshes. rm -rf is instant and soundless.
+	try
+		do shell script "rm -rf \"$HOME/Library/Developer/Xcode/DerivedData/ModuleCache.noindex\"/*.pcm"
+	end try
+	try
+		do shell script "rm -rf \"$HOME/Library/Developer/Xcode/DerivedData\"/Unity-iPhone-*"
+	end try
 end clearCache
 
 on clearBuild()
@@ -113,16 +110,25 @@ on addWidgetToProject()
 	-- Clean, recreate, copy widget sources — all via shell (no Finder quirks)
 	do shell script "rm -rf " & quoted form of widgetDest & " && mkdir -p " & quoted form of widgetDest & " && cp -R " & quoted form of widgetSource & ". " & quoted form of widgetDest
 
+	set mainPlist to projectPath & "Info.plist"
 	set terminalCommand to "
+setopt interactivecomments 2>/dev/null || true;
 /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & entitlementsFile & " || echo 'Skip delete';
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & entitlementsFile & ";
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & entitlementsFile & ";
-/usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & widgetPlist & " || echo 'Skip delete';
-/usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & widgetPlist & ";
-/usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & widgetPlist & ";
+# Disabled: application-groups is entitlements-only; in widget Info.plist it
+# can crash the host app at launch (-[__NSCFString count]).
+# /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & widgetPlist & " || echo 'Skip delete';
+# /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & widgetPlist & ";
+# /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & widgetPlist & ";
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string {{WIDGET_BUNDLE_ID}}' " & widgetPlist & ";
+# Sync widget version with parent app — Xcode warns if they differ.
+MAIN_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' " & mainPlist & " 2>/dev/null || echo '1');
+MAIN_SHORT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' " & mainPlist & " 2>/dev/null || echo '1.0');
+/usr/bin/plutil -replace CFBundleVersion -string \"$MAIN_VER\" " & widgetPlist & ";
+/usr/bin/plutil -replace CFBundleShortVersionString -string \"$MAIN_SHORT\" " & widgetPlist & ";
 cd {{WORK_DIR}}/iOS;
-gem install xcodeproj --no-document;
+gem list -i xcodeproj >/dev/null 2>&1 || gem install xcodeproj --no-document --user-install;
 WIDGET_BUNDLE_ID='{{WIDGET_BUNDLE_ID}}' WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' WIDGET_TARGET_NAME='{{WIDGET_TARGET}}' ruby {{WORK_DIR}}/add_widget_dependency.rb;
 "
 	tell application "Terminal"
@@ -206,6 +212,15 @@ on unpack()
 		do shell script "echo 'unpack: unzip done' | nc -w 1 " & IPADDRESS & " 8080"
 	end try
 
+	-- Patch project.pbxproj: Unity on Linux bakes absolute paths like
+	-- "/home/pavel/DEV/KartotekaAR/build AR/iOS/testIcon.png" into file
+	-- references. On Mac those paths don't exist → xcodebuild fails with
+	-- "no such file". Rewrite them to $(SRCROOT)/<filename> so Xcode
+	-- resolves them to the iOS/ folder on Mac.
+	try
+		do shell script "sed -i '' -E 's|/home/[^\"]*/[Ii][Oo][Ss]/|$(SRCROOT)/|g' " & quoted form of "{{WORK_DIR}}/iOS/Unity-iPhone.xcodeproj/project.pbxproj"
+	end try
+
 	-- Patch Podfile: force IPHONEOS_DEPLOYMENT_TARGET=12.0 for all pods so
 	-- Xcode stops warning about old minimum targets from legacy pods.
 	-- Idempotent — grep checks if the hook is already present.
@@ -236,12 +251,26 @@ end
 	delay 20
 end unpack
 
+-- Build + test: runs the app through xctest, which auto-launches it on device.
+-- Works for most Unity projects; some crash during test-runner init
+-- (NSInvalidArgumentException in UIApplicationMain). If that happens, use
+-- `installDevice` mode instead (Settings → iOS → "Run mode: Install only").
 on runDevice(deviceName)
 	stopTerminal()
 	tell application "Terminal"
 		do script my nccmd("cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates test")
 	end tell
 end runDevice
+
+-- Build + install (no test-runner). App icon lands on the device; user
+-- taps to launch normally, avoiding xctest's init quirks.
+on installDevice(deviceName)
+	stopTerminal()
+	set cmd to "cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'generic/platform=iOS' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
+	tell application "Terminal"
+		do script my nccmd(cmd)
+	end tell
+end installDevice
 
 -- ── Windows-host legacy: SMB mount for reading iOS.zip from a shared folder ──
 -- Linux and Windows-10+ hosts should use scp instead and ignore these handlers.
@@ -295,6 +324,13 @@ on run argv
 	else if command starts with "run:" then
 		set deviceName to text 5 thru -1 of command
 		runDevice(deviceName)
+	else if command starts with "installFull:" then
+		set deviceName to text 13 thru -1 of command
+		unpack()
+		installDevice(deviceName)
+	else if command starts with "install:" then
+		set deviceName to text 9 thru -1 of command
+		installDevice(deviceName)
 	else if command starts with "connectMac-" then
 		-- Windows-host legacy: SMB-mount the Windows share.
 		-- Save winIp into config.json so subsequent actions target it.

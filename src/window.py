@@ -265,10 +265,30 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.connect("close-request", self._on_window_close)
 
     def _on_window_close(self, *_a):
+        # Stop TCP listener so port 8080 frees up immediately
         lst = getattr(self, "_ios_progress_listener", None)
         if lst:
             try: lst.stop()
             except Exception: pass
+        # Kill any in-flight remote SSH subprocess so it doesn't become
+        # a zombie after the window closes.
+        runner = getattr(self, "_ios_runner", None)
+        if runner:
+            try: runner.stop()
+            except Exception: pass
+        # Cancel any Unity BuildWorker too (subprocess group kill)
+        w = getattr(self, "worker", None)
+        if w:
+            try: w.cancel()
+            except Exception: pass
+        # Force the Gtk.Application loop to exit. Without this, a hung
+        # subprocess pipe or an open Adw.Dialog can keep the interpreter
+        # alive even though the main window is gone.
+        app = self.get_application()
+        if app:
+            try: app.quit()
+            except Exception: pass
+        return False  # allow close
         return False  # allow close
 
     # ── Sidebar ──
@@ -617,8 +637,19 @@ class BuilderWindow(Adw.ApplicationWindow):
     def _get_tag(s):
         s = s.strip()
         sl = s.lower()
-        if "error" in sl or "FAILED" in s or "unable" in sl or "exception" in sl: return "error"
-        if "warning" in sl or "please" in sl: return "warning"
+        # Unzip and other verbose progress output — always neutral.
+        if s.startswith(("inflating:", "extracting:", "creating:", " extracting:",
+                         "  inflating:", "  extracting:")):
+            return None
+        # Require real error markers, not random substrings in paths/identifiers.
+        if ("error:" in sl or ": error:" in sl or "error cs" in sl
+                or sl.startswith("error ") or sl.startswith("error:")
+                or "FAILED" in s or " unable to " in sl
+                or "exception:" in sl or " exception " in sl):
+            return "error"
+        if ("warning:" in sl or ": warning:" in sl or "warning cs" in sl
+                or sl.startswith("warning ") or sl.startswith("warning:")):
+            return "warning"
         if "Done!" in s or "[Build] OK" in s: return "success"
         if s.startswith("[Stage]") or any(s.startswith(p[1] or "") for p in STAGE_PATTERNS if p[1]): return "stage"
         return None
@@ -672,18 +703,21 @@ class BuilderWindow(Adw.ApplicationWindow):
             self._settings_page.select_tab("ios")
 
     # action_id → (needs_unity, needs_zip, needs_scp, osa_arg_of_device, label)
+    # For run/runFull/build_only the prefix (`run:` vs `install:`) is swapped
+    # in _on_ios_action based on cfg.ios_remote.run_with_test.
     _IOS_ACTIONS = {
-        "full":          (True,  True,  True,  lambda dev: f"runFull:{dev}", "Full build"),
-        "xcode":         (False, False, False, lambda dev: f"runFull:{dev}", "Xcode build"),
-        "without_xcode": (True,  True,  True,  lambda _: "unpack",           "Build without Xcode"),
-        "archive":       (False, True,  False, lambda _: None,               "Pack zip"),
-        "unpack":        (False, False, False, lambda _: "unpack",           "Unpack on Mac"),
-        "all":           (False, True,  True,  lambda _: "unpack",           "Pack & unpack"),
-        "stop":          (False, False, False, lambda _: "stop",             "Stop"),
-        "clear_cache":   (False, False, False, lambda _: "clearCache",       "Clear .pcm cache"),
-        "add_widget":    (False, False, False, lambda _: "addWidget",        "Add widget"),
-        "clear_build":   (False, False, False, lambda _: "clearBuild",       "Clean build"),
-        "update_pod":    (False, False, False, lambda _: "updatePod",        "Update Pod"),
+        "full":          (True,  True,  True,  lambda dev: f"{{PREFIX}}Full:{dev}", "Full build"),
+        "xcode":         (False, False, False, lambda dev: f"{{PREFIX}}Full:{dev}", "Xcode build"),
+        "build_only":    (False, False, False, lambda dev: f"{{PREFIX}}:{dev}",     "Build & install (no refresh)"),
+        "without_xcode": (True,  True,  True,  lambda _: "unpack",                  "Build without Xcode"),
+        "archive":       (False, True,  False, lambda _: None,                      "Pack zip"),
+        "unpack":        (False, False, False, lambda _: "unpack",                  "Unpack on Mac"),
+        "all":           (False, True,  True,  lambda _: "unpack",                  "Pack & unpack"),
+        "stop":          (False, False, False, lambda _: "stop",                    "Stop"),
+        "clear_cache":   (False, False, False, lambda _: "clearCache",              "Clear .pcm cache"),
+        "add_widget":    (False, False, False, lambda _: "addWidget",               "Add widget"),
+        "clear_build":   (False, False, False, lambda _: "clearBuild",              "Clean build"),
+        "update_pod":    (False, False, False, lambda _: "updatePod",               "Update Pod"),
     }
 
     def _on_ios_action(self, proj, action_id, device_target):
@@ -693,6 +727,12 @@ class BuilderWindow(Adw.ApplicationWindow):
             return
         needs_unity, needs_zip, needs_scp, osa_fn, label = spec
         osa_arg = osa_fn(device_target)
+        # Pick command prefix based on cfg.ios_remote.run_with_test toggle
+        # (kebab menu checkbox). Default off = install-only via devicectl;
+        # on = xcodebuild test (auto-launches app through xctest harness).
+        if osa_arg and "{PREFIX}" in osa_arg:
+            prefix = "run" if (self.cfg.get("ios_remote") or {}).get("run_with_test") else "install"
+            osa_arg = osa_arg.replace("{PREFIX}", prefix)
 
         # Show what's running in the main status bar so it's visible after the
         # popup closes.

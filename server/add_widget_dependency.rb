@@ -44,6 +44,17 @@ widget_target.build_configurations.each do |config|
   config.build_settings['WRAPPER_EXTENSION'] = 'appex'
   config.build_settings['ENABLE_APPINTENTS_SUGGESTIONS_TRAINING'] = 'NO'
   config.build_settings['ENABLE_APP_SHORTCUTS_FLEXIBLE_MATCHING'] = 'NO'
+  # Silence "Traditional headermap style" warning on widget target.
+  config.build_settings['ALWAYS_SEARCH_USER_PATHS'] = 'NO'
+end
+
+# Also apply ALWAYS_SEARCH_USER_PATHS=NO to every Unity-iPhone target so
+# the headermap warning stops appearing for UnityFramework/main app as well.
+# (Pods live in a separate xcworkspace project and aren't touched here.)
+project.targets.each do |t|
+  t.build_configurations.each do |config|
+    config.build_settings['ALWAYS_SEARCH_USER_PATHS'] = 'NO'
+  end
 end
 
 # Add Swift source files to the widget target

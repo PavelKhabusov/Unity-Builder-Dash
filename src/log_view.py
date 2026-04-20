@@ -1,5 +1,12 @@
 """Reusable log viewer widget with search, level filter, word wrap, and color tags."""
+import re
 from gi.repository import Gtk, Gio
+
+
+# Matches Unity Bee / IL2CPP progress lines like:
+#   "[ 491/1162  3s] C_iOS_arm64 Il2CppTempDirArtifacts/..."
+# Back-to-back matches are collapsed into a single updating line in the buffer.
+_BEE_PROGRESS_RE = re.compile(r'^\s*\[\s*\d+\s*/\s*\d+\s+\d+[ms]?\]')
 
 
 # Tag configs: (name, foreground_color)
@@ -67,6 +74,21 @@ class LogView(Gtk.Box):
                                        tooltip_text="Word wrap", active=False)
         wrap_toggle.connect("toggled", self._on_wrap)
         search_box.append(wrap_toggle)
+
+        # Follow-tail toggle: pressed = auto-scroll (default), released = stay
+        # at current position so user can read a specific line without
+        # fighting the stream. Icon flips between "locked" and "unlocked".
+        self._follow_toggle = Gtk.ToggleButton(
+            icon_name="changes-prevent-symbolic",
+            tooltip_text="Follow log tail (auto-scroll)",
+            active=True)
+        def _on_follow(b):
+            b.set_icon_name("changes-prevent-symbolic" if b.get_active()
+                            else "changes-allow-symbolic")
+            if b.get_active():
+                self.scroll_to_bottom()
+        self._follow_toggle.connect("toggled", _on_follow)
+        search_box.append(self._follow_toggle)
 
         copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
                               tooltip_text="Copy visible log", css_classes=["flat"])
@@ -152,10 +174,32 @@ class LogView(Gtk.Box):
         self._trace_groups = []
         self._in_trace = False
         self._trace_ended_ago = 99
+        self._bee_mark = None
+        self._bee_line_idx = None
 
     def set_exclude_patterns(self, patterns):
         """Update exclude patterns at runtime."""
         self._exclude_patterns = patterns or []
+
+    def append_lines(self, lines):
+        """Bulk-append a list of lines with a single GTK user-action — much
+        cheaper than calling append_line N times for high-volume log streams
+        (xcodebuild, IL2CPP). All the same trace/filter/exclude logic runs."""
+        if not lines:
+            return
+        self._bulk = True  # suppress per-line scroll; one scroll at the end
+        self._buffer.begin_user_action()
+        try:
+            for ln in lines:
+                self.append_line(ln)
+        finally:
+            self._buffer.end_user_action()
+            self._bulk = False
+        follow = getattr(self, "_follow_toggle", None)
+        if follow is None or follow.get_active():
+            mk = self._buffer.create_mark(None, self._buffer.get_end_iter(), False)
+            self._view.scroll_mark_onscreen(mk)
+            self._buffer.delete_mark(mk)
 
     def append_line(self, text):
         """Append a line, respecting current filter. Stores raw line for refilter."""
@@ -196,9 +240,40 @@ class LogView(Gtk.Box):
                     self._replace_last_line(merged)
             return
 
+        # Bee / IL2CPP progress lines like "[ 491/1162  3s] C_iOS_arm64 …" —
+        # collapse into a single rolling line. Other log lines between them
+        # stay untouched; only the last Bee line is kept visible at a time.
+        if _BEE_PROGRESS_RE.match(text):
+            bm = getattr(self, "_bee_mark", None)
+            bi = getattr(self, "_bee_line_idx", None)
+            if bm and bi is not None and not self._paused:
+                try:
+                    start = self._buffer.get_iter_at_mark(bm)
+                    end = start.copy()
+                    end.forward_line()
+                    self._buffer.delete(start, end)
+                    self._buffer.delete_mark(bm)
+                except Exception:
+                    pass
+                self._bee_mark = None
+            if bi is not None and 0 <= bi < len(self._full_lines):
+                try: self._full_lines.pop(bi)
+                except IndexError: pass
+            self._full_lines.append(text)
+            self._bee_line_idx = len(self._full_lines) - 1
+            if not self._paused and self._passes_filter(text):
+                end_iter = self._buffer.get_end_iter()
+                mark = self._buffer.create_mark(None, end_iter, True)  # left-gravity
+                self._insert_tagged(text)
+                self._bee_mark = mark
+            return
+
         self._full_lines.append(text)
         if len(self._full_lines) > 10000:
             self._full_lines = self._full_lines[-7000:]
+            # Shift bee index if we just trimmed
+            if self._bee_line_idx is not None:
+                self._bee_line_idx = max(0, self._bee_line_idx - 3000)
         if not self._paused and self._passes_filter(text):
             self._insert_tagged(text)
 
@@ -265,14 +340,60 @@ class LogView(Gtk.Box):
             return False
         if s.startswith("(at "):
             return True
-        return (s.startswith("at ") or
+        # Unity C#-style stack traces
+        if (s.startswith("at ") or
                 s.startswith("UnityEngine.") or s.startswith("System.") or
                 s.startswith("Unity.") or s.startswith("Google.") or
                 s.startswith("Firebase.") or s.startswith("KartAuth.") or
                 (s.startswith("#") and " in " in s) or
                 "--- End of" in s or
                 (s.startswith("0x") and " in " in s) or
-                ("(at " in s and ".cs:" in s))
+                ("(at " in s and ".cs:" in s)):
+            return True
+        # clang / Xcode warning/error continuation lines.
+        if s.startswith("In file included from "):
+            return True
+        if ": note:" in s:
+            return True
+        # Source-code pointer lines from clang: "NNN | ...code..." and "  | ^"
+        import re as _re
+        if _re.match(r"^\s*\d+\s*\|", line) or _re.match(r"^\s*\|\s*[\^~]", line):
+            return True
+        # Xcodebuild dependency graph arrows
+        if s.startswith("➜ "):
+            return True
+        # Xcodebuild action detail lines: the action header (like "CompileC ..."
+        # or "CpResource ...") stays visible, but these implementation lines
+        # that follow it — `cd`, tool invocation (/Applications/Xcode.app/…,
+        # /Users/…/DerivedData/…, /bin/sh -c …, builtin-…), response files,
+        # progress reports from rsync/Transfer — all go into the trace block.
+        if s.startswith("cd /"):
+            return True
+        if s.startswith("/Applications/Xcode.app/Contents/Developer/"):
+            return True
+        if s.startswith("/Users/") and "/Library/Developer/Xcode/" in s:
+            return True
+        if s.startswith("/bin/sh -c ") or s.startswith("/bin/bash -c "):
+            return True
+        if s.startswith("builtin-") or s.startswith("Using response file:"):
+            return True
+        if s.startswith("Transfer starting:") or s.startswith("sent ") and " bytes " in s:
+            return True
+        if s.startswith("total size is ") or s.startswith("Ignoring --"):
+            return True
+        # Env-var dumps that Xcode emits before script phases:
+        #   export PLATFORM_NAME=iphoneos
+        #   export PATH\=/usr/bin:...
+        # Also `setenv VAR value` alt form. Hundreds of these per build.
+        if s.startswith("export ") and ("=" in s or "\\=" in s):
+            return True
+        if s.startswith("setenv ") and " " in s[7:]:
+            return True
+        # Unzip verbose output — one `inflating:`/`extracting:`/`creating:`
+        # line per file. Hide the wall of text under the fold.
+        if s.startswith("inflating:") or s.startswith("extracting:") or s.startswith("creating:"):
+            return True
+        return False
 
     def _insert_tagged(self, text, scroll=True):
         is_trace = self._is_trace_line(text)
@@ -333,7 +454,11 @@ class LogView(Gtk.Box):
                 else:
                     self._buffer.insert(end, text)
 
-        if scroll:
+        # Only auto-scroll when the follow-tail lock is engaged AND we're
+        # not in a bulk-append (append_lines does a single scroll at the end).
+        follow = getattr(self, "_follow_toggle", None)
+        in_bulk = getattr(self, "_bulk", False)
+        if scroll and not in_bulk and (follow is None or follow.get_active()):
             mk = self._buffer.create_mark(None, self._buffer.get_end_iter(), False)
             self._view.scroll_mark_onscreen(mk)
             self._buffer.delete_mark(mk)
@@ -373,7 +498,9 @@ class LogView(Gtk.Box):
         for line in self._full_lines:
             if self._passes_filter(line):
                 self._insert_tagged(line, scroll=False)
-        self.scroll_to_bottom()
+        follow = getattr(self, "_follow_toggle", None)
+        if follow is None or follow.get_active():
+            self.scroll_to_bottom()
 
     def _on_filter(self, *_):
         self._rebuild()
