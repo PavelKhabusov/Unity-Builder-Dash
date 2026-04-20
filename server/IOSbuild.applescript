@@ -34,9 +34,12 @@ property IPADDRESS : "127.0.0.1"
 
 -- Wrap a shell command so stdout/stderr goes to BOTH the Mac Terminal (tee)
 -- AND the host over TCP:8080 (ProgressListener in Unity Builder Dash).
--- Uses process substitution which requires bash/zsh (Terminal default on macOS).
+-- Uses a brace group `{ ... ; }` so the pipe captures ALL commands in a
+-- multi-line/multi-statement string, not just the last one. Requires bash or
+-- zsh for process substitution; Terminal's default on macOS is zsh.
 on nccmd(cmd)
-	return cmd & " 2>&1 | tee >(nc " & IPADDRESS & " 8080)"
+	return "{ " & cmd & "
+ ; } 2>&1 | tee >(nc " & IPADDRESS & " 8080)"
 end nccmd
 
 on readIPFromFile()
@@ -82,7 +85,7 @@ end clearCache
 
 on clearBuild()
 	tell application "Terminal"
-		do script nccmd("cd {{WORK_DIR}}/IOS && xcodebuild clean && rm -rf ./build/Build")
+		do script my nccmd("cd {{WORK_DIR}}/IOS && xcodebuild clean && rm -rf ./build/Build")
 	end tell
 end clearBuild
 
@@ -94,22 +97,23 @@ on addWidgetToProject()
 	set widgetPlist to projectPath & "Widgets/Info.plist"
 	set appGroupID to "{{APP_GROUP_ID}}"
 
-	tell application "System Events"
-		if not (exists POSIX file projectPath) then
-			display dialog "Error: project folder not found at " & projectPath buttons {"OK"} default button "OK"
-			return
-		end if
-	end tell
+	-- Existence checks via shell — Finder/System Events `exists POSIX file`
+	-- chokes on non-existent paths with trailing slash (error -1728).
+	try
+		do shell script "test -d " & quoted form of projectPath
+	on error
+		display dialog "Error: project folder not found at " & projectPath buttons {"OK"} default button "OK"
+		return
+	end try
+	try
+		do shell script "test -d " & quoted form of widgetSource
+	on error
+		display dialog "Error: widget source folder not found at " & widgetSource buttons {"OK"} default button "OK"
+		return
+	end try
 
-	tell application "Finder"
-		if exists POSIX file widgetDest then
-			delete POSIX file widgetDest
-		end if
-		if not (exists POSIX file widgetDest) then
-			do shell script "mkdir -p " & quoted form of widgetDest
-		end if
-		duplicate every item of folder (widgetSource as POSIX file) to folder (widgetDest as POSIX file) with replacing
-	end tell
+	-- Clean, recreate, copy widget sources — all via shell (no Finder quirks)
+	do shell script "rm -rf " & quoted form of widgetDest & " && mkdir -p " & quoted form of widgetDest & " && cp -R " & quoted form of widgetSource & ". " & quoted form of widgetDest
 
 	set terminalCommand to "
 /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & entitlementsFile & " || echo 'Skip delete';
@@ -124,14 +128,14 @@ gem install xcodeproj --no-document;
 WIDGET_BUNDLE_ID='{{WIDGET_BUNDLE_ID}}' WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' WIDGET_TARGET_NAME='{{WIDGET_TARGET}}' ruby {{WORK_DIR}}/add_widget_dependency.rb;
 "
 	tell application "Terminal"
-		do script nccmd(terminalCommand)
+		do script my nccmd(terminalCommand)
 	end tell
 end addWidgetToProject
 
 on updatePod()
 	tell application "Terminal"
 		activate
-		do script nccmd("cd {{WORK_DIR}}/IOS && \\
+		do script my nccmd("cd {{WORK_DIR}}/IOS && \\
 			pod cache clean --all && \\
 			rm -rf Pods && \\
 			rm -rf Podfile.lock && \\
@@ -151,34 +155,62 @@ on unpack()
 		close windows
 	end tell
 
-	tell application "Finder"
-		set iosFolder to POSIX file "{{WORK_DIR}}/IOS"
-		if exists iosFolder then
-			delete iosFolder
-		end if
-		if (count of items in trash) > 0 then
-			empty the trash
-		end if
-	end tell
+	-- Delete old IOS/ directory if present (shell is reliable with missing paths)
+	do shell script "rm -rf " & quoted form of "{{WORK_DIR}}/IOS"
 
-	-- If IOS.zip isn't in WORK_DIR yet but an SMB mount has one, copy it over.
-	-- Linux/Windows hosts that use scp will already have WORK_DIR/IOS.zip here.
-	tell application "Finder"
-		set localZip to POSIX file "{{WORK_DIR}}/IOS.zip"
-		set smbZip to POSIX file "/Volumes/Users/{{SMB_BUILD_PATH}}/IOS.zip"
-		if not (exists localZip) and (exists smbZip) then
-			duplicate smbZip to folder (POSIX file "{{WORK_DIR}}") with replacing
-		end if
-	end tell
-
-	-- unzip via shell (synchronous). Pipe through nc so host sees the progress.
+	-- Empty trash (best-effort)
 	try
-		do shell script "cd {{WORK_DIR}} && unzip -o IOS.zip 2>&1 | tee >(nc " & IPADDRESS & " 8080)"
+		tell application "Finder"
+			if (count of items in trash) > 0 then empty the trash
+		end tell
+	end try
+
+	-- If local IOS.zip is missing but SMB mount has it, copy over. Silent fallback.
+	try
+		do shell script "test -f " & quoted form of "{{WORK_DIR}}/IOS.zip"
+	on error
+		try
+			do shell script "cp /Volumes/Users/{{SMB_BUILD_PATH}}/IOS.zip " & quoted form of "{{WORK_DIR}}/IOS.zip"
+		end try
+	end try
+
+	-- Verify zip is here before unzipping
+	try
+		do shell script "test -f " & quoted form of "{{WORK_DIR}}/IOS.zip"
+	on error
+		display dialog "Error: IOS.zip not found in {{WORK_DIR}}. Did the host SCP fail?" buttons {"OK"} default button "OK"
+		return
+	end try
+
+	-- Start marker so host sees unpack actually fired, even if unzip is silent
+	try
+		do shell script "echo 'unpack: starting unzip' | nc -w 1 " & IPADDRESS & " 8080"
+	end try
+
+	-- unzip separately (not piped to nc) so it ALWAYS finishes, even if the
+	-- host isn't listening. After it's done, push the captured output via nc.
+	set unzipLog to ""
+	try
+		set unzipLog to (do shell script "cd " & quoted form of "{{WORK_DIR}}" & " && unzip -o IOS.zip 2>&1")
+	on error errMsg
+		try
+			do shell script "echo " & quoted form of ("unzip failed: " & errMsg) & " | nc -w 1 " & IPADDRESS & " 8080"
+		end try
+		display dialog "unzip failed: " & errMsg buttons {"OK"} default button "OK"
+		return
+	end try
+
+	-- Best-effort log stream back to host; don't fail the whole unpack if nc errors
+	try
+		do shell script "printf '%s\\n' " & quoted form of unzipLog & " | nc -w 1 " & IPADDRESS & " 8080"
+	end try
+	try
+		do shell script "echo 'unpack: unzip done' | nc -w 1 " & IPADDRESS & " 8080"
 	end try
 
 	tell application "Terminal"
 		activate
-		do script nccmd("cd {{WORK_DIR}}/IOS && pod install")
+		do script my nccmd("cd {{WORK_DIR}}/IOS && pod install")
 	end tell
 	delay 25
 
@@ -193,7 +225,7 @@ end unpack
 on runDevice(deviceName)
 	stopTerminal()
 	tell application "Terminal"
-		do script nccmd("cd {{WORK_DIR}}/IOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' test")
+		do script my nccmd("cd {{WORK_DIR}}/IOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' test")
 	end tell
 end runDevice
 
@@ -217,12 +249,7 @@ on splitString(someString)
 end splitString
 
 on removeBuildAlias()
-	tell application "Finder"
-		set aliasPath to POSIX file "{{WORK_DIR}}/build"
-		if exists aliasPath then
-			delete aliasPath
-		end if
-	end tell
+	do shell script "rm -f " & quoted form of "{{WORK_DIR}}/build"
 end removeBuildAlias
 
 on connectToServer(ipa)

@@ -492,19 +492,66 @@ class ProgressListener:
         self._thread = None
         self._running = False
 
+    def _free_port_if_orphaned(self):
+        """If a previous instance of this app left a listener behind, kill it.
+
+        Matches only processes whose cmdline looks like our own (`build.py`
+        under this repo, or the ubd module) so we never shoot innocent
+        bystanders. No-op on platforms without lsof.
+        """
+        try:
+            r = subprocess.run(["lsof", "-ti", f"TCP:{self.port}", "-sTCP:LISTEN"],
+                               capture_output=True, text=True, timeout=3)
+            pids = [p.strip() for p in r.stdout.splitlines() if p.strip().isdigit()]
+        except Exception:
+            return
+        my_pid = str(os.getpid())
+        repo_hint = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for pid in pids:
+            if pid == my_pid:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+            except Exception:
+                continue
+            if "build.py" in cmd and repo_hint in cmd:
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                    if self.log_cb:
+                        GLib.idle_add(self.log_cb,
+                            f"Killed orphaned listener pid {pid}\n")
+                    # Give the kernel a moment to release the socket
+                    import time as _t; _t.sleep(0.3)
+                except Exception:
+                    pass
+
     def start(self):
         if self._running:
             return
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._sock.bind(("0.0.0.0", self.port))
-            self._sock.listen(1)
-            self._sock.settimeout(1.0)
-        except Exception as e:
-            if self.log_cb:
-                GLib.idle_add(self.log_cb, f"Progress listener failed: {e}\n")
-            return
+        for attempt in (1, 2):
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._sock.bind(("0.0.0.0", self.port))
+                self._sock.listen(1)
+                self._sock.settimeout(1.0)
+                break
+            except OSError as e:
+                try: self._sock.close()
+                except Exception: pass
+                self._sock = None
+                if attempt == 1 and getattr(e, "errno", None) == 98:
+                    # EADDRINUSE — probably our own zombie; try to reclaim.
+                    self._free_port_if_orphaned()
+                    continue
+                if self.log_cb:
+                    GLib.idle_add(self.log_cb, f"Progress listener failed: {e}\n")
+                return
+            except Exception as e:
+                if self.log_cb:
+                    GLib.idle_add(self.log_cb, f"Progress listener failed: {e}\n")
+                return
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()

@@ -244,6 +244,33 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not cfg.get("unity") or not cfg.get("projects"):
             self._settings_list.select_row(self._settings_list.get_row_at_index(0))
 
+        # Start iOS progress listener early if Mac is configured — so even
+        # actions triggered from the Devices page (before the popup opens)
+        # have a live TCP:8080 server ready to receive Mac-side logs.
+        ios_cfg = ios_remote.get_remote_cfg(cfg)
+        if ios_cfg.get("mac_ip"):
+            def _ios_progress_log(t):
+                # Auto-reveal the log panel on any incoming Mac-side byte so
+                # streamed output is never silently hidden.
+                self._toggle_build_log(True)
+                self._log(t)
+            self._ios_progress_listener = ios_remote.ProgressListener(
+                ios_cfg.get("progress_port", 8080),
+                log_cb=_ios_progress_log,
+                progress_cb=self.progress_bar.set_fraction)
+            self._ios_progress_listener.start()
+
+        # Stop listener (close socket) when the window closes so the port
+        # frees immediately on quit — no orphan TCP:8080 across restarts.
+        self.connect("close-request", self._on_window_close)
+
+    def _on_window_close(self, *_a):
+        lst = getattr(self, "_ios_progress_listener", None)
+        if lst:
+            try: lst.stop()
+            except Exception: pass
+        return False  # allow close
+
     # ── Sidebar ──
 
     def _toggle_sidebar(self):
