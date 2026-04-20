@@ -26,7 +26,7 @@
    updatePod                 full pod reinstall + add widget
    addWidget                 re-run add_widget_dependency.rb
    connectMac-<winIp>-<mac>  (Windows host only) SMB-mount winIp, save winIp
-                             to ip_address.txt. Linux hosts don't need this
+                             into config.json. Linux hosts don't need this
                              since they scp IOS.zip directly.
 *)
 
@@ -42,17 +42,15 @@ on nccmd(cmd)
  ; } 2>&1 | tee >(nc " & IPADDRESS & " 8080)"
 end nccmd
 
+-- Read host_ip from {{WORK_DIR}}/config.json (written by the host on every
+-- SSH call). Returns "" if config is missing or malformed.
 on readIPFromFile()
 	try
-		return (do shell script "cat " & quoted form of "{{WORK_DIR}}/ip_address.txt")
+		return (do shell script "python3 -c 'import json; print(json.load(open(\"{{WORK_DIR}}/config.json\")).get(\"host_ip\",\"\"))'")
 	on error
 		return ""
 	end try
 end readIPFromFile
-
-on writeIPToFile(ipa)
-	do shell script "mkdir -p " & quoted form of "{{WORK_DIR}}" & " && echo " & quoted form of ipa & " > " & quoted form of "{{WORK_DIR}}/ip_address.txt"
-end writeIPToFile
 
 on stopTerminal()
 	tell application "Terminal"
@@ -268,11 +266,8 @@ on connectToServer(ipa)
 end connectToServer
 
 on run argv
-	try
-		set IPADDRESS to readIPFromFile()
-	on error
-		writeIPToFile(IPADDRESS)
-	end try
+	set IPADDRESS to readIPFromFile()
+	if IPADDRESS is "" then set IPADDRESS to "127.0.0.1"
 
 	if (count of argv) = 0 then return
 	set command to item 1 of argv
@@ -285,9 +280,12 @@ on run argv
 		set deviceName to text 5 thru -1 of command
 		runDevice(deviceName)
 	else if command starts with "connectMac-" then
-		-- Windows-host legacy: SMB-mount the Windows share
+		-- Windows-host legacy: SMB-mount the Windows share.
+		-- Save winIp into config.json so subsequent actions target it.
 		set {_cmd, winIp, macIp} to splitString(command)
-		writeIPToFile(winIp)
+		try
+			do shell script "python3 -c \"import json,os; p='{{WORK_DIR}}/config.json'; d=json.load(open(p)) if os.path.isfile(p) else {}; d['host_ip']='" & winIp & "'; open(p,'w').write(json.dumps(d,indent=2))\""
+		end try
 		removeBuildAlias()
 		connectToServer(winIp)
 	else if command is "unpack" then

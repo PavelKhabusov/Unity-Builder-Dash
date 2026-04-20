@@ -48,3 +48,12 @@ mkdir -p "$WORK_DIR"
 osacompile -o "$DEST" "$TMP"
 rm "$TMP"
 echo "Compiled: $DEST"
+
+# Compile the native GUI console (mac_console.applescript) into .app if present
+CONSOLE_SRC="$WORK_DIR/mac_console.applescript"
+CONSOLE_APP="$WORK_DIR/mac_console.app"
+if [ -f "$CONSOLE_SRC" ]; then
+    rm -rf "$CONSOLE_APP"
+    osacompile -o "$CONSOLE_APP" "$CONSOLE_SRC"
+    echo "Compiled: $CONSOLE_APP"
+fi

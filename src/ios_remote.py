@@ -221,17 +221,31 @@ def _wrap_sshpass(remote, cmd):
 
 
 def _write_client_ip_cmd(work_dir):
-    """Shell snippet (Mac-side) to write the SSH client IP into ip_address.txt.
+    """Shell snippet (Mac-side) that updates host_ip in config.json.
 
-    The file lives in WORK_DIR. A symlink from ~/Desktop/ip_address.txt to
-    this file is created by install_mac_server / patch_scpt.sh, so the
-    AppleScript (which uses `path to desktop folder`) and the host both see
-    the same file. Uses $SSH_CLIENT (set by sshd) — no host-side detection.
+    Host runs this via SSH before every action. Uses $SSH_CLIENT (set by
+    sshd) — no host-side IP detection. Creates config.json if missing.
     """
     return (
         f'mkdir -p "{work_dir}" && '
-        f'echo "$SSH_CLIENT" | awk \'{{print $1}}\' > "{work_dir}/ip_address.txt"'
+        f'IP=$(echo "$SSH_CLIENT" | awk \'{{print $1}}\') && '
+        f'python3 -c "import json, os; p=\'{work_dir}/config.json\'; '
+        f'd=json.load(open(p)) if os.path.isfile(p) else {{}}; '
+        f'd[\'host_ip\']=\'$IP\'; open(p,\'w\').write(json.dumps(d,indent=2))"'
     )
+
+
+def _build_mac_config(remote):
+    """Assemble the dict that becomes $WORK_DIR/config.json on the Mac."""
+    return {
+        "host_ip": "",  # filled by _write_client_ip_cmd on every action
+        "widget_bundle_id":    remote.get("widget_bundle_id")    or "com.example.myapp.widget",
+        "widget_team_id":      remote.get("widget_team_id")      or "XXXXXXXXXX",
+        "widget_target":       remote.get("widget_target_name")  or "URLImageWidget",
+        "widget_folder":       remote.get("widget_folder_name")  or "kartoteka.widget",
+        "widget_app_group_id": remote.get("widget_app_group_id") or "group.com.example.myapp",
+        "devices":             remote.get("devices") or [],
+    }
 
 
 def test_connection(remote, log_cb=None, notify=True):
@@ -248,14 +262,18 @@ def test_connection(remote, log_cb=None, notify=True):
     if not remote.get("mac_ip"):
         if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
         return False
+    # Always write the client IP — silent probes too, so mac_console.app
+    # and any in-flight .scpt have a current value. Notifications stay
+    # opt-in (noisy macOS banner / Glass sound on the Mac).
+    base = f'{_write_client_ip_cmd(remote["mac_work_dir"])} && echo ok'
     if notify:
         remote_cmd = (
-            f'echo ok && {_write_client_ip_cmd(remote["mac_work_dir"])} && osascript -e '
+            f'{base} && osascript -e '
             '\'display notification "Unity Builder Dash connected" '
             'with title "iOS Remote" sound name "Glass"\''
         )
     else:
-        remote_cmd = "echo ok"
+        remote_cmd = base
     cmd = ["ssh"] + _ssh_common_opts(remote) + [
         "-o", "BatchMode=yes" if remote["mac_auth"] == "key" else "BatchMode=no",
         f'{remote["mac_user"]}@{remote["mac_ip"]}', remote_cmd]
@@ -387,7 +405,8 @@ def install_mac_server(remote, log_cb=None):
     # Locate the server/ folder next to src/ in the app root
     here = os.path.dirname(os.path.abspath(__file__))
     server_dir = os.path.join(os.path.dirname(here), "server")
-    files = ["IOSbuild.applescript", "add_widget_dependency.rb", "patch_scpt.sh"]
+    files = ["IOSbuild.applescript", "add_widget_dependency.rb", "patch_scpt.sh",
+             "mac_console.applescript"]
     missing = [f for f in files if not os.path.isfile(os.path.join(server_dir, f))]
     if missing:
         if log_cb:
@@ -422,6 +441,32 @@ def install_mac_server(remote, log_cb=None):
     except Exception as e:
         if log_cb: GLib.idle_add(log_cb, f"scp error: {e}\n")
         return False
+
+    # Write the Mac-side config.json (devices + widget metadata) before
+    # patch_scpt.sh runs — so the compiled .scpt and mac_console.app both
+    # have live config when first launched.
+    import json as _json
+    mac_cfg = _build_mac_config(remote)
+    cfg_json = _json.dumps(mac_cfg, indent=2, ensure_ascii=False)
+    # Base64-encode to avoid quoting hell over SSH
+    import base64 as _b64
+    cfg_b64 = _b64.b64encode(cfg_json.encode("utf-8")).decode("ascii")
+    # Write config.json AND populate host_ip from $SSH_CLIENT in one go, so the
+    # Mac always has a usable value right after install (before any action).
+    remote_shell = (
+        f'echo {cfg_b64} | base64 -d > "{dest_dir}/config.json" && '
+        f'IP=$(echo "$SSH_CLIENT" | awk \'{{print $1}}\') && '
+        f'python3 -c "import json; p=\'{dest_dir}/config.json\'; '
+        f'd=json.load(open(p)); d[\'host_ip\']=\'$IP\'; '
+        f'open(p,\'w\').write(json.dumps(d,indent=2))"'
+    )
+    write_cfg_cmd = ["ssh"] + _ssh_common_opts(remote) + [host, remote_shell]
+    write_cfg_cmd = _wrap_sshpass(remote, write_cfg_cmd)
+    try:
+        subprocess.run(write_cfg_cmd, capture_output=True, text=True, timeout=15)
+        if log_cb: GLib.idle_add(log_cb, "  Wrote config.json\n")
+    except Exception as e:
+        if log_cb: GLib.idle_add(log_cb, f"  config.json write error: {e}\n")
 
     if log_cb: GLib.idle_add(log_cb, "Compiling IOSbuild.applescript on Mac...\n")
     # Pass all placeholders so patch_scpt.sh can substitute them and osacompile
