@@ -1,147 +1,148 @@
 # iOS Remote Build Server (Mac side)
 
-This folder contains the files that live **on the Mac** to make the iOS popup
-in Unity Builder Dash work. The host (Linux, Windows, or another Mac) uploads
-the built Xcode project as `IOS.zip` via SCP, then invokes `IOSbuild.scpt`
-over SSH. The script unpacks the zip, opens Xcode, builds the archive, and
-installs it on the attached iOS device.
+Files that live **on the Mac** to make the iOS popup in Unity Builder Dash work.
+The host (Linux/Windows/another Mac) pushes `IOS.zip` to the Mac via SCP, then
+invokes `IOSbuild.scpt` over SSH. The script unzips, runs `pod install`,
+integrates the widget, builds via `xcodebuild`, and installs on the iOS device.
 
 ## Contents
 
 | File | Purpose |
 |---|---|
-| `IOSbuild.scpt` | Compiled AppleScript. The one-command orchestrator on the Mac. |
-| `add_widget_dependency.example.rb` | Template for the widget-integration script. Copy to `add_widget_dependency.rb` and fill in `BUNDLE_ID` + `TEAM_ID` — the real file is gitignored so your Apple Team ID stays out of the repo. |
-| `add_widget_dependency.rb` *(gitignored)* | Your customized copy. Adds the WidgetKit extension target to the Unity-exported Xcode project. Invoked by `IOSbuild.scpt` on the "Add widget" button. |
-| `patch_scpt.sh` | Decompiles `IOSbuild.scpt`, wraps the legacy SMB-mount block in an existence check, recompiles. Run once on the Mac. |
+| `IOSbuild.applescript` | **Source** with `{{PLACEHOLDERS}}`. Compiled to `IOSbuild.scpt` on the Mac at install time. |
+| `add_widget_dependency.rb` | Adds the WidgetKit extension target to the Unity-exported Xcode project. Fully env-driven (BUNDLE_ID / TEAM_ID / WIDGET_TARGET_NAME come from your `config.json`). |
+| `patch_scpt.sh` | Substitutes placeholders in `IOSbuild.applescript` with env-var values and runs `osacompile` to produce `IOSbuild.scpt`. |
 
-## Install on the Mac (one-time)
+`IOSbuild.scpt` is **not** checked in — it's generated from source on your Mac.
 
-### 1. Enable Remote Login (SSH)
+## Quick setup
 
-System Settings → General → Sharing → **Remote Login: ON**. Allow your user.
+The happy path uses the app's UI — no terminal surgery required.
 
-### 2. Set up passwordless SSH from the host
+### 1. On the Mac: enable Remote Login + install Xcode tools
 
-On the **Linux/Windows host** (not the Mac):
+System Settings → General → Sharing → **Remote Login: ON**.
 
 ```bash
-ssh-keygen -t ed25519           # if you don't have a key yet
-ssh-copy-id pavel@<mac-ip>      # paste Mac password once
-ssh pavel@<mac-ip> echo ok      # should print 'ok' without asking for password
+xcode-select --install                     # command-line tools
+sudo gem install xcodeproj --no-document   # needed by add_widget_dependency.rb
+sudo gem install cocoapods --no-document   # needed by pod install / updatePod
 ```
 
-If you must keep password auth, set `mac_auth: "password"` in Unity Builder
-Dash's `config.json` and install `sshpass` on the host:
+Open Xcode once from `/Applications` to accept the license.
+
+### 2. On the host: configure iOS Settings
+
+Launch Unity Builder Dash → **Settings → iOS** tab. Fill in:
+
+- **Mac IP**, **Mac user**, **Mac password**, **Mac work folder** (e.g. `/Users/you/Builds/iOS`)
+- **Widget bundle ID** / **Apple Team ID** / **Widget target name** / **Widget folder name** / **App Group ID**
+- **iOS Devices** list — add entries with `name` (exact `xcodebuild -destination 'platform=iOS,name=<this>'`) and a friendly `display_name` for the popup dropdown.
+
+Everything is saved to `config.json` (gitignored, safe to share minus `mac_password`).
+
+### 3. Click **Set up** then **Install on Mac**
+
+Still in Settings → iOS (or via the 🔑 popover in the iOS action popup):
+
+1. **Set up** — generates `~/.ssh/id_ed25519` if missing and runs `ssh-copy-id` to the Mac (needs `sshpass` locally and your Mac password filled in). After this, passwordless SSH works.
+2. **Install on Mac** — SCPs `IOSbuild.applescript`, `add_widget_dependency.rb`, `patch_scpt.sh` into your work folder on the Mac, then runs `patch_scpt.sh` remotely to compile `IOSbuild.scpt` with your values substituted.
+
+Re-run **Install on Mac** whenever you change widget/work-folder/devices — the `.scpt` gets regenerated.
+
+### 4. Grant macOS automation permissions
+
+First time a remote action fires, the Mac prompts to allow `osascript` to control Terminal / Xcode / Finder / System Events. Approve each.
+
+Pre-grant in: **System Settings → Privacy & Security → Automation** (and **Accessibility**).
+
+### 5. Test
+
+Click the iOS button on a project. In the popup: the status dot next to Mac IP
+should turn **green** on auto-probe. Clicking **Connect** additionally shows a
+macOS notification banner on the Mac. Then try **Full** with a device plugged
+in — xcodebuild output streams into the app's log view in real time.
+
+## Installing `sshpass` (one-time, for Set up & password auth)
 
 ```bash
-# Linux (Arch)
+# Arch
 sudo pacman -S sshpass
-# Linux (Debian/Ubuntu)
+# Debian/Ubuntu
 sudo apt install sshpass
-# Windows
-# Use sshpass from WSL or install via Chocolatey/Scoop
+# macOS
+brew install sshpass
+# Windows — from WSL, or Chocolatey/Scoop
 ```
 
-### 3. Copy the server files to the Mac
+Only needed for: initial `ssh-copy-id` (Set up button), and running with
+`mac_auth: "password"` (i.e. not using an SSH key).
 
-From the repo root on the host:
+## Commands the Mac understands
 
-```bash
-scp server/IOSbuild.scpt            pavel@<mac-ip>:~/Desktop/
-scp server/add_widget_dependency.rb pavel@<mac-ip>:~/Desktop/
-scp server/patch_scpt.sh            pavel@<mac-ip>:~/Desktop/
-```
+Sent as first argument to `osascript ~/<work_dir>/IOSbuild.scpt <command>`.
 
-### 4. Install Mac dependencies
+| Command | Meaning |
+|---|---|
+| `run:<device>` | `stopTerminal` + `xcodebuild test -destination 'platform=iOS,name=<device>'` |
+| `runFull:<device>` | `unpack` + `run:<device>` |
+| `unpack` | unzip `IOS.zip`, `pod install`, add widget |
+| `stop` | kill active Terminal job |
+| `clearCache` | remove Xcode `DerivedData` / `.pcm` |
+| `clearBuild` | `xcodebuild clean` + `rm -rf ./build/Build` |
+| `updatePod` | full pod reinstall + add widget |
+| `addWidget` | re-run `add_widget_dependency.rb` |
+| `connectMac-<winIp>-<macIp>` | **Windows-only legacy**: SMB-mount the Windows share + save `winIp` for progress callbacks |
 
-On the Mac (Terminal):
+## How the popup buttons map
 
-```bash
-# Xcode Command Line Tools
-xcode-select --install
-
-# Ruby gem for add_widget_dependency.rb (needed for the "Добавить виджет" button)
-sudo gem install xcodeproj --no-document
-
-# CocoaPods (needed for "Обновить Pod")
-sudo gem install cocoapods --no-document
-```
-
-Xcode itself must be installed from the App Store and opened at least once to
-accept the license.
-
-### 5. Patch `IOSbuild.scpt` to skip SMB mount
-
-On the Mac:
-
-```bash
-cd ~/Desktop
-bash patch_scpt.sh
-```
-
-This makes the AppleScript use the SCP'd `/Users/pavel/Desktop/IOS.zip`
-directly instead of trying to SMB-mount a share on the host. The Windows flow
-still works — if `IOS.zip` is absent when the script runs, the SMB mount is
-attempted as before.
-
-A backup of the original is saved as `IOSbuild.scpt.bak`.
-
-### 6. Grant automation permissions
-
-`osascript` needs permission to drive Terminal, Xcode, Finder, and System
-Events. The first time you trigger an action from Unity Builder Dash, macOS
-will prompt — approve each one. You can also pre-grant them in:
-
-System Settings → Privacy & Security → **Automation** and **Accessibility**.
-Add `ssh`/`sshd-keygen-wrapper` to Automation if needed.
-
-### 7. Test
-
-From the host, open a project in Unity Builder Dash, click the iOS button,
-enter the Mac's IP, click **Соединить** — should say "Connected". Then try
-**Полностью** with a real device plugged in.
-
-## How the actions map to the Mac
-
-| Popup button | Host does | Mac side (`osascript` argument) |
+| Popup button | Host does | osascript arg |
 |---|---|---|
-| Сборка → Полностью | Unity build → zip → scp | `RuniPhone12miniFull` / `RuniPadProFull` / etc. |
-| Сборка → Xcode | (skip all — reuses prior zip on Mac) | same as above |
-| Сборка → Без Xcode | Unity build → zip → scp | `unpack` |
-| Архив → Архивировать | zip locally | — |
-| Архив → Разархивировать | — | `unpack` |
-| Архив → Всё | zip → scp | `unpack` |
-| Доп → Остановить | kill active SSH | `stop` |
-| Доп → Очистить кэш .pcm Xcode | — | `clearCache` |
-| Доп → Добавить виджет | — | `addWidget` |
-| Доп → Очистить сборку | — | `clearBuild` |
-| Menu → Обновить Pod | — | `updatePod` |
+| Build → **Full** | Unity iOS build → zip → scp | `runFull:<device>` |
+| Build → **Xcode** | *(skip all — reuse existing zip on Mac)* | `runFull:<device>` |
+| Build → **No Xcode** | Unity build → zip → scp | `unpack` |
+| Archive → **Pack** | zip locally only | *(none — no SSH)* |
+| Archive → **Unpack** | *(none)* | `unpack` |
+| Archive → **All** | zip → scp | `unpack` |
+| Extras → **Clear .pcm cache** | *(none)* | `clearCache` |
+| Extras → **Add widget** | *(none)* | `addWidget` |
+| Extras → **Clean build** | *(none)* | `clearBuild` |
+| Kebab → **Stop** | kill local SSH + runner | `stop` |
+| Kebab → **Update Pod** | *(none)* | `updatePod` |
+
+## Log streaming
+
+Every shell command on the Mac is wrapped as
+`<cmd> 2>&1 | tee >(nc $IPADDRESS 8080)` so output goes **both** to the Mac's
+Terminal window (visible locally on the Mac) **and** over TCP:8080 to Unity
+Builder Dash's `ProgressListener`, which renders it in the LogView. Xcode,
+pod, gem, ruby, plist-editing — everything streams.
+
+`$IPADDRESS` is read from `$WORK_DIR/ip_address.txt`, which the host rewrites
+on every SSH call (using `$SSH_CLIENT` — no IP detection on the host needed).
 
 ## Windows host notes
 
-The original `CrazyMegaBuilder` Unity Editor window targets Windows and uses
-an SMB share (often set up via XAMPP or Windows file sharing) so the Mac
-could mount a Windows folder and read `IOS.zip` from there. With this repo,
-the host instead **pushes `IOS.zip` via SCP**, which also works from Windows
-10+ (SSH client is included). XAMPP is no longer required.
-
-If you still prefer the legacy SMB flow (e.g. for an existing Windows
-setup), don't run `patch_scpt.sh` — the unmodified `IOSbuild.scpt` keeps
-mounting the share.
+Modern Windows 10+ ships with OpenSSH `scp`, so you can use the same SCP flow
+as Linux — no SMB share / XAMPP required. If you still prefer the legacy SMB
+flow (e.g. to avoid SCP large-zip overhead on slow networks), fill in the
+`smb_user` / `smb_password` / `smb_build_path` fields in `config.json` and
+send the `connectMac-<winIp>-<macIp>` command once per session. The Mac
+`unpack` handler falls back to copying `IOS.zip` from the SMB mount if no
+local zip is found in the work folder.
 
 ## Troubleshooting
 
-**"Permission denied" on SSH** — re-run `ssh-copy-id`, verify Remote Login
-is ON, and that the user matches `mac_user` in `config.json`.
+**"Permission denied (publickey,password)" on SSH** — re-run **Set up** from Settings → iOS (requires the Mac password in that tab + `sshpass` locally), or run `ssh-copy-id pavel@<mac-ip>` manually.
 
-**`osascript` hangs with no output** — macOS is probably waiting for an
-Automation permission prompt. Open Terminal on the Mac, run `osascript
-~/Desktop/IOSbuild.scpt RuniPhone12miniFull` directly, approve prompts, then
-retry from the host.
+**Mac status dot stays grey / red** — open the iOS popup, click **Connect** (notification + audible feedback on Mac confirms the round trip), check the inline log for the exact error.
 
-**"IOS.zip not found" on Mac** — the scp step failed silently; check
-`mac_zip_dest` in config and that the host can write to that path.
+**`osascript` hangs with no output** — macOS is waiting for an Automation permission prompt. Open Terminal on the Mac directly: `osascript ~/<work_dir>/IOSbuild.scpt 'run:iPhone 12 mini'`, approve the prompts, then retry from the host.
 
-**Widget build fails** — make sure `gem install xcodeproj` completed and the
-widget source folder is at `/Users/pavel/Desktop/kartoteka.widget/Widgets/`.
+**"IOS.zip not found" on Mac** — the SCP step failed silently; check `mac_work_dir` in Settings → iOS matches an existing folder and that SSH has write permission there.
+
+**Widget build fails** — verify `gem install xcodeproj` completed on the Mac and that your widget source folder sits at `$WORK_DIR/$WIDGET_FOLDER/Widgets/` (e.g. `/Users/pavel/Desktop/Kartoteka/kartoteka.widget/Widgets/`). Copy the folder there manually if moving from the old `~/Desktop/kartoteka.widget/` path.
+
+**Progress bar doesn't fill during build** — the Mac side sends progress via `nc $IPADDRESS:8080`. Check: firewall on the host isn't blocking 8080, and `$WORK_DIR/ip_address.txt` on the Mac contains the host's IP (auto-written by every SSH invocation via `$SSH_CLIENT`).
+
+**Changed `mac_work_dir` and things break** — click **Install on Mac** again in Settings to re-deploy + recompile `IOSbuild.scpt` with the new paths.

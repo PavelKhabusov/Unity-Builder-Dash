@@ -12,6 +12,7 @@ A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, 
 
 ### Projects
 - **Build** multiple Unity projects (Android APK, iOS Xcode) with one click
+- **iOS Remote Build** — build iOS on a remote Mac over SSH (zip → scp → xcodebuild). See [server/README.md](server/README.md) for Mac-side setup.
 - **Build All** — sequential builds across all configured projects
 - **Run Tests** — EditMode and PlayMode tests via Unity Test Runner (batchmode)
   - Real-time progress counter, ETA based on previous runs
@@ -108,6 +109,23 @@ cp config.example.json config.json
 ```
 
 On first launch with no config, Settings opens automatically with auto-detection of Unity Editor path.
+
+### Desktop entry (optional)
+
+To get a proper GNOME launcher entry with the right icon:
+```bash
+./install.sh             # installs to ~/.local/share/applications/
+./install.sh --system    # system-wide (needs sudo)
+./install.sh --uninstall
+```
+The script detects the repo path at install time, so no path hardcoding.
+
+### iOS remote build
+
+If you build iOS on a remote Mac, see [server/README.md](server/README.md) for
+the one-time Mac setup. After that, the iOS button in the app opens a popup
+that orchestrates: Unity build → zip → scp → xcodebuild on Mac, with full log
+streaming back into the app's LogView.
 
 ## Unity BuildScript
 
