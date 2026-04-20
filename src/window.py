@@ -216,7 +216,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._stack.add_named(self._projects_page, "projects")
 
         # Devices page
-        self._devices_page = DevicesPage()
+        self._devices_page = DevicesPage(cfg)
         self._stack.add_named(self._devices_page, "devices")
 
         # History page
@@ -630,21 +630,33 @@ class BuilderWindow(Adw.ApplicationWindow):
             self, proj, self.cfg,
             on_action=lambda aid, dt, p=proj: self._on_ios_action(p, aid, dt),
             save_cfg=save_config,
-            log_cb=log_with_panel)
+            log_cb=log_with_panel,
+            on_open_settings=self._open_settings_ios)
+
+    def _open_settings_ios(self):
+        """Switch the main window to Settings and select the iOS tab."""
+        self._stack.set_visible_child_name("settings")
+        if hasattr(self, "_settings_list"):
+            first = self._settings_list.get_row_at_index(0)
+            if first: self._settings_list.select_row(first)
+        if hasattr(self, "_sidebar_list"):
+            self._sidebar_list.unselect_all()
+        if hasattr(self, "_settings_page"):
+            self._settings_page.select_tab("ios")
 
     # action_id → (needs_unity, needs_zip, needs_scp, osa_arg_of_device, label)
     _IOS_ACTIONS = {
-        "full":          (True,  True,  True,  lambda dev: dev,   "Full build"),
-        "xcode":         (False, False, False, lambda dev: dev,   "Xcode build"),
-        "without_xcode": (True,  True,  True,  lambda _: "unpack","Build without Xcode"),
-        "archive":       (False, True,  False, lambda _: None,    "Pack zip"),
-        "unpack":        (False, False, False, lambda _: "unpack","Unpack on Mac"),
-        "all":           (False, True,  True,  lambda _: "unpack","Pack & unpack"),
-        "stop":          (False, False, False, lambda _: "stop",  "Stop"),
-        "clear_cache":   (False, False, False, lambda _: "clearCache", "Clear .pcm cache"),
-        "add_widget":    (False, False, False, lambda _: "addWidget",  "Add widget"),
-        "clear_build":   (False, False, False, lambda _: "clearBuild", "Clean build"),
-        "update_pod":    (False, False, False, lambda _: "updatePod",  "Update Pod"),
+        "full":          (True,  True,  True,  lambda dev: f"runFull:{dev}", "Full build"),
+        "xcode":         (False, False, False, lambda dev: f"runFull:{dev}", "Xcode build"),
+        "without_xcode": (True,  True,  True,  lambda _: "unpack",           "Build without Xcode"),
+        "archive":       (False, True,  False, lambda _: None,               "Pack zip"),
+        "unpack":        (False, False, False, lambda _: "unpack",           "Unpack on Mac"),
+        "all":           (False, True,  True,  lambda _: "unpack",           "Pack & unpack"),
+        "stop":          (False, False, False, lambda _: "stop",             "Stop"),
+        "clear_cache":   (False, False, False, lambda _: "clearCache",       "Clear .pcm cache"),
+        "add_widget":    (False, False, False, lambda _: "addWidget",        "Add widget"),
+        "clear_build":   (False, False, False, lambda _: "clearBuild",       "Clean build"),
+        "update_pod":    (False, False, False, lambda _: "updatePod",        "Update Pod"),
     }
 
     def _on_ios_action(self, proj, action_id, device_target):
@@ -658,8 +670,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         # Show what's running in the main status bar so it's visible after the
         # popup closes.
         dev_label = ""
-        for lbl, tgt in ios_remote.DEVICES:
-            if tgt == device_target:
+        for lbl, name in ios_remote.get_devices(self.cfg):
+            if name == device_target:
                 dev_label = f" — {lbl}"
                 break
         status_text = f"iOS: {label}{dev_label}"

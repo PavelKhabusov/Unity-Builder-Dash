@@ -21,7 +21,35 @@ DEFAULT_REMOTE = {
     # When True, ssh is spawned in an external terminal emulator instead of
     # being captured in-app. Mirrors CMB's "Окно терминала" toggle.
     "external_terminal": False,
+    # Widget config — piped through as env vars to add_widget_dependency.rb
+    # and sed-substituted into IOSbuild.applescript by patch_scpt.sh.
+    "widget_bundle_id":     "com.example.myapp.widget",
+    "widget_team_id":       "XXXXXXXXXX",
+    "widget_target_name":   "URLImageWidget",
+    "widget_folder_name":   "kartoteka.widget",
+    "widget_app_group_id":  "group.com.example.myapp",
+    # Devices: list of {"name": <xcodebuild destination>, "display_name": <UI>}
+    "devices": [
+        {"name": "iPhone 12 mini", "display_name": "iPhone 12 mini"},
+        {"name": "iPad Pro",       "display_name": "iPad Pro"},
+    ],
+    # SMB (Windows-host legacy — leave empty on Linux)
+    "smb_user":       "",
+    "smb_password":   "",
+    "smb_build_path": "",
 }
+
+
+def get_devices(cfg):
+    """Return [(display_name, name), ...] from cfg.ios_remote.devices."""
+    devs = (cfg.get("ios_remote") or {}).get("devices") or DEFAULT_REMOTE["devices"]
+    out = []
+    for d in devs:
+        name = d.get("name") or ""
+        disp = d.get("display_name") or name
+        if name:
+            out.append((disp, name))
+    return out
 
 
 def _has_tool(name):
@@ -192,37 +220,59 @@ def _wrap_sshpass(remote, cmd):
     return cmd
 
 
-def test_connection(remote, log_cb=None):
+def _write_client_ip_cmd(work_dir):
+    """Shell snippet (Mac-side) to write the SSH client IP into ip_address.txt.
+
+    The file lives in WORK_DIR. A symlink from ~/Desktop/ip_address.txt to
+    this file is created by install_mac_server / patch_scpt.sh, so the
+    AppleScript (which uses `path to desktop folder`) and the host both see
+    the same file. Uses $SSH_CLIENT (set by sshd) — no host-side detection.
+    """
+    return (
+        f'mkdir -p "{work_dir}" && '
+        f'echo "$SSH_CLIENT" | awk \'{{print $1}}\' > "{work_dir}/ip_address.txt"'
+    )
+
+
+def test_connection(remote, log_cb=None, notify=True):
     """Try `ssh user@host echo ok` — returns True on success.
 
-    On success, also fires a native macOS notification so the user visually
-    sees the handshake on the Mac side.
+    When `notify=True` (explicit Connect button), also writes our host IP into
+    $WORK_DIR/ip_address.txt so progress callbacks from the Mac AppleScript
+    can reach us, and fires a native macOS notification as visual/audible
+    confirmation on the Mac.
+
+    When `notify=False` (auto-probe for status indicator), just does a silent
+    `echo ok` — no Mac notification, no IP write. Keeps probes unobtrusive.
     """
     if not remote.get("mac_ip"):
         if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
         return False
-    # `echo ok` tells us we're in; then display a Notification Center banner
-    # on the Mac and play the Glass sound as visual + audible confirmation.
-    remote_cmd = (
-        'echo ok && osascript -e '
-        '\'display notification "Unity Builder Dash connected" '
-        'with title "iOS Remote" sound name "Glass"\''
-    )
+    if notify:
+        remote_cmd = (
+            f'echo ok && {_write_client_ip_cmd(remote["mac_work_dir"])} && osascript -e '
+            '\'display notification "Unity Builder Dash connected" '
+            'with title "iOS Remote" sound name "Glass"\''
+        )
+    else:
+        remote_cmd = "echo ok"
     cmd = ["ssh"] + _ssh_common_opts(remote) + [
         "-o", "BatchMode=yes" if remote["mac_auth"] == "key" else "BatchMode=no",
         f'{remote["mac_user"]}@{remote["mac_ip"]}', remote_cmd]
     cmd = _wrap_sshpass(remote, cmd)
-    if log_cb: GLib.idle_add(log_cb, f"Testing SSH to {remote['mac_user']}@{remote['mac_ip']}...\n")
+    if log_cb and notify:
+        GLib.idle_add(log_cb, f"Testing SSH to {remote['mac_user']}@{remote['mac_ip']}...\n")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         ok = r.returncode == 0 and "ok" in r.stdout
-        if log_cb:
+        if log_cb and notify:
             msg = "Connected (notification shown on Mac)\n" if ok \
                   else f"Failed: {r.stderr.strip() or r.stdout.strip()}\n"
             GLib.idle_add(log_cb, msg)
         return ok
     except Exception as e:
-        if log_cb: GLib.idle_add(log_cb, f"SSH error: {e}\n")
+        if log_cb and notify:
+            GLib.idle_add(log_cb, f"SSH error: {e}\n")
         return False
 
 
@@ -268,10 +318,11 @@ class RemoteRunner:
     def _build_cmd(self, target_arg):
         r = self.remote
         script = r["mac_script_path"]
-        if target_arg:
-            remote_cmd = f"osascript '{script}' '{target_arg}'"
-        else:
-            remote_cmd = f"osascript '{script}'"
+        osa = (f"osascript '{script}' '{target_arg}'" if target_arg
+               else f"osascript '{script}'")
+        # Refresh ip_address.txt every run so Mac always knows where to POST
+        # progress back, even if our IP changed (DHCP, VPN, laptop move).
+        remote_cmd = f"{_write_client_ip_cmd(r['mac_work_dir'])} && {osa}"
         cmd = ["ssh"] + _ssh_common_opts(r) + [
             f'{r["mac_user"]}@{r["mac_ip"]}', remote_cmd]
         return _wrap_sshpass(r, cmd)
@@ -336,7 +387,7 @@ def install_mac_server(remote, log_cb=None):
     # Locate the server/ folder next to src/ in the app root
     here = os.path.dirname(os.path.abspath(__file__))
     server_dir = os.path.join(os.path.dirname(here), "server")
-    files = ["IOSbuild.scpt", "add_widget_dependency.rb", "patch_scpt.sh"]
+    files = ["IOSbuild.applescript", "add_widget_dependency.rb", "patch_scpt.sh"]
     missing = [f for f in files if not os.path.isfile(os.path.join(server_dir, f))]
     if missing:
         if log_cb:
@@ -372,10 +423,23 @@ def install_mac_server(remote, log_cb=None):
         if log_cb: GLib.idle_add(log_cb, f"scp error: {e}\n")
         return False
 
-    if log_cb: GLib.idle_add(log_cb, "Running patch_scpt.sh on Mac...\n")
-    # Pass WORK_DIR so patch_scpt.sh rewrites hardcoded /Users/pavel/Desktop paths
+    if log_cb: GLib.idle_add(log_cb, "Compiling IOSbuild.applescript on Mac...\n")
+    # Pass all placeholders so patch_scpt.sh can substitute them and osacompile
+    # IOSbuild.applescript → IOSbuild.scpt. No decompile/sed trickery needed.
+    env = {
+        "WORK_DIR":           dest_dir,
+        "WIDGET_BUNDLE_ID":   remote.get("widget_bundle_id")    or "com.example.myapp.widget",
+        "WIDGET_TEAM_ID":     remote.get("widget_team_id")      or "XXXXXXXXXX",
+        "WIDGET_TARGET_NAME": remote.get("widget_target_name")  or "URLImageWidget",
+        "WIDGET_FOLDER_NAME": remote.get("widget_folder_name")  or "kartoteka.widget",
+        "APP_GROUP_ID":       remote.get("widget_app_group_id") or "group.com.example.myapp",
+        "SMB_USER":           remote.get("smb_user")            or "",
+        "SMB_PASS":           remote.get("smb_password")        or "",
+        "SMB_BUILD_PATH":     remote.get("smb_build_path")      or "",
+    }
+    env_prefix = " ".join(f'{k}="{v}"' for k, v in env.items())
     patch_cmd = ["ssh"] + _ssh_common_opts(remote) + [
-        host, f'WORK_DIR="{dest_dir}" bash "{dest_dir}/patch_scpt.sh" "{dest_dir}/IOSbuild.scpt"']
+        host, f'{env_prefix} bash "{dest_dir}/patch_scpt.sh"']
     patch_cmd = _wrap_sshpass(remote, patch_cmd)
     try:
         r = subprocess.run(patch_cmd, capture_output=True, text=True, timeout=60)

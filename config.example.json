@@ -7,8 +7,20 @@
     "mac_auth": "key",
     "mac_key_path": "~/.ssh/id_ed25519",
     "mac_password": "",
-    "mac_work_dir": "/Users/pavel/Desktop",
-    "progress_port": 8080
+    "mac_work_dir": "/Users/pavel/Desktop/MyProject",
+    "progress_port": 8080,
+    "widget_bundle_id": "com.example.myapp.widget",
+    "widget_team_id": "XXXXXXXXXX",
+    "widget_target_name": "URLImageWidget",
+    "widget_folder_name": "kartoteka.widget",
+    "widget_app_group_id": "group.com.example.myapp",
+    "devices": [
+      {"name": "iPhone 12 mini", "display_name": "iPhone 12 mini"},
+      {"name": "iPad Pro",       "display_name": "iPad Pro"}
+    ],
+    "smb_user": "",
+    "smb_password": "",
+    "smb_build_path": ""
   },
   "projects": [
     {

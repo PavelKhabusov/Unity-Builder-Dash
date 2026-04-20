@@ -11,7 +11,8 @@ installs it on the attached iOS device.
 | File | Purpose |
 |---|---|
 | `IOSbuild.scpt` | Compiled AppleScript. The one-command orchestrator on the Mac. |
-| `add_widget_dependency.rb` | Adds the WidgetKit extension target to the Unity-exported Xcode project. Invoked by `IOSbuild.scpt` when "Добавить виджет" is pressed. |
+| `add_widget_dependency.example.rb` | Template for the widget-integration script. Copy to `add_widget_dependency.rb` and fill in `BUNDLE_ID` + `TEAM_ID` — the real file is gitignored so your Apple Team ID stays out of the repo. |
+| `add_widget_dependency.rb` *(gitignored)* | Your customized copy. Adds the WidgetKit extension target to the Unity-exported Xcode project. Invoked by `IOSbuild.scpt` on the "Add widget" button. |
 | `patch_scpt.sh` | Decompiles `IOSbuild.scpt`, wraps the legacy SMB-mount block in an existence check, recompiles. Run once on the Mac. |
 
 ## Install on the Mac (one-time)

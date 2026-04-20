@@ -3,6 +3,7 @@ import os, subprocess
 from gi.repository import Gtk, Adw, Gdk
 from .constants import APP_NAME, APP_GITHUB, APK_DASH_GITHUB
 from .config import save_config, find_unity, find_apk_dash, list_unity_versions
+from .ios_settings import build_ios_settings_groups
 
 
 class SettingsPage(Gtk.Box):
@@ -19,21 +20,34 @@ class SettingsPage(Gtk.Box):
         self.save_btn.add_css_class("suggested-action")
         self.save_btn.connect("clicked", self._save)
 
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        page = Adw.PreferencesPage()
+        # ── Tabs via ViewStack + ViewSwitcher ──
+        self._view_stack = Adw.ViewStack(vexpand=True)
+        switcher = Adw.ViewSwitcher(stack=self._view_stack,
+                                    policy=Adw.ViewSwitcherPolicy.WIDE,
+                                    halign=Gtk.Align.CENTER,
+                                    margin_top=6, margin_bottom=6)
+        self.append(switcher)
+        self.append(self._view_stack)
 
-        # ── Projects ──
+        # ── Tab: Projects ──
+        proj_scroll = Gtk.ScrolledWindow(vexpand=True)
+        proj_page = Adw.PreferencesPage()
         self.proj_grp = Adw.PreferencesGroup(title="Projects")
         add_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
         add_btn.add_css_class("flat")
         add_btn.connect("clicked", self._add_project)
         self.proj_grp.set_header_suffix(add_btn)
-
         for p in cfg.get("projects", []):
             self._add_project_row(p)
-        page.add(self.proj_grp)
+        proj_page.add(self.proj_grp)
+        proj_scroll.set_child(proj_page)
+        self._view_stack.add_titled_with_icon(
+            proj_scroll, "projects", "Projects", "applications-system-symbolic")
 
-        # ── General ──
+        # ── Tab: General ──
+        gen_scroll = Gtk.ScrolledWindow(vexpand=True)
+        gen_page = Adw.PreferencesPage()
+
         grp = Adw.PreferencesGroup(title="General")
         self.unity_row = Adw.EntryRow(title="Unity Editor (default)")
         self.unity_row.set_text(cfg.get("unity", ""))
@@ -53,37 +67,46 @@ class SettingsPage(Gtk.Box):
         detect.set_activatable_widget(detect_btn)
         grp.add(detect)
 
-        # Theme
         self.theme_row = Adw.ComboRow(title="Theme")
         self.theme_row.set_model(Gtk.StringList.new(["System", "Dark", "Light"]))
         theme_idx = {"system": 0, "dark": 1, "light": 2}
         self.theme_row.set_selected(theme_idx.get(cfg.get("theme", "system"), 0))
         self.theme_row.connect("notify::selected", self._on_theme_preview)
         grp.add(self.theme_row)
-        page.add(grp)
+        gen_page.add(grp)
 
-        # ── Log Filters ──
         filter_grp = Adw.PreferencesGroup(title="Log Filters",
             description="Lines containing these strings will be hidden from build/test logs (with their stack traces)")
         add_filter_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
         add_filter_btn.add_css_class("flat")
         add_filter_btn.connect("clicked", self._add_filter_row)
         filter_grp.set_header_suffix(add_filter_btn)
-
         self._filter_grp = filter_grp
         self._filter_rows = []
         for f in cfg.get("log_filters", []):
             self._add_filter_row(None, f)
-        page.add(filter_grp)
+        gen_page.add(filter_grp)
 
-        # ── About ──
+        gen_scroll.set_child(gen_page)
+        self._view_stack.add_titled_with_icon(
+            gen_scroll, "general", "General", "preferences-system-symbolic")
+
+        # ── Tab: iOS ──
+        ios_scroll = Gtk.ScrolledWindow(vexpand=True)
+        ios_page = Adw.PreferencesPage()
+        for g in build_ios_settings_groups(cfg, save_config, self._ios_log):
+            ios_page.add(g)
+        ios_scroll.set_child(ios_page)
+        self._view_stack.add_titled_with_icon(
+            ios_scroll, "ios", "iOS", "phone-apple-iphone-symbolic")
+
+        # ── Tab: About ──
+        about_scroll = Gtk.ScrolledWindow(vexpand=True)
+        about_page = Adw.PreferencesPage()
         about_grp = Adw.PreferencesGroup(title="About")
-
-        # App info with icon
         icon_path = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "icons", "ubd-app-icon.png")
-        app_row = Adw.ActionRow(title=APP_NAME,
-            subtitle="MIT License — 2026")
+        app_row = Adw.ActionRow(title=APP_NAME, subtitle="MIT License — 2026")
         if os.path.isfile(icon_path):
             icon_img = Gtk.Image.new_from_paintable(
                 Gdk.Texture.new_from_filename(icon_path))
@@ -103,10 +126,25 @@ class SettingsPage(Gtk.Box):
             row.connect("activated", lambda _, u=url: subprocess.Popen(["xdg-open", u]))
             row.add_suffix(Gtk.Image.new_from_icon_name("adw-external-link-symbolic"))
             about_grp.add(row)
-        page.add(about_grp)
+        about_page.add(about_grp)
+        about_scroll.set_child(about_page)
+        self._view_stack.add_titled_with_icon(
+            about_scroll, "about", "About", "help-about-symbolic")
 
-        scroll.set_child(page)
-        self.append(scroll)
+    def select_tab(self, name):
+        """Programmatically switch to a tab (e.g. 'projects', 'general', 'ios', 'about')."""
+        if hasattr(self, "_view_stack"):
+            self._view_stack.set_visible_child_name(name)
+
+    def _ios_log(self, text):
+        """Log destination for iOS setup buttons when fired from Settings.
+
+        No in-page log pane here — print to stdout so users running from a
+        terminal see progress. UI toasts/notifications can be added later.
+        """
+        import sys
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
     @staticmethod
     def _apply_theme(name):

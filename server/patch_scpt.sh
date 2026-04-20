@@ -1,81 +1,50 @@
 #!/bin/bash
-# Run once on the Mac. Decompiles IOSbuild.scpt, makes two edits, recompiles:
-#   1. Rewrites hardcoded "/Users/pavel/Desktop" → "$WORK_DIR" if it differs,
-#      so you can keep build artefacts anywhere (e.g. ~/Builds/iOS).
-#   2. Wraps the SMB-mount block in an existence check so the Linux/Windows
-#      host can scp "IOS.zip" directly to $WORK_DIR/IOS.zip and skip the mount.
+# Compile server/IOSbuild.applescript into IOSbuild.scpt on the Mac,
+# substituting {{PLACEHOLDERS}} with values from env vars.
 #
-# Idempotent — re-running is safe. A sentinel comment flags the SMB patch.
+# Called by install_mac_server (over SSH) after the source + helpers are
+# scp'd to WORK_DIR. Also safe to run manually on the Mac for debugging.
 #
-# Usage:    bash patch_scpt.sh [path/to/IOSbuild.scpt]
-# Env vars: WORK_DIR   Mac work folder (default: /Users/pavel/Desktop)
+# Usage:  bash patch_scpt.sh
+#
+# Env vars (all read with fallbacks; install_mac_server fills them from cfg):
+#   WORK_DIR            Mac work folder (default: ~/Desktop)
+#   WIDGET_BUNDLE_ID    Widget CFBundleIdentifier
+#   WIDGET_TEAM_ID      Apple Dev Team ID
+#   WIDGET_TARGET_NAME  Widget Xcode target (e.g. URLImageWidget)
+#   WIDGET_FOLDER_NAME  Widget source folder name (e.g. kartoteka.widget)
+#   APP_GROUP_ID        App Group ID
+#   SMB_USER            SMB user for Windows-host fallback (optional)
+#   SMB_PASS            SMB password (optional)
+#   SMB_BUILD_PATH      Path under /Volumes/Users/ (optional)
 set -e
 
-SCPT="${1:-$HOME/Desktop/IOSbuild.scpt}"
-WORK_DIR="${WORK_DIR:-/Users/pavel/Desktop}"
-# Normalize: strip trailing slash
+WORK_DIR="${WORK_DIR:-$HOME/Desktop}"
 WORK_DIR="${WORK_DIR%/}"
-[ -f "$SCPT" ] || { echo "Not found: $SCPT"; exit 1; }
+SRC="$WORK_DIR/IOSbuild.applescript"
+DEST="$WORK_DIR/IOSbuild.scpt"
 
-BACKUP="$SCPT.bak"
-SRC="$(mktemp -t IOSbuild).applescript"
+[ -f "$SRC" ] || { echo "Source not found: $SRC" >&2; exit 1; }
 
-# Preserve a one-time backup of the original binary
-[ -f "$BACKUP" ] || cp "$SCPT" "$BACKUP"
+# sed escapes: | is our delimiter and \ / & are special to replacement.
+esc() {
+    printf '%s' "$1" | sed -e 's/[\\/&|]/\\&/g'
+}
 
-echo "Decompiling $SCPT..."
-osadecompile "$SCPT" > "$SRC"
+TMP="$(mktemp -t IOSbuild).applescript"
+sed \
+  -e "s|{{WORK_DIR}}|$(esc "$WORK_DIR")|g" \
+  -e "s|{{WIDGET_BUNDLE_ID}}|$(esc "${WIDGET_BUNDLE_ID:-com.example.myapp.widget}")|g" \
+  -e "s|{{WIDGET_TEAM_ID}}|$(esc "${WIDGET_TEAM_ID:-XXXXXXXXXX}")|g" \
+  -e "s|{{WIDGET_TARGET}}|$(esc "${WIDGET_TARGET_NAME:-URLImageWidget}")|g" \
+  -e "s|{{WIDGET_FOLDER}}|$(esc "${WIDGET_FOLDER_NAME:-kartoteka.widget}")|g" \
+  -e "s|{{APP_GROUP_ID}}|$(esc "${APP_GROUP_ID:-group.com.example.myapp}")|g" \
+  -e "s|{{SMB_USER}}|$(esc "${SMB_USER:-Admin}")|g" \
+  -e "s|{{SMB_PASS}}|$(esc "${SMB_PASS:-}")|g" \
+  -e "s|{{SMB_BUILD_PATH}}|$(esc "${SMB_BUILD_PATH:-Admin/Desktop/build}")|g" \
+  "$SRC" > "$TMP"
 
-# ── Step 1: path rewrite ──
-if [ "$WORK_DIR" != "/Users/pavel/Desktop" ]; then
-    # Escape for sed (only | needs special care since we use | as delim)
-    esc_work=$(printf '%s' "$WORK_DIR" | sed 's|[|]|\\|g')
-    echo "Rewriting /Users/pavel/Desktop → $WORK_DIR"
-    # macOS sed requires '' after -i
-    sed -i '' "s|/Users/pavel/Desktop|$esc_work|g" "$SRC"
-fi
-
-if grep -q "CMB_PATCH_LOCAL_ZIP" "$SRC"; then
-    echo "SMB block already patched — recompiling with updated paths only."
-    osacompile -o "$SCPT" "$SRC"
-    rm "$SRC"
-    exit 0
-fi
-
-# Patch strategy:
-# Find the SMB-mount block (`mount volume "smb://..."`) and wrap it in
-#   `if not (POSIX file "/Users/pavel/Desktop/IOS.zip" exists) then ... end if`
-# so that it's only executed when the host hasn't already scp'd IOS.zip.
-#
-# The sentinel comment `CMB_PATCH_LOCAL_ZIP` marks it so we can detect
-# re-runs.
-python3 - "$SRC" "$WORK_DIR" <<'PY'
-import re, sys
-path, work_dir = sys.argv[1], sys.argv[2]
-text = open(path).read()
-
-pattern = re.compile(r'(\s*)(mount volume\s+"smb://[^"\n]+"[^\n]*)', re.IGNORECASE)
-m = pattern.search(text)
-if not m:
-    sys.stderr.write("WARN: mount volume block not found — nothing to patch.\n")
-    sys.exit(0)
-
-indent = m.group(1)
-line = m.group(2)
-zip_path = f"{work_dir}/IOS.zip"
-replacement = (
-    f'{indent}-- CMB_PATCH_LOCAL_ZIP: skip SMB mount when host already scp\'d IOS.zip\n'
-    f'{indent}tell application "System Events" to set zipExists to (exists file "{zip_path}")\n'
-    f'{indent}if not zipExists then\n'
-    f'{indent}    {line}\n'
-    f'{indent}end if'
-)
-text = text[:m.start()] + replacement + text[m.end():]
-open(path, "w").write(text)
-print("Patched SMB-mount block.")
-PY
-
-echo "Recompiling → $SCPT"
-osacompile -o "$SCPT" "$SRC"
-rm "$SRC"
-echo "Done. Backup kept at $BACKUP"
+mkdir -p "$WORK_DIR"
+osacompile -o "$DEST" "$TMP"
+rm "$TMP"
+echo "Compiled: $DEST"

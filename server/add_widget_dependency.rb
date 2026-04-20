@@ -1,39 +1,58 @@
+# Widget integration script — adds a WidgetKit app extension target to the
+# Unity-exported Xcode project. Invoked by IOSbuild.scpt after Unity export.
+#
+# Fully env-driven — no hardcoded identity. Values come from ENV vars set
+# by IOSbuild.scpt (patched on Install from Unity Builder Dash). Fallbacks
+# are placeholder-safe so the script still runs if env is unset.
+
 require 'xcodeproj'
 
-project_path = '/Users/pavel/Desktop/IOS/Unity-iPhone.xcodeproj'
+# Work dir resolution order:
+#   1. ARGV[0]          explicit override when invoked manually
+#   2. ENV['WORK_DIR']  set by IOSbuild.scpt (patched on install)
+#   3. script's own dir install_mac_server places this .rb next to IOS/
+script_dir   = File.dirname(File.expand_path(__FILE__))
+work_dir     = ARGV[0] || ENV['WORK_DIR'] || script_dir
+project_path = File.join(work_dir, 'IOS', 'Unity-iPhone.xcodeproj')
+
+# Widget config from env (set by Settings → Install on Mac)
+BUNDLE_ID     = ENV['WIDGET_BUNDLE_ID']   || 'com.example.myapp.widget'
+TEAM_ID       = ENV['WIDGET_TEAM_ID']     || 'XXXXXXXXXX'
+WIDGET_TARGET = ENV['WIDGET_TARGET_NAME'] || 'URLImageWidget'
+
+puts "📂 Using project at #{project_path}"
+puts "🔧 Widget: target=#{WIDGET_TARGET}, bundle=#{BUNDLE_ID}, team=#{TEAM_ID}"
 project = Xcodeproj::Project.open(project_path)
 
-widget_target_name = 'URLImageWidget'
 app_target = project.targets.find { |t| t.name == 'Unity-iPhone' }
-abort("❌ Не найден основной таргет") unless app_target
+abort("❌ Main target not found") unless app_target
 
-# Создаём новый таргет для виджета
-widget_target = project.new_target(:app_extension, widget_target_name, :ios, '17.0', nil, :swift)
+# Create the widget target
+widget_target = project.new_target(:app_extension, WIDGET_TARGET, :ios, '17.0', nil, :swift)
 
-# Указываем Bundle Identifier и Info.plist путь
+# Bundle Identifier and Info.plist
 plist_path = 'Widgets/Info.plist'
 widget_target.build_configurations.each do |config|
-  config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = 'com.PavelKhabusov.KartotekaAR.widget'
+  config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = BUNDLE_ID
   config.build_settings['INFOPLIST_FILE'] = plist_path
   config.build_settings['CODE_SIGN_ENTITLEMENTS'] = 'Unity-iPhone.entitlements'
-  config.build_settings['DEVELOPMENT_TEAM'] = '7W3GJTY422'
+  config.build_settings['DEVELOPMENT_TEAM'] = TEAM_ID
   config.build_settings['SWIFT_VERSION'] = '5.0'
   config.build_settings['EMBEDDED_CONTENT_CONTAINS_SWIFT'] = 'YES'
   config.build_settings['LD_RUNPATH_SEARCH_PATHS'] = '$(inherited) @executable_path/Frameworks'
-  config.build_settings['PRODUCT_NAME'] = 'URLImageWidget'
+  config.build_settings['PRODUCT_NAME'] = WIDGET_TARGET
   config.build_settings['WRAPPER_EXTENSION'] = 'appex'
   config.build_settings['ENABLE_APPINTENTS_SUGGESTIONS_TRAINING'] = 'NO'
   config.build_settings['ENABLE_APP_SHORTCUTS_FLEXIBLE_MATCHING'] = 'NO'
-  # config.build_settings['SWIFT_OPTIMIZATION_LEVEL'] = '-Onone'
 end
 
-# Добавляем Swift-файлы в новую группу и таргет
+# Add Swift source files to the widget target
 group = project.main_group.find_subpath('Widgets/', true)
 group.set_source_tree('SOURCE_ROOT')
-%w[
-  URLImageWidget/ProductData.swift
-  URLImageWidget/URLImageWidget.swift
-  URLImageWidget/URLImageWidget+Provider.swift
+%W[
+  #{WIDGET_TARGET}/ProductData.swift
+  #{WIDGET_TARGET}/#{WIDGET_TARGET}.swift
+  #{WIDGET_TARGET}/#{WIDGET_TARGET}+Provider.swift
   WidgetBundle.swift
 ].each do |filename|
   file_path = "Widgets/#{filename}"
@@ -43,7 +62,6 @@ group.set_source_tree('SOURCE_ROOT')
 end
 
 frameworks_phase = widget_target.frameworks_build_phase
-#widget_target.add_system_framework('Foundation')
 
 frameworks_phase.files.each do |build_file|
     file_ref = build_file.file_ref
@@ -61,8 +79,8 @@ end
     AppIntents
 ].each do |framework_name|
   framework_path = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/System/Library/Frameworks/#{framework_name}.framework"
-  
-  # Проверим, не добавлен ли уже такой фреймворк (по имени, не по пути)
+
+  # Skip if already linked (by filename, not by full path)
   existing_file = project.frameworks_group.files.find do |f|
     File.basename(f.path.to_s) == framework_name
   end
@@ -80,6 +98,5 @@ unless copy_phase
 end
 copy_phase.add_file_reference(widget_target.product_reference, true)
 
-# Сохраняем проект
 project.save
-puts "✅ Виджет #{widget_target_name} успешно добавлен в проект"
+puts "✅ Widget #{WIDGET_TARGET} added to project"

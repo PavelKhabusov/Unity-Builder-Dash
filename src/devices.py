@@ -2,6 +2,7 @@
 import os, subprocess, threading
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 from .log_view import LogView
+from . import ios_remote
 
 
 def _adb(*args, device=None, timeout=15):
@@ -128,8 +129,10 @@ def _get_logcat_tag(line):
 class DevicesPage(Gtk.Box):
     """Full-page device manager with ADB controls."""
 
-    def __init__(self):
+    def __init__(self, cfg=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._cfg = cfg or {}
+        self._mac_online = None  # None=unknown, True=ok, False=offline
 
         # ── Top bar: refresh + connect ──
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -266,16 +269,115 @@ class DevicesPage(Gtk.Box):
         while (c := self._device_list.get_first_child()):
             self._device_list.remove(c)
 
+        # Mac card (only if an IP is configured)
+        r = ios_remote.get_remote_cfg(self._cfg)
+        if r.get("mac_ip"):
+            self._device_list.append(self._make_mac_card(r))
+            # Async probe to refresh the indicator
+            threading.Thread(target=self._probe_mac, args=(r,), daemon=True).start()
+
         if not devices:
-            self._status.set_text("No devices connected")
-            self._device_list.append(
-                Adw.StatusPage(title="No devices", icon_name="phone-symbolic",
-                               description="Connect a device via USB or WiFi"))
+            if not r.get("mac_ip"):
+                self._status.set_text("No devices connected")
+                self._device_list.append(
+                    Adw.StatusPage(title="No devices", icon_name="phone-symbolic",
+                                   description="Connect a device via USB or WiFi"))
+            else:
+                self._status.set_text("Mac configured; no Android devices")
             return
 
         self._status.set_text(f"{len(devices)} device(s)")
         for dev in devices:
             self._device_list.append(self._make_device_card(dev))
+
+    def _probe_mac(self, remote):
+        ok = ios_remote.test_connection(remote, log_cb=None, notify=False)
+        self._mac_online = ok
+        GLib.idle_add(self._refresh_mac_status)
+
+    def _refresh_mac_status(self):
+        """Update the Mac card's status label in place without full rebuild."""
+        status_lbl = getattr(self, "_mac_status_lbl", None)
+        if not status_lbl: return False
+        ok = self._mac_online
+        txt = "Connected" if ok is True else "Disconnected" if ok is False else "Checking..."
+        color = "success" if ok is True else "error" if ok is False else "dim-label"
+        status_lbl.set_text(txt)
+        for c in ("success", "error", "dim-label"):
+            status_lbl.remove_css_class(c)
+        status_lbl.add_css_class(color)
+        return False
+
+    def _make_mac_card(self, remote):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
+                       css_classes=["card"])
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                        margin_top=12, margin_bottom=12,
+                        margin_start=16, margin_end=16)
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        title = Gtk.Label(label="Mac (iOS build server)", xalign=0,
+                          css_classes=["heading"], hexpand=True)
+        header.append(title)
+
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        status_box.append(Gtk.Image.new_from_icon_name("computer-apple-ipad-symbolic"))
+        self._mac_status_lbl = Gtk.Label(label="Checking...", css_classes=["caption", "dim-label"])
+        status_box.append(self._mac_status_lbl)
+        header.append(status_box)
+        inner.append(header)
+
+        sub = Gtk.Label(
+            label=f"{remote['mac_user']}@{remote['mac_ip']}  •  {remote['mac_work_dir']}",
+            xalign=0, css_classes=["dim-label", "caption"])
+        inner.append(sub)
+
+        # Action buttons
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2,
+                          margin_top=6)
+        for tooltip, icon, cb in [
+            ("Reconnect (notify Mac)", "emblem-synchronizing-symbolic",
+             lambda _: self._mac_reconnect()),
+            ("Open SSH terminal", "utilities-terminal-symbolic",
+             lambda _: ios_remote.open_ssh_terminal(
+                 ios_remote.get_remote_cfg(self._cfg), log_cb=None)),
+            ("Install server files", "document-save-symbolic",
+             lambda _: threading.Thread(
+                 target=ios_remote.install_mac_server,
+                 args=(ios_remote.get_remote_cfg(self._cfg), self._log_to_status),
+                 daemon=True).start()),
+            ("Open iOS settings", "emblem-system-symbolic",
+             lambda _: self._open_ios_settings()),
+        ]:
+            btn = Gtk.Button(icon_name=icon, tooltip_text=tooltip, css_classes=["flat"])
+            btn.connect("clicked", cb)
+            actions.append(btn)
+        inner.append(actions)
+
+        card.append(inner)
+        return card
+
+    def _mac_reconnect(self):
+        """Explicit reconnect: SSH + notify on Mac, update indicator."""
+        r = ios_remote.get_remote_cfg(self._cfg)
+        self._status.set_text(f"Reconnecting to {r['mac_user']}@{r['mac_ip']}...")
+        def do():
+            ok = ios_remote.test_connection(r, log_cb=None, notify=True)
+            self._mac_online = ok
+            GLib.idle_add(self._refresh_mac_status)
+            GLib.idle_add(self._status.set_text,
+                "Mac: connected" if ok else "Mac: connection failed")
+        threading.Thread(target=do, daemon=True).start()
+
+    def _log_to_status(self, text):
+        """Route iOS-module logs through the status bar label (one-line)."""
+        GLib.idle_add(self._status.set_text, text.strip().split("\n")[-1][:120])
+
+    def _open_ios_settings(self):
+        win = self.get_root()
+        if win and hasattr(win, "_open_settings_ios"):
+            win._open_settings_ios()
 
     def _make_device_card(self, dev):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)

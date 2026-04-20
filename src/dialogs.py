@@ -2,8 +2,8 @@
 import os, subprocess, threading
 from gi.repository import Gtk, Adw, GLib
 from .config import scan_project
-from .ios_remote import (DEVICES, get_remote_cfg, test_connection,
-                         copy_key_to_mac, generate_ssh_key, install_mac_server)
+from .ios_remote import (get_devices, get_remote_cfg, test_connection,
+                         generate_ssh_key, copy_key_to_mac, install_mac_server)
 
 
 def show_scan(parent, proj):
@@ -100,17 +100,19 @@ def show_screenshots(parent, paths, project_name, platform):
     dlg.present(parent)
 
 
-def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb):
+def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
+                   on_open_settings=None):
     """iOS remote-build action picker (port of CrazyMegaBuilder's iOS tab).
 
     Args:
-        parent:    main window (for dlg.present)
-        proj:      project dict
-        cfg:       full config dict; ios_remote key is read/written here
-        on_action: callback (action_id: str, device_target: str|None) invoked
-                   when the user clicks a build/archive/extras button
-        save_cfg:  callback to persist cfg (e.g. config.save_config)
-        log_cb:    callback to append text to the main log view
+        parent:           main window (for dlg.present)
+        proj:             project dict
+        cfg:              full config dict; ios_remote key is read/written
+        on_action:        callback (action_id, device_target) for build buttons
+        save_cfg:         callback to persist cfg (e.g. config.save_config)
+        log_cb:           callback to append text to the main log view
+        on_open_settings: optional callback to switch the window to Settings
+                          (for the "Open Settings" link)
     """
     remote = get_remote_cfg(cfg)
 
@@ -223,15 +225,15 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb):
         set_connected(None, "IP changed — reconnect to verify")
     ip_entry.connect("changed", _on_ip_changed)
 
-    def _do_test(r):
-        ok = test_connection(r, popup_log)
+    def _do_test(r, notify):
+        ok = test_connection(r, popup_log, notify=notify)
         GLib.idle_add(lambda: set_connected(ok))
 
     def _on_connect(_b):
         r = get_remote_cfg(cfg)
         r["mac_ip"] = ip_entry.get_text().strip()
         popup_log(f"Connecting to {r['mac_user']}@{r['mac_ip']}...\n")
-        threading.Thread(target=_do_test, args=(r,), daemon=True).start()
+        threading.Thread(target=_do_test, args=(r, True), daemon=True).start()
     connect_btn.connect("clicked", _on_connect)
 
     ip_row.add_prefix(status_dot)
@@ -239,123 +241,88 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb):
     ip_row.add_suffix(connect_btn)
     conn_grp.add(ip_row)
 
-    # Auto-probe on popup open for key-auth setups (silent — no password needed)
+    # Auto-probe on popup open for key-auth setups — silent (no Mac
+    # notification, no IP write) so the indicator can update without
+    # spamming the Mac every time the popup is opened.
     if remote.get("mac_ip") and remote.get("mac_auth") == "key":
         threading.Thread(target=_do_test,
-            args=(get_remote_cfg(cfg),), daemon=True).start()
+            args=(get_remote_cfg(cfg), False), daemon=True).start()
 
-    # ── Authentication popover (triggered by key icon in the IP row) ──
-    auth_mode = Adw.ComboRow(title="Mode")
-    auth_model = Gtk.StringList()
-    auth_model.append("SSH key")
-    auth_model.append("Password")
-    auth_mode.set_model(auth_model)
-    auth_mode.set_selected(0 if remote.get("mac_auth") == "key" else 1)
-
-    user_row = Adw.EntryRow(title="Mac user")
-    user_row.set_text(remote.get("mac_user", "pavel"))
-    def _on_user_changed(_e):
-        cfg.setdefault("ios_remote", {})["mac_user"] = user_row.get_text().strip()
-        save_cfg(cfg)
-    user_row.connect("changed", _on_user_changed)
-
-    work_row = Adw.EntryRow(title="Mac work folder")
-    work_row.set_text(remote.get("mac_work_dir", "/Users/pavel/Desktop"))
-    def _on_work_changed(_e):
-        val = work_row.get_text().strip().rstrip("/") or "/Users/pavel/Desktop"
-        ios = cfg.setdefault("ios_remote", {})
-        ios["mac_work_dir"] = val
-        ios.pop("mac_script_path", None)
-        ios.pop("mac_zip_dest", None)
-        save_cfg(cfg)
-    work_row.connect("changed", _on_work_changed)
-
-    pw_row = Adw.PasswordEntryRow(title="Mac password")
-    pw_row.set_text(remote.get("mac_password", ""))
-    def _on_pw_changed(_e):
-        cfg.setdefault("ios_remote", {})["mac_password"] = pw_row.get_text()
-        save_cfg(cfg)
-    pw_row.connect("changed", _on_pw_changed)
-
-    def _on_mode_changed(*_a):
-        mode = "key" if auth_mode.get_selected() == 0 else "password"
-        cfg.setdefault("ios_remote", {})["mac_auth"] = mode
-        save_cfg(cfg)
-    auth_mode.connect("notify::selected", _on_mode_changed)
+    # ── Quick-actions popover (🔑) — one-click Generate/Set up/Install ──
+    # Mac password lives in full Settings (iOS tab); Set up reads it from cfg.
+    gen_row = Adw.ActionRow(title="Generate SSH key",
+        subtitle=f"{remote.get('mac_key_path','~/.ssh/id_ed25519')}")
+    gen_btn = Gtk.Button(label="Generate", valign=Gtk.Align.CENTER)
+    gen_btn.connect("clicked", lambda _b: threading.Thread(
+        target=generate_ssh_key,
+        args=(get_remote_cfg(cfg).get("mac_key_path", "~/.ssh/id_ed25519"),
+              popup_log), daemon=True).start())
+    gen_row.add_suffix(gen_btn)
 
     setup_row = Adw.ActionRow(title="Install SSH key on Mac",
-        subtitle="Generates ~/.ssh/id_ed25519 if missing, then ssh-copy-id")
+        subtitle="Generate if missing, then ssh-copy-id")
     setup_btn = Gtk.Button(label="Set up", css_classes=["suggested-action"],
                            valign=Gtk.Align.CENTER)
     def _on_setup(_b):
-        pw = pw_row.get_text()
         r = get_remote_cfg(cfg)
         r["mac_ip"] = ip_entry.get_text().strip()
-        r["mac_user"] = user_row.get_text().strip()
+        pw = r.get("mac_password", "")
+        if not pw:
+            popup_log("Mac password is empty — set it in full iOS settings first.\n")
+            return
         popup_log("Installing SSH key on Mac...\n")
         def _do():
             ok = copy_key_to_mac(r, pw, popup_log)
             if ok:
                 cfg.setdefault("ios_remote", {})["mac_auth"] = "key"
                 save_cfg(cfg)
-                GLib.idle_add(auth_mode.set_selected, 0)
         threading.Thread(target=_do, daemon=True).start()
     setup_btn.connect("clicked", _on_setup)
     setup_row.add_suffix(setup_btn)
 
-    gen_row = Adw.ActionRow(title="Generate SSH key",
-                            subtitle=f"Writes to {remote.get('mac_key_path','~/.ssh/id_ed25519')}")
-    gen_btn = Gtk.Button(label="Generate", valign=Gtk.Align.CENTER)
-    def _on_gen(_b):
-        path = get_remote_cfg(cfg).get("mac_key_path", "~/.ssh/id_ed25519")
-        threading.Thread(target=generate_ssh_key,
-                         args=(path, popup_log), daemon=True).start()
-    gen_btn.connect("clicked", _on_gen)
-    gen_row.add_suffix(gen_btn)
-
     install_row = Adw.ActionRow(title="Install on Mac",
-        subtitle="Copies IOSbuild.scpt + scripts to the work folder and patches them")
+        subtitle="Copy IOSbuild.scpt + patches to the Mac work folder")
     install_btn = Gtk.Button(label="Install", valign=Gtk.Align.CENTER)
-    def _on_install(_b):
-        r = get_remote_cfg(cfg)
-        r["mac_ip"] = ip_entry.get_text().strip()
-        r["mac_user"] = user_row.get_text().strip()
-        threading.Thread(target=install_mac_server,
-                         args=(r, popup_log), daemon=True).start()
-    install_btn.connect("clicked", _on_install)
+    install_btn.connect("clicked", lambda _b: threading.Thread(
+        target=install_mac_server,
+        args=(get_remote_cfg(cfg), popup_log), daemon=True).start())
     install_row.add_suffix(install_btn)
 
-    auth_group = Adw.PreferencesGroup()
-    auth_group.add(auth_mode)
-    auth_group.add(user_row)
-    auth_group.add(work_row)
-    auth_group.add(pw_row)
-    auth_group.add(gen_row)
-    auth_group.add(setup_row)
-    auth_group.add(install_row)
+    quick_group = Adw.PreferencesGroup()
+    quick_group.add(gen_row)
+    quick_group.add(setup_row)
+    quick_group.add(install_row)
 
-    auth_popover = Gtk.Popover()
-    auth_popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+    # Link to full Settings page (auth mode, user, work folder, widget identity)
+    settings_group = Adw.PreferencesGroup()
+    settings_row = Adw.ActionRow(title="Full iOS settings",
+        subtitle="Mode, user, work folder, widget identity…")
+    settings_row.set_activatable(True)
+    settings_row.add_suffix(
+        Gtk.Image.new_from_icon_name("adw-external-link-symbolic"))
+    def _open_settings(_r):
+        quick_popover.popdown()
+        dlg.close()
+        if on_open_settings: on_open_settings()
+    settings_row.connect("activated", _open_settings)
+    settings_group.add(settings_row)
+
+    quick_popover = Gtk.Popover()
+    quick_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
         margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
-    auth_popover_box.set_size_request(440, -1)
-    auth_popover_box.append(auth_group)
-    auth_scroll = Gtk.ScrolledWindow(
-        hscrollbar_policy=Gtk.PolicyType.NEVER,
-        vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-        propagate_natural_height=True,
-        max_content_height=520)
-    auth_scroll.set_child(auth_popover_box)
-    auth_popover.set_child(auth_scroll)
+    quick_box.set_size_request(420, -1)
+    quick_box.append(quick_group)
+    quick_box.append(settings_group)
+    quick_popover.set_child(quick_box)
 
-    auth_btn = Gtk.MenuButton(
+    quick_btn = Gtk.MenuButton(
         icon_name="dialog-password-symbolic",
         always_show_arrow=True,
-        tooltip_text="Authentication & setup",
-        popover=auth_popover,
+        tooltip_text="SSH key + install",
+        popover=quick_popover,
         css_classes=["flat"],
         valign=Gtk.Align.CENTER)
-    # Put the key+arrow button right after the status dot, before IP entry
-    ip_row.add_suffix(auth_btn)
+    ip_row.add_suffix(quick_btn)
 
     page.append(conn_grp)
 
@@ -363,13 +330,16 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb):
     build_grp = Adw.PreferencesGroup(title="Build")
     build_row = Adw.ActionRow(title="Device")
 
-    dev_dropdown = Gtk.DropDown.new_from_strings([lbl for lbl, _t in DEVICES])
+    devices_list = get_devices(cfg) or [("iPhone 12 mini", "iPhone 12 mini")]
+    dev_dropdown = Gtk.DropDown.new_from_strings([lbl for lbl, _n in devices_list])
     dev_dropdown.set_selected(0)
     dev_dropdown.set_valign(Gtk.Align.CENTER)
 
     def _dev_target():
         idx = dev_dropdown.get_selected()
-        return DEVICES[idx][1] if 0 <= idx < len(DEVICES) else DEVICES[0][1]
+        if 0 <= idx < len(devices_list):
+            return devices_list[idx][1]
+        return devices_list[0][1]
 
     build_row.add_suffix(dev_dropdown)
     for lbl, action_id, css in [
