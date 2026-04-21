@@ -159,6 +159,15 @@ class LogView(Gtk.Box):
         self._dedup_hist = []
         self._dedup_active = None
 
+        # Chunked-drain queue for append_lines. Xcodebuild startup emits
+        # thousands of env-var/build-setting lines in one burst — processing
+        # them all synchronously in a single GTK user-action would block the
+        # main loop past GTK's "not responding" watchdog. Instead we enqueue
+        # the batch and drain CHUNK lines per GLib idle tick, so GTK processes
+        # input/redraws between chunks and the UI stays live.
+        self._pending_lines = []
+        self._drain_scheduled = False
+
         # Track right-click position for context menu
         self._last_click_line = -1
         rclick = Gtk.GestureClick(button=3)
@@ -224,6 +233,7 @@ class LogView(Gtk.Box):
         self._bee_mark = None
         self._bee_line_idx = None
         self._buffer_first_idx = 0
+        self._pending_lines = []
 
     def set_exclude_patterns(self, patterns):
         """Update exclude patterns at runtime."""
@@ -237,26 +247,73 @@ class LogView(Gtk.Box):
     _BUFFER_CAP_LINES = 3000
     _BUFFER_TRIM_KEEP = 2000  # trim down to this size when cap is exceeded
 
+    _DRAIN_CHUNK = 100          # upper bound on lines per GLib idle tick
+    _DRAIN_TIME_BUDGET = 0.05   # seconds — hard cap on wall time per tick
+    _PENDING_CAP = 3000         # hard cap on queued lines awaiting drain
+    _PENDING_KEEP = 2000        # when cap exceeded, trim down to this tail
+
     def append_lines(self, lines):
-        """Bulk-append a list of lines with a single GTK user-action — much
-        cheaper than calling append_line N times for high-volume log streams
-        (xcodebuild, IL2CPP). All the same trace/filter/exclude logic runs."""
+        """Enqueue lines for chunked drain. A huge flush (xcodebuild startup
+        dumps thousands of env/build-setting lines at once) is split across
+        GLib idle ticks so GTK's main loop stays responsive between chunks —
+        otherwise the "not responding / force quit" watchdog fires.
+
+        If the window is backgrounded while logs keep streaming, the queue
+        is capped at _PENDING_CAP and trimmed to the tail _PENDING_KEEP so
+        the user sees recent output on restore, not minutes-old prelude —
+        and drain finishes in bounded time. Full log still persists in
+        worker.py's `_save_log`, so nothing is truly lost."""
         if not lines:
             return
+        self._pending_lines.extend(lines)
+        if len(self._pending_lines) > self._PENDING_CAP:
+            dropped = len(self._pending_lines) - self._PENDING_KEEP
+            del self._pending_lines[:dropped]
+            # Tell the user once; don't re-announce for every overflow tick.
+            self._pending_lines.insert(0,
+                f"  ⋯ {dropped} older lines dropped (window was inactive) ⋯\n")
+        if not self._drain_scheduled:
+            self._drain_scheduled = True
+            GLib.idle_add(self._drain_pending_chunk)
+
+    def _drain_pending_chunk(self):
+        if not self._pending_lines:
+            self._drain_scheduled = False
+            return False
+        # Time-budgeted drain: process up to _DRAIN_CHUNK lines OR until
+        # wall-time budget is exhausted, whichever comes first. Prevents a
+        # single expensive batch (dedup regex + GTK inserts) from blocking
+        # the main loop beyond the compositor "not responding" window.
+        import time as _time
+        deadline = _time.monotonic() + self._DRAIN_TIME_BUDGET
         self._bulk = True  # suppress per-line scroll; one scroll at the end
         self._buffer.begin_user_action()
+        processed = 0
         try:
-            for ln in lines:
-                self.append_line(ln)
+            limit = min(self._DRAIN_CHUNK, len(self._pending_lines))
+            while processed < limit and _time.monotonic() < deadline:
+                self.append_line(self._pending_lines[processed])
+                processed += 1
             self._trim_buffer_if_needed()
         finally:
+            if processed:
+                del self._pending_lines[:processed]
             self._buffer.end_user_action()
             self._bulk = False
+        # Skip scroll when the widget isn't on-screen. scroll_mark_onscreen
+        # forces TextView layout up to the mark — cheap when the window is
+        # mapped and already laid out, painfully expensive when GTK has been
+        # skipping layout in the background and the buffer has grown by
+        # thousands of lines. Just redraw the tail when the window comes back.
         follow = getattr(self, "_follow_toggle", None)
-        if follow is None or follow.get_active():
+        if (follow is None or follow.get_active()) and self._view.get_mapped():
             mk = self._buffer.create_mark(None, self._buffer.get_end_iter(), False)
             self._view.scroll_mark_onscreen(mk)
             self._buffer.delete_mark(mk)
+        if self._pending_lines:
+            return True  # reschedule on next idle; GTK processes events between
+        self._drain_scheduled = False
+        return False
 
     def _trim_buffer_if_needed(self):
         """If the TextView buffer exceeds _BUFFER_CAP_LINES, delete the

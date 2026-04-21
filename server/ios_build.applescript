@@ -101,6 +101,18 @@ on clearBuild()
 	end tell
 end clearBuild
 
+on openXcode()
+	-- Open the Unity-exported workspace in Xcode so the user can inspect
+	-- build settings, signing, or run a build manually. Use `open -a Xcode`
+	-- rather than `tell application "Xcode" to open` — the latter requires
+	-- Automation permission and silently fails the first time.
+	try
+		do shell script "open -a Xcode " & quoted form of "{{WORK_DIR}}/iOS/Unity-iPhone.xcworkspace"
+	on error errMsg
+		display dialog "Failed to open Xcode: " & errMsg buttons {"OK"} default button "OK"
+	end try
+end openXcode
+
 on addWidgetToProject()
 	set widgetSource to "{{WORK_DIR}}/{{WIDGET_FOLDER}}/Widgets/"
 	set projectPath to "{{WORK_DIR}}/iOS/"
@@ -455,5 +467,7 @@ on run argv
 		addWidgetToProject()
 	else if command is "clearBuild" then
 		clearBuild()
+	else if command is "openXcode" then
+		openXcode()
 	end if
 end run

@@ -171,6 +171,11 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
         lambda _: (_fire("update_pod"), menu_popover.popdown()))
     menu_box.append(update_pod_btn)
 
+    open_xcode_btn = Gtk.Button(label="Open in Xcode", css_classes=["flat"])
+    open_xcode_btn.connect("clicked",
+        lambda _: (_fire("open_xcode"), menu_popover.popdown()))
+    menu_box.append(open_xcode_btn)
+
     open_terminal_btn = Gtk.Button(label="Open SSH terminal", css_classes=["flat"])
     def _open_ssh(_b):
         from . import ios_remote as _ir

@@ -738,6 +738,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         "add_widget":    (False, False, False, lambda _: "addWidget",               "Add widget"),
         "clear_build":   (False, False, False, lambda _: "clearBuild",              "Clean build"),
         "update_pod":    (False, False, False, lambda _: "updatePod",               "Update Pod"),
+        "open_xcode":    (False, False, False, lambda _: "openXcode",               "Open in Xcode"),
     }
 
     def _on_ios_action(self, proj, action_id, device_target):
