@@ -252,13 +252,17 @@ class BuilderWindow(Adw.ApplicationWindow):
             def _ios_progress_log(t):
                 # Auto-reveal the log panel on any incoming Mac-side byte so
                 # streamed output is never silently hidden.
-                self._toggle_build_log(True)
+                if not self._build_log_box.get_visible():
+                    self._toggle_build_log(True)
                 self._log(t)
             def _ios_progress_bulk(lines):
                 # Bulk path: hand the whole flush to LogView so it can insert
                 # under a single user-action (one GTK layout pass per flush).
                 # Per-line _log would re-layout thousands of times per build.
-                self._toggle_build_log(True)
+                # Only toggle the panel if it's hidden — idempotent set_visible
+                # is cheap but set_position re-lays out the Paned every time.
+                if not self._build_log_box.get_visible():
+                    self._toggle_build_log(True)
                 self._log_widget.append_lines(lines)
             self._ios_progress_listener = ios_remote.ProgressListener(
                 ios_cfg.get("progress_port", 8080),
@@ -449,9 +453,14 @@ class BuilderWindow(Adw.ApplicationWindow):
         return paned
 
     def _toggle_build_log(self, show):
-        """Show or hide the build log panel."""
+        """Show or hide the build log panel. Idempotent — skips work if the
+        panel is already in the requested state so high-frequency callers
+        (log-stream batches) don't re-lay out the Paned 20x/second."""
+        if self._build_log_box.get_visible() == show:
+            if self._log_toggle.get_active() != show:
+                self._log_toggle.set_active(show)
+            return
         self._build_log_box.set_visible(show)
-        # Sync toggle button without triggering callback
         if self._log_toggle.get_active() != show:
             self._log_toggle.set_active(show)
         if show:
@@ -1021,6 +1030,18 @@ class BuilderWindow(Adw.ApplicationWindow):
             self._test_proc = None
             self._stop_test_timer()
             self.cancel_btn.set_sensitive(False)
+        # Stop in-flight iOS remote SSH + send "stop" to Mac so xcodebuild in
+        # the Terminal window on Mac actually dies. Without this, the top-bar
+        # Cancel button only killed Unity/Android/test-run but left the Mac
+        # side grinding away.
+        runner = getattr(self, "_ios_runner", None)
+        if runner:
+            try: runner.stop()
+            except Exception: pass
+        if (self.cfg.get("ios_remote") or {}).get("mac_ip"):
+            threading.Thread(target=self._ios_run_remote, args=("stop",),
+                             daemon=True).start()
+            self._set_building(False)
         self.stage_label.set_text("Cancelled")
         self.progress_bar.set_fraction(0)
         self._log("\n  Cancelled by user.\n")

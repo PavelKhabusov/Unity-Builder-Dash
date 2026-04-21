@@ -48,12 +48,42 @@ widget_target.build_configurations.each do |config|
   config.build_settings['ALWAYS_SEARCH_USER_PATHS'] = 'NO'
 end
 
-# Also apply ALWAYS_SEARCH_USER_PATHS=NO to every Unity-iPhone target so
-# the headermap warning stops appearing for UnityFramework/main app as well.
+# Apply shared settings to every Unity-iPhone target:
+#   ALWAYS_SEARCH_USER_PATHS=NO           silences headermap warnings
+#   ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO  widget + UnityFramework must not
+#     embed Swift libs; only the main app should. Dual-embedding trips Apple
+#     notarization "ITMS-90562: Invalid Bundle" on upload.
+#   ENABLE_APP_SHORTCUTS_FLEXIBLE_MATCHING=NO  disables Siri App Intents
+#     flexible matching so Xcode stops requiring an AppShortcutsProvider.
 # (Pods live in a separate xcworkspace project and aren't touched here.)
 project.targets.each do |t|
   t.build_configurations.each do |config|
     config.build_settings['ALWAYS_SEARCH_USER_PATHS'] = 'NO'
+    config.build_settings['ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES'] = 'NO'
+    config.build_settings['ENABLE_APP_SHORTCUTS_FLEXIBLE_MATCHING'] = 'NO'
+  end
+end
+
+# Silence "Run script build phase ... will be run during every build" notes
+# by declaring the phases deliberately input-independent. Unity exports
+# a handful of shell-script phases (Ensure *dSYM, Run Script on GameAssembly)
+# with no outputs — Xcode 15+ warns about them. We're fine with them
+# running every build (they're fast/idempotent), so mark them explicitly.
+project.targets.each do |t|
+  t.build_phases.each do |phase|
+    if phase.respond_to?(:shell_script)
+      phase.always_out_of_date = '1'
+    end
+  end
+end
+
+# Dedupe Copy Bundle Resources build file entries. Unity sometimes writes
+# the same resource (e.g. en.lproj/InfoPlist.strings) twice; Xcode warns
+# "Skipping duplicate build file". Keep the first occurrence, drop rest.
+project.targets.each do |t|
+  t.resources_build_phase.files.group_by { |bf| bf.file_ref&.path }.each do |path, dups|
+    next if path.nil? || dups.size < 2
+    dups[1..].each { |bf| bf.remove_from_project }
   end
 end
 

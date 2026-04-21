@@ -53,15 +53,32 @@ on readIPFromFile()
 end readIPFromFile
 
 on stopTerminal()
+	-- Kill build/deploy tools running in the Terminal tab. `kill $(jobs -p)`
+	-- in the shell only touches background jobs; xcodebuild / pod install
+	-- run in the FOREGROUND, so `jobs -p` is empty and nothing dies. We
+	-- pkill them by name instead — reliably interrupts the build. SIGINT
+	-- (== Ctrl+C) lets the tool print a "User interrupted" summary and
+	-- clean up, rather than leaving half-written derived data.
+	try
+		do shell script "pkill -INT -x xcodebuild; pkill -INT -f 'pod install'; pkill -INT -f 'pod update'; pkill -INT -f 'pod repo'; pkill -INT -f 'add_widget_dependency'; true"
+	end try
+	delay 0.3
 	tell application "Terminal"
 		if (count of windows) > 0 then
 			set activeWindow to front window
 			set activeTab to selected tab of activeWindow
-			tell activeTab to do script "kill $(jobs -p); exit" in activeTab
-			repeat until (busy of activeTab is false)
+			try
+				tell activeTab to do script "kill $(jobs -p) 2>/dev/null; exit" in activeTab
+			end try
+			-- Don't block indefinitely waiting for the tab to idle — if the
+			-- shell is stuck it'll never go un-busy. Bounded wait then close.
+			repeat 10 times
+				if busy of activeTab is false then exit repeat
 				delay 0.2
 			end repeat
-			close activeWindow
+			try
+				close activeWindow saving no
+			end try
 		end if
 	end tell
 end stopTerminal
@@ -80,7 +97,7 @@ end clearCache
 
 on clearBuild()
 	tell application "Terminal"
-		do script my nccmd("cd {{WORK_DIR}}/iOS && xcodebuild clean && rm -rf ./build/Build")
+		do script my nccmd("cd {{WORK_DIR}}/iOS && { [ -d ./build ] && xattr -w com.apple.xcode.CreatedByBuildSystem true ./build; true; } && xcodebuild clean && rm -rf ./build/Build")
 	end tell
 end clearBuild
 
@@ -111,18 +128,19 @@ on addWidgetToProject()
 	do shell script "rm -rf " & quoted form of widgetDest & " && mkdir -p " & quoted form of widgetDest & " && cp -R " & quoted form of widgetSource & ". " & quoted form of widgetDest
 
 	set mainPlist to projectPath & "Info.plist"
+	-- Shell-snippet for Terminal. All comments are AppleScript-side only —
+	-- we don't embed `#` comments because zsh in interactive `do script`
+	-- mode parses `#` as a command (no `setopt interactivecomments` in
+	-- non-rc contexts), producing noisy "command not found: #" errors.
+	-- Background: widget's Info.plist MUST NOT carry application-groups —
+	-- that's entitlements-only. When present on the widget plist, the host
+	-- Unity app crashes at launch with -[__NSCFString count]. Only the main
+	-- app's entitlements file gets the group.
 	set terminalCommand to "
-setopt interactivecomments 2>/dev/null || true;
 /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & entitlementsFile & " || echo 'Skip delete';
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & entitlementsFile & ";
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & entitlementsFile & ";
-# Disabled: application-groups is entitlements-only; in widget Info.plist it
-# can crash the host app at launch (-[__NSCFString count]).
-# /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & widgetPlist & " || echo 'Skip delete';
-# /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & widgetPlist & ";
-# /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & widgetPlist & ";
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string {{WIDGET_BUNDLE_ID}}' " & widgetPlist & ";
-# Sync widget version with parent app — Xcode warns if they differ.
 MAIN_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' " & mainPlist & " 2>/dev/null || echo '1');
 MAIN_SHORT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' " & mainPlist & " 2>/dev/null || echo '1.0');
 /usr/bin/plutil -replace CFBundleVersion -string \"$MAIN_VER\" " & widgetPlist & ";
@@ -221,6 +239,55 @@ on unpack()
 		do shell script "sed -i '' -E 's|/home/[^\"]*/[Ii][Oo][Ss]/|$(SRCROOT)/|g' " & quoted form of "{{WORK_DIR}}/iOS/Unity-iPhone.xcodeproj/project.pbxproj"
 	end try
 
+	-- Sanitize Info.plist — some Unity post-process-build scripts (notably
+	-- Google Sign-In with GIDClientID) recursively inject unrelated keys
+	-- into every dict they touch, polluting UIApplicationSceneManifest.
+	-- When UISceneConfigurations contains stray string values instead of
+	-- only role keys mapping to arrays of scene-config dicts, UIKit in
+	-- UIApplicationMain calls `count` on a string →
+	--   *** NSInvalidArgumentException: -[__NSCFString count]: unrecognized selector
+	-- Keep only known-good roles and valid scene-config keys.
+	set infoClean to "
+import plistlib
+p = '{{WORK_DIR}}/iOS/Info.plist'
+d = plistlib.load(open(p,'rb'))
+sm = d.get('UIApplicationSceneManifest')
+if isinstance(sm, dict):
+    out = {}
+    if 'UIApplicationSupportsMultipleScenes' in sm:
+        out['UIApplicationSupportsMultipleScenes'] = sm['UIApplicationSupportsMultipleScenes']
+    cfgs = sm.get('UISceneConfigurations')
+    if isinstance(cfgs, dict):
+        roles = {
+            'UIWindowSceneSessionRoleApplication',
+            'UIWindowSceneSessionRoleExternalDisplay',
+            'UIWindowSceneSessionRoleVolumetricApplication',
+        }
+        valid = {'UISceneClassName','UISceneConfigurationName',
+                 'UISceneDelegateClassName','UISceneStoryboardFile'}
+        clean = {}
+        for role, arr in cfgs.items():
+            if role not in roles or not isinstance(arr, list):
+                continue
+            items = []
+            for it in arr:
+                if isinstance(it, dict):
+                    items.append({k:v for k,v in it.items() if k in valid})
+            if items:
+                clean[role] = items
+        if not clean:
+            clean = {'UIWindowSceneSessionRoleApplication': [
+                {'UISceneConfigurationName':'Default Configuration',
+                 'UISceneDelegateClassName':'UnityScene'}]}
+        out['UISceneConfigurations'] = clean
+    d['UIApplicationSceneManifest'] = out
+    plistlib.dump(d, open(p,'wb'))
+    print('Info.plist UIApplicationSceneManifest sanitized')
+"
+	try
+		do shell script "python3 -c " & quoted form of infoClean
+	end try
+
 	-- Patch Podfile post_install:
 	--   IPHONEOS_DEPLOYMENT_TARGET=12.0 — silence old-target warnings from legacy pods
 	--   ENABLE_USER_SCRIPT_SANDBOXING=NO — Xcode 15+ sandboxing breaks gRPC-Core
@@ -232,12 +299,14 @@ on unpack()
 	-- Versioned marker ("# ubd-post-install v2") lets us re-patch when we
 	-- add settings in a newer version without duplicating the block.
 	set podfilePatch to "
-# ubd-post-install v2
+# ubd-post-install v3
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     target.build_configurations.each do |config|
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
       config.build_settings['ENABLE_USER_SCRIPT_SANDBOXING'] = 'NO'
+      config.build_settings['ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES'] = 'NO'
+      config.build_settings['ENABLE_APP_SHORTCUTS_FLEXIBLE_MATCHING'] = 'NO'
     end
     target.build_phases.each do |phase|
       if phase.respond_to?(:shell_script)
