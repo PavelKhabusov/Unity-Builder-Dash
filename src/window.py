@@ -501,7 +501,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         sub.append(Gtk.Label(label=proj.get("desc", ""), xalign=0,
                              css_classes=["dim-label", "caption"]))
 
-        ver = Gtk.Label(label=get_version(proj["path"]), css_classes=["caption"])
+        ver = Gtk.Label(label=get_version(proj["path"], proj.get("targets")), css_classes=["caption"])
         sub.append(ver)
 
         apk = find_apk(proj)
@@ -864,7 +864,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         runner = ios_remote.RemoteRunner(
             remote, log_cb=self._log,
             done_cb=on_remote_done,
-            progress_cb=self.progress_bar.set_fraction)
+            progress_cb=self.progress_bar.set_fraction,
+            log_bulk_cb=self._log_widget.append_lines)
         self._ios_runner = runner
         runner.run(osa_arg)
 
@@ -907,7 +908,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             proj = self.worker.project
             c = self.cards[name]
             c["status"].set_text("Done" if ok else "Failed")
-            c["version"].set_text(get_version(proj["path"]))
+            c["version"].set_text(get_version(proj["path"], proj.get("targets")))
             if c["deploy"]:
                 c["deploy"].set_sensitive(find_apk(proj) is not None)
 
@@ -923,7 +924,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             except OSError:
                 apk_size = None
             save_build_entry(name, self.worker.target, ok, duration,
-                             apk_size, get_build_number(proj["path"]))
+                             apk_size, get_build_number(proj["path"], self.worker.target))
 
             try:
                 icon = "dialog-ok-apply" if ok else "dialog-error"

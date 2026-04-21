@@ -129,34 +129,31 @@ streaming back into the app's LogView.
 
 ## Unity BuildScript
 
-Place this in `Assets/Editor/BuildScript.cs` of each project:
+Place this in `Assets/Editor/BuildScript.cs` of each project. UBD invokes
+four entry points via `-executeMethod`, toggled by the auto-increment UI
+button:
+
+| Target | Auto-increment ON            | Auto-increment OFF                  |
+|--------|------------------------------|-------------------------------------|
+| Android | `BuildScript.BuildAndroid`  | `BuildScript.BuildAndroidNoIncrement` |
+| iOS     | `BuildScript.BuildiOS`      | `BuildScript.BuildiOSNoIncrement`   |
+
+Android and iOS build numbers are incremented **independently** —
+`PlayerSettings.Android.bundleVersionCode` vs `PlayerSettings.iOS.buildNumber`.
+UBD reads both from `ProjectSettings.asset` and shows them in the project
+row (e.g. `v1.0.0 · iOS 325 / A 452`).
 
 ```csharp
 using UnityEditor;
-using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
 using System.Linq;
 
 public static class BuildScript {
-
     private static string[] GetScenes() =>
-        EditorBuildSettings.scenes
-            .Where(s => s.enabled)
-            .Select(s => s.path)
-            .ToArray();
+        EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
 
-    [MenuItem("Build/Android APK")]
-    public static void BuildAndroid() {
-        PlayerSettings.Android.bundleVersionCode++;
-        EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
-
-        var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions {
-            scenes = GetScenes(),
-            locationPathName = "Builds/MyApp",
-            target = BuildTarget.Android,
-            options = BuildOptions.None
-        });
-
+    private static void RunBuild(BuildPlayerOptions options) {
+        var report = BuildPipeline.BuildPlayer(options);
         if (report.summary.result == BuildResult.Succeeded)
             UnityEngine.Debug.Log("[Build] OK");
         else {
@@ -165,17 +162,38 @@ public static class BuildScript {
         }
     }
 
-    // Without version increment (called when toggle is off)
-    public static void BuildAndroidNoIncrement() {
+    // ── Android ──
+    [MenuItem("Build/Android APK")]
+    public static void BuildAndroid() => DoBuildAndroid(true);
+    public static void BuildAndroidNoIncrement() => DoBuildAndroid(false);
+
+    private static void DoBuildAndroid(bool increment) {
+        if (increment) PlayerSettings.Android.bundleVersionCode++;
         EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
-        var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions {
+        RunBuild(new BuildPlayerOptions {
             scenes = GetScenes(),
             locationPathName = "Builds/MyApp",
             target = BuildTarget.Android,
             options = BuildOptions.None
         });
-        if (report.summary.result != BuildResult.Succeeded)
-            EditorApplication.Exit(1);
+    }
+
+    // ── iOS ──
+    [MenuItem("Build/iOS Xcode")]
+    public static void BuildiOS() => DoBuildiOS(true);
+    public static void BuildiOSNoIncrement() => DoBuildiOS(false);
+
+    private static void DoBuildiOS(bool increment) {
+        if (increment) {
+            int current = int.TryParse(PlayerSettings.iOS.buildNumber, out var n) ? n : 0;
+            PlayerSettings.iOS.buildNumber = (current + 1).ToString();
+        }
+        RunBuild(new BuildPlayerOptions {
+            scenes = GetScenes(),
+            locationPathName = "Builds/iOS",
+            target = BuildTarget.iOS,
+            options = BuildOptions.None
+        });
     }
 }
 ```

@@ -321,9 +321,11 @@ class RemoteRunner:
     Keeps a reference to the subprocess so it can be killed via `stop()`.
     One instance per run; create a new one for each action.
     """
-    def __init__(self, remote, log_cb=None, done_cb=None, progress_cb=None):
+    def __init__(self, remote, log_cb=None, done_cb=None, progress_cb=None,
+                 log_bulk_cb=None):
         self.remote = remote
         self.log_cb = log_cb
+        self.log_bulk_cb = log_bulk_cb
         self.done_cb = done_cb
         self.progress_cb = progress_cb
         self.process = None
@@ -359,6 +361,33 @@ class RemoteRunner:
                         "No terminal emulator found — falling back in-app\n")
                 external = False
 
+        # Batch SSH stdout at ~20 Hz. During Xcode build, the .scpt emits
+        # thousands of lines via `log` / `do shell script "xcodebuild …"` —
+        # per-line idle_add floods the GTK main thread and trips GNOME's
+        # "not responding / Force Quit or Wait" watchdog. Prefer log_bulk_cb
+        # so LogView batches them under one begin/end_user_action.
+        import time as _t
+        pending = []
+        last_flush = [0.0]
+        def flush():
+            if not pending: return
+            batch = pending[:]
+            pending.clear()
+            last_flush[0] = _t.monotonic()
+            bulk = self.log_bulk_cb
+            cb = self.log_cb
+            def _deliver(lines=batch):
+                try:
+                    if bulk is not None:
+                        bulk(lines)
+                    elif cb is not None:
+                        for ln in lines:
+                            try: cb(ln)
+                            except Exception: pass
+                except Exception: pass
+                return False
+            GLib.idle_add(_deliver)
+
         try:
             if external:
                 full = [term, flag] + cmd
@@ -372,14 +401,18 @@ class RemoteRunner:
                 for line in self.process.stdout:
                     if self.cancelled:
                         break
-                    if self.log_cb:
-                        GLib.idle_add(self.log_cb, line)
+                    pending.append(line)
+                    if _t.monotonic() - last_flush[0] >= 0.05:
+                        flush()
+                flush()
                 self.process.wait()
                 ok = (self.process.returncode == 0) and not self.cancelled
         except Exception as e:
             if self.log_cb:
                 GLib.idle_add(self.log_cb, f"SSH error: {e}\n")
             ok = False
+        finally:
+            flush()
         if self.done_cb:
             GLib.idle_add(self.done_cb, ok)
 

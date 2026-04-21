@@ -105,24 +105,59 @@ def find_apk(proj):
     apks = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".apk")]
     return max(apks, key=os.path.getmtime) if apks else None
 
-def get_version(path):
+def _parse_project_settings(path):
+    """Parse bundleVersion + iOS buildNumber + AndroidBundleVersionCode.
+    iOS build number lives under a nested `buildNumber:` block keyed by
+    platform; Android has its own top-level `AndroidBundleVersionCode:`."""
     try:
         with open(os.path.join(path, "ProjectSettings", "ProjectSettings.asset")) as f:
-            ver = bld = ""
+            ver = ios_b = and_b = None
+            in_build_number = False
             for line in f:
-                if "bundleVersion:" in line: ver = line.split(":")[1].strip()
-                if "AndroidBundleVersionCode:" in line: bld = line.split(":")[1].strip()
-        return f"v{ver} ({bld})" if ver else "?"
-    except: return "?"
+                if line.startswith("  bundleVersion:"):
+                    ver = line.split(":", 1)[1].strip()
+                    continue
+                if line.startswith("  buildNumber:"):
+                    in_build_number = True
+                    continue
+                if in_build_number:
+                    if line.startswith("    "):
+                        s = line.strip()
+                        if s.startswith("iPhone:"):
+                            ios_b = s.split(":", 1)[1].strip()
+                    else:
+                        in_build_number = False
+                if line.startswith("  AndroidBundleVersionCode:"):
+                    and_b = line.split(":", 1)[1].strip()
+            return ver, ios_b, and_b
+    except Exception:
+        return None, None, None
 
-def get_build_number(path):
-    try:
-        with open(os.path.join(path, "ProjectSettings", "ProjectSettings.asset")) as f:
-            for line in f:
-                if "AndroidBundleVersionCode:" in line:
-                    return line.split(":")[1].strip()
-    except: pass
-    return None
+def get_version(path, targets=None):
+    """Format `v<ver>` with build numbers for the project's configured
+    targets. Single-target projects render the legacy compact form
+    `v1.0 (452)`; multi-target projects get labelled numbers so the two
+    independent counters are distinguishable: `v1.0 · iOS 325 / A 452`."""
+    ver, ios_b, and_b = _parse_project_settings(path)
+    if not ver:
+        return "?"
+    want_ios = targets is None or "ios" in targets
+    want_and = targets is None or "android" in targets
+    show_ios = want_ios and ios_b is not None
+    show_and = want_and and and_b is not None
+    if show_ios and show_and:
+        return f"v{ver} · iOS {ios_b} / A {and_b}"
+    if show_ios:
+        return f"v{ver} ({ios_b})"
+    if show_and:
+        return f"v{ver} ({and_b})"
+    return f"v{ver}"
+
+def get_build_number(path, target=None):
+    _, ios_b, and_b = _parse_project_settings(path)
+    if target == "ios":
+        return ios_b
+    return and_b
 
 def get_unity_for_project(cfg, proj):
     """Get Unity path: per-project override or global."""

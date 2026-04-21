@@ -148,10 +148,16 @@ on addWidgetToProject()
 	-- that's entitlements-only. When present on the widget plist, the host
 	-- Unity app crashes at launch with -[__NSCFString count]. Only the main
 	-- app's entitlements file gets the group.
+	--
+	-- increased-memory-limit: requires the capability pre-enabled on the main
+	-- App ID (developer.apple.com → Identifiers → Edit → Additional Capabilities);
+	-- `-allowProvisioningUpdates` does NOT auto-register it.
 	set terminalCommand to "
 /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' " & entitlementsFile & " || echo 'Skip delete';
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' " & entitlementsFile & ";
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups:0 string " & appGroupID & "' " & entitlementsFile & ";
+/usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.kernel.increased-memory-limit' " & entitlementsFile & " || echo 'Skip delete';
+/usr/libexec/PlistBuddy -c 'Add :com.apple.developer.kernel.increased-memory-limit bool true' " & entitlementsFile & ";
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string {{WIDGET_BUNDLE_ID}}' " & widgetPlist & ";
 MAIN_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' " & mainPlist & " 2>/dev/null || echo '1');
 MAIN_SHORT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' " & mainPlist & " 2>/dev/null || echo '1.0');
