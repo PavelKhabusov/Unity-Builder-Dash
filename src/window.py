@@ -1,6 +1,6 @@
 """Main application window with sidebar navigation."""
 import os, subprocess, datetime, time, threading
-from gi.repository import Gtk, Adw, GLib, Gio
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS, SKIP_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
@@ -545,6 +545,13 @@ class BuilderWindow(Adw.ApplicationWindow):
                              tooltip_text=f"Build {t_info['label']}", css_classes=["flat"])
             if t_key == "ios":
                 btn.connect("clicked", lambda _, p=proj: self._show_ios_popup(p))
+                # Right-click → quick build variants (4 combinations of
+                # increment/scripts-only) that bypass the remote-pipeline popup.
+                gesture = Gtk.GestureClick()
+                gesture.set_button(Gdk.BUTTON_SECONDARY)
+                gesture.connect("pressed",
+                    lambda _g, _n, _x, _y, b=btn, p=proj: self._show_ios_quick_menu(b, p))
+                btn.add_controller(gesture)
             else:
                 btn.connect("clicked", lambda _, p=proj, t=t_key: self._on_build(p, t))
             actions.append(btn)
@@ -722,6 +729,32 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._start(proj, target_key)
 
     # ── iOS remote pipeline (CrazyMegaBuilder integration) ──
+
+    def _show_ios_quick_menu(self, anchor, proj):
+        """Right-click on iOS button → same 4 build actions as the popup's Build row.
+        Device defaults to first in cfg; open the popup if a different device is needed."""
+        devices = ios_remote.get_devices(self.cfg) or [("iPhone 12 mini", "iPhone 12 mini")]
+        default_device = devices[0][1]
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=4,
+                      margin_bottom=4, margin_start=4, margin_end=4)
+        variants = [
+            ("Full",     "full",          "Unity build → zip → scp → unpack (pods+widget) → build on Mac"),
+            ("Xcode",    "xcode",         "Skip Unity: unpack (pods+widget) + build on Mac with existing zip"),
+            ("Build",    "build_only",    "Just xcodebuild on existing iOS/ — no unpack, no pods, no widget"),
+            ("No Xcode", "without_xcode", "Unity build → zip → scp → unpack only (no build)"),
+        ]
+        for label, action_id, tip in variants:
+            lbl = Gtk.Label(label=label, xalign=0)
+            b = Gtk.Button(child=lbl, css_classes=["flat"], tooltip_text=tip)
+            b.connect("clicked",
+                lambda _, p=proj, a=action_id, d=default_device, pop=popover: (
+                    pop.popdown(), self._on_ios_action(p, a, d)))
+            box.append(b)
+        popover.set_child(box)
+        popover.set_parent(anchor)
+        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.popup()
 
     def _show_ios_popup(self, proj):
         if not hasattr(self, "_ios_progress_listener"):
