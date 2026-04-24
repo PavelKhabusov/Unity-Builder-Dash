@@ -875,21 +875,38 @@ class LogView(Gtk.Box):
     def _on_scroll(self, adj):
         """Lazy-load older lines when the user scrolls near the top.
         Trigger at ~half a page-height above 0 so content appears before
-        they actually hit the boundary."""
+        they actually hit the boundary.
+
+        Mutation must be DEFERRED to an idle tick. The "value-changed" signal
+        fires synchronously from inside GTK's own scroll machinery (e.g.
+        during scroll_mark_onscreen called from _insert_tagged after a new
+        log line). Inserting hundreds of lines into the buffer right then
+        invalidates the iters GTK is still using → 3× "Invalid text buffer
+        iterator" warnings followed by gtk_text_view_validate_onscreen
+        assertion ("priv->onscreen_validated") → hard crash. Reproduces
+        during iOS archive: the "Zipping..." line fires a scroll while the
+        user is scrolled near the top."""
         if self._loading_older or self._buffer_first_idx <= 0:
             return
         if adj.get_value() < adj.get_page_size() * 0.5:
-            self._prepend_older()
+            self._loading_older = True  # latch immediately to coalesce bursts
+            def _deferred():
+                try:
+                    self._prepend_older()
+                except Exception:
+                    self._loading_older = False
+                return False
+            GLib.idle_add(_deferred)
 
     def _prepend_older(self, count=500):
         """Take up to `count` older entries from self._full_lines and insert
         them at the top of the buffer, preserving the user's scroll
         position. Older trace runs get their own marker + content marks
         inserted at the front so per-block toggles keep working."""
-        if self._buffer_first_idx <= 0:
-            return
         self._loading_older = True
         try:
+            if self._buffer_first_idx <= 0:
+                return
             start_idx = max(0, self._buffer_first_idx - count)
             chunk = self._full_lines[start_idx : self._buffer_first_idx]
             if not chunk:
