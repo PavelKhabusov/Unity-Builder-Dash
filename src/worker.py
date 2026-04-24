@@ -1,12 +1,12 @@
 """Build worker — runs Unity in background thread."""
 import os, signal, subprocess, threading, time, datetime
 from gi.repository import GLib
-from .constants import TARGET_INFO, SKIP_PATTERNS, STAGE_PATTERNS, PROGRESS_RE
+from .constants import TARGET_INFO, SKIP_PATTERNS, STAGE_PATTERNS, PROGRESS_RE, resolve_build_method
 from .config import find_apk, get_unity_for_project, APP_DIR
 
 
 class BuildWorker:
-    def __init__(self, cfg, project, target, log_cb, done_cb, stage_cb, auto_increment=True, log_bulk_cb=None):
+    def __init__(self, cfg, project, target, log_cb, done_cb, stage_cb, auto_increment=True, log_bulk_cb=None, scripts_only=False):
         self.cfg = cfg
         self.unity = get_unity_for_project(cfg, project)
         self.project = project
@@ -16,6 +16,7 @@ class BuildWorker:
         self.done_cb = done_cb
         self.stage_cb = stage_cb
         self.auto_increment = auto_increment
+        self.scripts_only = scripts_only
         self.process = None
         self.cancelled = False
         self.start_time = None
@@ -61,7 +62,7 @@ class BuildWorker:
     def _run(self):
         path = self.project["path"]
         info = TARGET_INFO[self.target]
-        method = info["method"] if self.auto_increment else info["method"] + "NoIncrement"
+        method = resolve_build_method(info["method"], self.auto_increment, self.scripts_only)
         build_target = "Android" if self.target == "android" else "iOS"
         cmd = [self.unity, "-quit", "-batchmode",
                "-buildTarget", build_target,        # pre-set target, skip platform switch

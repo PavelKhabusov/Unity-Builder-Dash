@@ -21,6 +21,7 @@ A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, 
 - **Real-time build log** — colored output with search, level filter, word wrap, copy
 - **Progress bar** with ETA based on previous builds
 - **Auto-increment toggle** — build with or without version bump
+- **Scripts Only toggle** — rebuild C# without full IL2CPP/Gradle/Xcode passes; huge speed-up for iterative code-only changes
 - **Clean Build** — delete Library/Bee folders from context menu
 - **Upload to server** — FTP upload with per-project host, directory, and rename pattern
 - **Deploy to device** via [APK Dash](https://github.com/PavelKhabusov/APK-Dash) integration
@@ -130,13 +131,19 @@ streaming back into the app's LogView.
 ## Unity BuildScript
 
 Place this in `Assets/Editor/BuildScript.cs` of each project. UBD invokes
-four entry points via `-executeMethod`, toggled by the auto-increment UI
-button:
+**eight** entry points via `-executeMethod`, chosen from the cross of the
+auto-increment and Scripts Only toggles:
 
-| Target | Auto-increment ON            | Auto-increment OFF                  |
-|--------|------------------------------|-------------------------------------|
-| Android | `BuildScript.BuildAndroid`  | `BuildScript.BuildAndroidNoIncrement` |
-| iOS     | `BuildScript.BuildiOS`      | `BuildScript.BuildiOSNoIncrement`   |
+| Target  | Full, incr.                 | Full, no-incr.                      | Scripts Only, incr.                        | Scripts Only, no-incr.              |
+|---------|-----------------------------|-------------------------------------|--------------------------------------------|-------------------------------------|
+| Android | `BuildScript.BuildAndroid`  | `BuildScript.BuildAndroidNoIncrement` | `BuildScript.BuildAndroidScriptsOnlyIncrement` | `BuildScript.BuildAndroidScriptsOnly` |
+| iOS     | `BuildScript.BuildiOS`      | `BuildScript.BuildiOSNoIncrement`     | `BuildScript.BuildiOSScriptsOnlyIncrement`     | `BuildScript.BuildiOSScriptsOnly`     |
+
+**Scripts Only** (`BuildOptions.BuildScriptsOnly`) rebuilds just the C#
+assemblies and patches them into the existing player bundle — skipping
+IL2CPP, asset importing, shader compilation, Gradle/Xcode packaging.
+Typical iteration: 10-15× faster than a clean build. Only usable after
+a full build has produced a bundle at the same `locationPathName`.
 
 Android and iOS build numbers are incremented **independently** —
 `PlayerSettings.Android.bundleVersionCode` vs `PlayerSettings.iOS.buildNumber`.
@@ -166,15 +173,18 @@ public static class BuildScript {
     [MenuItem("Build/Android APK")]
     public static void BuildAndroid() => DoBuildAndroid(true);
     public static void BuildAndroidNoIncrement() => DoBuildAndroid(false);
+    [MenuItem("Build/Android APK (Scripts Only)")]
+    public static void BuildAndroidScriptsOnly() => DoBuildAndroid(false, scriptsOnly: true);
+    public static void BuildAndroidScriptsOnlyIncrement() => DoBuildAndroid(true, scriptsOnly: true);
 
-    private static void DoBuildAndroid(bool increment) {
+    private static void DoBuildAndroid(bool increment, bool scriptsOnly = false) {
         if (increment) PlayerSettings.Android.bundleVersionCode++;
         EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
         RunBuild(new BuildPlayerOptions {
             scenes = GetScenes(),
             locationPathName = "Builds/MyApp",
             target = BuildTarget.Android,
-            options = BuildOptions.None
+            options = scriptsOnly ? BuildOptions.BuildScriptsOnly : BuildOptions.None
         });
     }
 
@@ -182,8 +192,11 @@ public static class BuildScript {
     [MenuItem("Build/iOS Xcode")]
     public static void BuildiOS() => DoBuildiOS(true);
     public static void BuildiOSNoIncrement() => DoBuildiOS(false);
+    [MenuItem("Build/iOS Xcode (Scripts Only)")]
+    public static void BuildiOSScriptsOnly() => DoBuildiOS(false, scriptsOnly: true);
+    public static void BuildiOSScriptsOnlyIncrement() => DoBuildiOS(true, scriptsOnly: true);
 
-    private static void DoBuildiOS(bool increment) {
+    private static void DoBuildiOS(bool increment, bool scriptsOnly = false) {
         if (increment) {
             int current = int.TryParse(PlayerSettings.iOS.buildNumber, out var n) ? n : 0;
             PlayerSettings.iOS.buildNumber = (current + 1).ToString();
@@ -192,7 +205,7 @@ public static class BuildScript {
             scenes = GetScenes(),
             locationPathName = "Builds/iOS",
             target = BuildTarget.iOS,
-            options = BuildOptions.None
+            options = scriptsOnly ? BuildOptions.BuildScriptsOnly : BuildOptions.None
         });
     }
 }

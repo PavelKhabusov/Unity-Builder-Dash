@@ -181,9 +181,14 @@ class BuilderWindow(Adw.ApplicationWindow):
                                                    tooltip_text="Auto-increment build version")
         self.increment_toggle.set_active(cfg.get("auto_increment", False))
 
+        self.scripts_only_toggle = Gtk.ToggleButton(icon_name="media-seek-forward-symbolic",
+                                                    tooltip_text="Scripts Only — fast rebuild of C# without full IL2CPP/gradle/Xcode")
+        self.scripts_only_toggle.set_active(cfg.get("scripts_only", False))
+
         self._content_header.pack_start(build_all)
         self._content_header.pack_start(self.cancel_btn)
         self._content_header.pack_start(self.increment_toggle)
+        self._content_header.pack_start(self.scripts_only_toggle)
 
         # Header right — spinner + elapsed + log toggle
         self.spinner = Gtk.Spinner()
@@ -362,6 +367,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.build_all_btn.set_visible(is_projects)
         self.cancel_btn.set_visible(is_projects)
         self.increment_toggle.set_visible(is_projects)
+        self.scripts_only_toggle.set_visible(is_projects)
         self._log_toggle.set_visible(is_projects)
         self._settings_save_btn.set_visible(page_id == "settings")
 
@@ -854,6 +860,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             self.cfg, proj, "ios",
             self._log, after_unity, self._on_stage,
             auto_increment=self.increment_toggle.get_active(),
+            scripts_only=self.scripts_only_toggle.get_active(),
             log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 
@@ -941,6 +948,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.worker = BuildWorker(self.cfg, proj, target_key,
                                   self._log, self._on_done, self._on_stage,
                                   auto_increment=self.increment_toggle.get_active(),
+                                  scripts_only=self.scripts_only_toggle.get_active(),
                                   log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 

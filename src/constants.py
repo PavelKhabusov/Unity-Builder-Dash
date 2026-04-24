@@ -12,6 +12,20 @@ TARGET_INFO = {
     "ios":     {"label": "iOS",     "method": "BuildScript.BuildiOS",     "icon": "ubd-apple-symbolic"},
 }
 
+
+def resolve_build_method(base_method: str, increment: bool, scripts_only: bool) -> str:
+    """Compose Unity -executeMethod name from the 4 BuildScript variants.
+
+    Expected BuildScript.cs static methods per target:
+      * Build{Target}                       — increment + full
+      * Build{Target}NoIncrement            — no-increment + full
+      * Build{Target}ScriptsOnly            — no-increment + scripts only
+      * Build{Target}ScriptsOnlyIncrement   — increment + scripts only
+    """
+    if scripts_only:
+        return base_method + ("ScriptsOnlyIncrement" if increment else "ScriptsOnly")
+    return base_method if increment else base_method + "NoIncrement"
+
 SKIP_PATTERNS = [
     "Refreshing native plugins", "Native extension for", "Preloading",
     "[Physics]", "Batchmode", "[UnityConnectServicesConfig]", "[Licensing::",
