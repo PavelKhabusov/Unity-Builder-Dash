@@ -264,6 +264,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                 if not self._build_log_box.get_visible():
                     self._toggle_build_log(True)
                 self._log_widget.append_lines(lines)
+                self._scan_for_alerts(lines)
             self._ios_progress_listener = ios_remote.ProgressListener(
                 ios_cfg.get("progress_port", 8080),
                 log_cb=_ios_progress_log,
@@ -672,11 +673,41 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     def _log(self, t):
         self._log_widget.append_line(t)
+        self._scan_for_alerts((t,))
 
     def _on_stage(self, text, frac):
         if text: self.stage_label.set_text(text)
         if frac >= 0: self.progress_bar.set_fraction(frac)
         elif text: self.progress_bar.pulse()
+
+    def _scan_for_alerts(self, lines):
+        """Watch Mac-side log output for operator-attention prompts and
+        surface them as stage-label + notify-send. Currently handles
+        xcodebuild's "Unlock <device> to Continue" (Error Domain
+        com.apple.dt.deviceprep Code=-3): the build hangs on Run Destination
+        Preflight until the phone is unlocked, and the user won't see it
+        unless the log panel is open. Throttled so the repeated prompt
+        (xcodebuild re-emits it every few seconds) only notifies once per
+        30s, and only once per build stage."""
+        now = time.time()
+        if now - getattr(self, "_lock_notified_at", 0) < 30:
+            return
+        for ln in lines:
+            if "Unlock " not in ln or " to Continue" not in ln:
+                continue
+            try:
+                dev = ln.split("Unlock ", 1)[1].split(" to Continue", 1)[0].strip()
+            except Exception:
+                dev = "device"
+            self._lock_notified_at = now
+            self.stage_label.set_text(f"⚠ Unlock {dev} to continue")
+            try:
+                subprocess.Popen(
+                    ["notify-send", "-u", "critical", "-i", "dialog-warning",
+                     APP_NAME, f"Unlock {dev} — Xcode is waiting"])
+            except Exception:
+                pass
+            return
 
     # ── Actions ──
 
@@ -692,6 +723,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             def _bulk(lines):
                 self._toggle_build_log(True)
                 self._log_widget.append_lines(lines)
+                self._scan_for_alerts(lines)
             self._ios_progress_listener = ios_remote.ProgressListener(
                 port, log_cb=self._log,
                 log_bulk_cb=_bulk,
@@ -801,6 +833,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not unity or not os.path.isfile(unity):
             self._log("Unity editor not found. Check Settings.\n")
             return
+        self._lock_notified_at = 0  # reset per-build throttle for device-lock alert
         self._log_widget.clear()
         self._set_building(True)
         self.cards[proj["name"]]["status"].set_text("Building...")
@@ -867,11 +900,14 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     def _ios_run_remote(self, osa_arg, on_remote_done=None):
         remote = ios_remote.get_remote_cfg(self.cfg)
+        def _bulk(lines):
+            self._log_widget.append_lines(lines)
+            self._scan_for_alerts(lines)
         runner = ios_remote.RemoteRunner(
             remote, log_cb=self._log,
             done_cb=on_remote_done,
             progress_cb=self.progress_bar.set_fraction,
-            log_bulk_cb=self._log_widget.append_lines)
+            log_bulk_cb=_bulk)
         self._ios_runner = runner
         runner.run(osa_arg)
 
