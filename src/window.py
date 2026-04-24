@@ -853,8 +853,14 @@ class BuilderWindow(Adw.ApplicationWindow):
 
         if ok and osa_arg is not None:
             GLib.idle_add(self.stage_label.set_text, f"{status_text} — Mac")
-            self._ios_run_remote(
-                osa_arg, on_remote_done=lambda rok: GLib.idle_add(done, rok))
+            # RemoteRunner already invokes done_cb via GLib.idle_add on the
+            # main thread — passing `done` directly. An intermediate
+            # `lambda rok: GLib.idle_add(done, rok)` double-schedules AND
+            # (worse) returns the source-ID int → GLib treats the lambda as
+            # a repeating idle source and re-fires it every tick, calling
+            # _on_done in an infinite loop until AttributeError trips on
+            # self.worker=None (cleared by the first successful call).
+            self._ios_run_remote(osa_arg, on_remote_done=done)
             return  # done fires from RemoteRunner callback
 
         GLib.idle_add(done, ok)
@@ -1000,8 +1006,14 @@ class BuilderWindow(Adw.ApplicationWindow):
             GLib.idle_add(self.progress_bar.set_fraction, frac)
             GLib.idle_add(self.stage_label.set_text, f"Uploading... {frac*100:.0f}%")
         def do_upload():
+            def _log_cb(t):
+                GLib.idle_add(self._log, t)
+                # Must return None/False — if upload_apk ever invokes log_cb
+                # through idle_add, a truthy return (source-ID int) would
+                # make GLib reschedule it forever. See the _on_done loop bug
+                # in _ios_post_build for the same failure mode.
             ok = upload_apk(self.cfg, proj, apk,
-                            log_cb=lambda t: GLib.idle_add(self._log, t),
+                            log_cb=_log_cb,
                             progress_cb=on_progress)
             GLib.idle_add(self.stage_label.set_text, "Uploaded!" if ok else "Upload failed")
             GLib.idle_add(self.progress_bar.set_fraction, 1.0 if ok else 0)
