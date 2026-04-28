@@ -1,6 +1,18 @@
 """Main application window with sidebar navigation."""
 import os, subprocess, datetime, time, threading
+import gi
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk
+# libnotify so we can dismiss notifications programmatically (notify-send is
+# fire-and-forget — once shown there's no handle to close it). Soft-fails
+# if Notify isn't available (rare on GNOME systems but possible on minimal
+# installs); we fall back to subprocess notify-send in that case.
+try:
+    gi.require_version("Notify", "0.7")
+    from gi.repository import Notify
+    _HAS_NOTIFY = True
+except (ValueError, ImportError):
+    Notify = None
+    _HAS_NOTIFY = False
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS, SKIP_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
@@ -745,18 +757,47 @@ class BuilderWindow(Adw.ApplicationWindow):
                 self._locked_device = locked_dev
                 self._pre_lock_stage = self.stage_label.get_text() or ""
                 self.stage_label.set_text(f"⚠ Unlock {locked_dev} to continue")
-                try:
-                    subprocess.Popen(
-                        ["notify-send", "-u", "critical", "-i", "dialog-warning",
-                         APP_NAME, f"Unlock {locked_dev} — Xcode is waiting"])
-                except Exception:
-                    pass
+                self._show_lock_notification(locked_dev)
             return
 
         # No "Unlock" in this batch. If we have an active alert AND we saw
         # any resume signal, the device got unlocked — clear the banner.
         if saw_resume and getattr(self, "_locked_device", None):
             self._clear_lock_alert()
+
+    def _show_lock_notification(self, dev):
+        """Fire a critical-urgency desktop notification asking the user to
+        unlock the device. Holds onto the Notify.Notification handle so we
+        can `.close()` it from _clear_lock_alert when the build resumes —
+        notify-send (subprocess) gives no handle, so the banner would
+        outlive the actual lock state."""
+        # Close any stale handle from a prior alert before opening a new one
+        old = getattr(self, "_lock_notification", None)
+        if old is not None:
+            try: old.close()
+            except Exception: pass
+            self._lock_notification = None
+        if _HAS_NOTIFY:
+            try:
+                if not getattr(self, "_notify_inited", False):
+                    Notify.init(APP_NAME)
+                    self._notify_inited = True
+                n = Notify.Notification.new(
+                    APP_NAME, f"Unlock {dev} — Xcode is waiting",
+                    "dialog-warning")
+                n.set_urgency(Notify.Urgency.CRITICAL)
+                n.show()
+                self._lock_notification = n
+                return
+            except Exception:
+                pass
+        # Fallback: notify-send (won't be closable, but better than silent)
+        try:
+            subprocess.Popen(
+                ["notify-send", "-u", "critical", "-i", "dialog-warning",
+                 APP_NAME, f"Unlock {dev} — Xcode is waiting"])
+        except Exception:
+            pass
 
     def _clear_lock_alert(self):
         """Clear the ⚠ device-locked banner. Triggered when log output shows
@@ -772,12 +813,33 @@ class BuilderWindow(Adw.ApplicationWindow):
         if cur.startswith("⚠ Unlock"):
             prior = getattr(self, "_pre_lock_stage", "") or "Resumed"
             self.stage_label.set_text(prior)
-        try:
-            subprocess.Popen(
-                ["notify-send", "-u", "low", "-i", "dialog-ok-apply",
-                 APP_NAME, f"{dev} unlocked — build resumed"])
-        except Exception:
-            pass
+        # Dismiss the critical-urgency banner from the notification tray.
+        n = getattr(self, "_lock_notification", None)
+        if n is not None:
+            try: n.close()
+            except Exception: pass
+            self._lock_notification = None
+        # Replace it with a low-urgency "resumed" notification — short toast,
+        # auto-dismisses on its own.
+        if _HAS_NOTIFY:
+            try:
+                if not getattr(self, "_notify_inited", False):
+                    Notify.init(APP_NAME)
+                    self._notify_inited = True
+                m = Notify.Notification.new(
+                    APP_NAME, f"{dev} unlocked — build resumed",
+                    "dialog-ok-apply")
+                m.set_urgency(Notify.Urgency.LOW)
+                m.show()
+            except Exception:
+                pass
+        else:
+            try:
+                subprocess.Popen(
+                    ["notify-send", "-u", "low", "-i", "dialog-ok-apply",
+                     APP_NAME, f"{dev} unlocked — build resumed"])
+            except Exception:
+                pass
 
     # ── Actions ──
 
@@ -933,6 +995,11 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._lock_notified_at = 0
         self._locked_device = None
         self._pre_lock_stage = ""
+        n = getattr(self, "_lock_notification", None)
+        if n is not None:
+            try: n.close()
+            except Exception: pass
+            self._lock_notification = None
         self._log_widget.clear()
         self._set_building(True)
         self.cards[proj["name"]]["status"].set_text("Building...")
