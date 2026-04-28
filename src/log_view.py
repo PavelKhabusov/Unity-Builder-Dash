@@ -168,6 +168,13 @@ class LogView(Gtk.Box):
         self._pending_lines = []
         self._drain_scheduled = False
 
+        # Debounce timer for filter rebuild. SearchEntry fires "search-changed"
+        # on every keystroke — without debounce, typing "abc" runs three full
+        # _rebuild passes back-to-back. On a 7000-line buffer with a single
+        # letter matching almost every line, that's 7000 GTK inserts per
+        # keystroke = main thread frozen / app crashes.
+        self._filter_timer = None
+
         # Track right-click position for context menu
         self._last_click_line = -1
         rclick = Gtk.GestureClick(button=3)
@@ -650,25 +657,72 @@ class LogView(Gtk.Box):
             tag.set_property("invisible", not btn.get_active())
 
     def _rebuild(self):
-        self._buffer.set_text("")
-        self._trace_groups = []
-        self._in_trace = False
-        self._dedup_hist = []
-        self._dedup_active = None
-        self._buffer_first_idx = 0
-        for line in self._full_lines:
-            if self._passes_filter(line):
+        # If a debounced filter rebuild is queued, drop it — we're rebuilding
+        # right now (direct call from "Show in Context" / pause-resume), the
+        # pending one would just redo identical work 200 ms later.
+        if self._filter_timer is not None:
+            GLib.source_remove(self._filter_timer)
+            self._filter_timer = None
+        # Cache filter params ONCE — _passes_filter does GTK calls
+        # (self._search.get_text(), self._level_filter.get_selected()) and
+        # string ops on every line; a 7000-line rebuild was making 14000+
+        # GTK property reads. Inline a fast precomputed check instead.
+        query = self._search.get_text().lower().strip()
+        level_idx = self._level_filter.get_selected()
+        level_name = (self._level_names[level_idx]
+                      if level_idx < len(self._level_names) else "All")
+        level_tag_map = {
+            "Errors":   ("error", "E"),
+            "Error":    ("error", "E"),
+            "Warnings": ("error", "warning", "E", "W"),
+            "Warning":  ("error", "warning", "E", "W"),
+            "Stages":   ("stage",),
+            "Info":     ("error", "warning", "success", "stage", "E", "W", "I"),
+            "Debug":    ("error", "warning", "success", "stage", "E", "W", "I", "D"),
+        }
+        allowed = level_tag_map.get(level_name) if level_name != "All" else None
+
+        # Wrap the whole rebuild in a single user_action so GTK does one
+        # layout pass for the buffer reset + all inserts, instead of a pass
+        # per insert (the difference between snappy and "not responding").
+        self._bulk = True
+        self._buffer.begin_user_action()
+        try:
+            self._buffer.set_text("")
+            self._trace_groups = []
+            self._in_trace = False
+            self._dedup_hist = []
+            self._dedup_active = None
+            self._buffer_first_idx = 0
+            for line in self._full_lines:
+                if allowed is not None:
+                    tag = self._get_tag(line)
+                    if tag not in allowed:
+                        continue
+                if query and query not in line.lower():
+                    continue
                 if self._dedup_try_absorb(line):
                     continue
                 self._insert_tagged(line, scroll=False)
                 self._dedup_record_last_line(line)
+        finally:
+            self._buffer.end_user_action()
+            self._bulk = False
         follow = getattr(self, "_follow_toggle", None)
         if follow is None or follow.get_active():
             self.scroll_to_bottom()
 
     def _on_filter(self, *_):
-        self._rebuild()
-        self._update_ctx_action()
+        # Debounce: SearchEntry fires per-keystroke. Coalesce bursts so
+        # typing "error" doesn't run five full rebuilds back to back.
+        if self._filter_timer is not None:
+            GLib.source_remove(self._filter_timer)
+        def _fire():
+            self._filter_timer = None
+            self._rebuild()
+            self._update_ctx_action()
+            return False
+        self._filter_timer = GLib.timeout_add(200, _fire)
 
     def _update_ctx_action(self):
         has_filter = bool(self._search.get_text().strip()) or self._level_filter.get_selected() != 0

@@ -693,34 +693,91 @@ class BuilderWindow(Adw.ApplicationWindow):
         if frac >= 0: self.progress_bar.set_fraction(frac)
         elif text: self.progress_bar.pulse()
 
+    # Positive signals that xcodebuild has moved past Run Destination
+    # Preflight — i.e. the device got unlocked and the build resumed.
+    # All four are observed in real iOS-test runs right after the user
+    # unlocks the phone (see commit context for the captured xcodebuild log):
+    #   - "DVTDevice: Error locating DeviceSupport"  xcodebuild side: device handshake done
+    #   - "Initialize engine version"                Unity engine starting on device
+    #   - "UIApplicationMain"                        host process main() running
+    #   - "Test Suite '"                              xctest runner began
+    # Any one of them is sufficient — we only check while a lock alert is
+    # active, so they can't false-trigger when there's nothing to clear.
+    _UNLOCK_RESUME_SIGNS = (
+        "DVTDevice: Error locating",
+        "Initialize engine version",
+        "UIApplicationMain",
+        "Test Suite '",
+    )
+
     def _scan_for_alerts(self, lines):
         """Watch Mac-side log output for operator-attention prompts and
         surface them as stage-label + notify-send. Currently handles
         xcodebuild's "Unlock <device> to Continue" (Error Domain
         com.apple.dt.deviceprep Code=-3): the build hangs on Run Destination
         Preflight until the phone is unlocked, and the user won't see it
-        unless the log panel is open. Throttled so the repeated prompt
-        (xcodebuild re-emits it every few seconds) only notifies once per
-        30s, and only once per build stage."""
+        unless the log panel is open.
+
+        Auto-clears event-driven: once a line matching any
+        _UNLOCK_RESUME_SIGNS pattern shows up after we surfaced the alert,
+        the build has clearly resumed → restore the prior stage label and
+        fire a follow-up "unlocked" notification. No timers — we react to
+        the actual log stream the way xcodebuild signals progress."""
         now = time.time()
-        if now - getattr(self, "_lock_notified_at", 0) < 30:
-            return
+        locked_dev = None
+        saw_resume = False
         for ln in lines:
-            if "Unlock " not in ln or " to Continue" not in ln:
-                continue
-            try:
-                dev = ln.split("Unlock ", 1)[1].split(" to Continue", 1)[0].strip()
-            except Exception:
-                dev = "device"
-            self._lock_notified_at = now
-            self.stage_label.set_text(f"⚠ Unlock {dev} to continue")
-            try:
-                subprocess.Popen(
-                    ["notify-send", "-u", "critical", "-i", "dialog-warning",
-                     APP_NAME, f"Unlock {dev} — Xcode is waiting"])
-            except Exception:
-                pass
+            if "Unlock " in ln and " to Continue" in ln:
+                try:
+                    locked_dev = ln.split("Unlock ", 1)[1].split(" to Continue", 1)[0].strip()
+                except Exception:
+                    locked_dev = "device"
+            elif any(s in ln for s in self._UNLOCK_RESUME_SIGNS):
+                saw_resume = True
+
+        if locked_dev:
+            last_notify = getattr(self, "_lock_notified_at", 0)
+            # First lock event in this build OR >30s since last → fire UI +
+            # system notification. Repeated prompts inside the same lock
+            # event are silently absorbed.
+            if now - last_notify >= 30:
+                self._lock_notified_at = now
+                self._locked_device = locked_dev
+                self._pre_lock_stage = self.stage_label.get_text() or ""
+                self.stage_label.set_text(f"⚠ Unlock {locked_dev} to continue")
+                try:
+                    subprocess.Popen(
+                        ["notify-send", "-u", "critical", "-i", "dialog-warning",
+                         APP_NAME, f"Unlock {locked_dev} — Xcode is waiting"])
+                except Exception:
+                    pass
             return
+
+        # No "Unlock" in this batch. If we have an active alert AND we saw
+        # any resume signal, the device got unlocked — clear the banner.
+        if saw_resume and getattr(self, "_locked_device", None):
+            self._clear_lock_alert()
+
+    def _clear_lock_alert(self):
+        """Clear the ⚠ device-locked banner. Triggered when log output shows
+        the build has moved past Run Destination Preflight."""
+        dev = getattr(self, "_locked_device", None)
+        if not dev:
+            return
+        self._locked_device = None
+        self._lock_notified_at = 0  # let a fresh lock event notify immediately
+        # Only restore prior stage if our warning is still on screen — if
+        # build code already updated stage_label, don't clobber it.
+        cur = self.stage_label.get_text() or ""
+        if cur.startswith("⚠ Unlock"):
+            prior = getattr(self, "_pre_lock_stage", "") or "Resumed"
+            self.stage_label.set_text(prior)
+        try:
+            subprocess.Popen(
+                ["notify-send", "-u", "low", "-i", "dialog-ok-apply",
+                 APP_NAME, f"{dev} unlocked — build resumed"])
+        except Exception:
+            pass
 
     # ── Actions ──
 
@@ -872,7 +929,10 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not unity or not os.path.isfile(unity):
             self._log("Unity editor not found. Check Settings.\n")
             return
-        self._lock_notified_at = 0  # reset per-build throttle for device-lock alert
+        # Fully reset device-lock alert state for the new build.
+        self._lock_notified_at = 0
+        self._locked_device = None
+        self._pre_lock_stage = ""
         self._log_widget.clear()
         self._set_building(True)
         self.cards[proj["name"]]["status"].set_text("Building...")
