@@ -251,17 +251,29 @@ class DevicesPage(Gtk.Box):
         self._logcat_box.set_visible(False)
 
     def refresh(self):
+        # Re-entrancy guard. Builds do `adb kill-server` and the daemon takes
+        # 1-2s to come back; meanwhile `adb devices -l` blocks waiting for
+        # the smartsocket. If the user hammers refresh — or if a build's
+        # restart races with it — concurrent calls stack up to dozens of
+        # stuck adb clients that the system can't drain quickly. One scan
+        # at a time keeps the queue at zero.
+        if getattr(self, "_refresh_running", False):
+            return
+        self._refresh_running = True
         self._status.set_text("Scanning...")
         def do_scan():
-            devs = _parse_devices()
-            for dev in devs:
-                if dev["state"] == "device":
-                    dev["running_apps"] = _get_running_apps(dev["id"])
-                    dev["installed_apps"] = _get_installed_packages(dev["id"])
-                else:
-                    dev["running_apps"] = []
-                    dev["installed_apps"] = []
-            GLib.idle_add(self._update_list, devs)
+            try:
+                devs = _parse_devices()
+                for dev in devs:
+                    if dev["state"] == "device":
+                        dev["running_apps"] = _get_running_apps(dev["id"])
+                        dev["installed_apps"] = _get_installed_packages(dev["id"])
+                    else:
+                        dev["running_apps"] = []
+                        dev["installed_apps"] = []
+                GLib.idle_add(self._update_list, devs)
+            finally:
+                self._refresh_running = False
         threading.Thread(target=do_scan, daemon=True).start()
 
     def _update_list(self, devices):
@@ -912,10 +924,33 @@ class DevicesPage(Gtk.Box):
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1)
                 self._logcat_proc = proc
+
+                # Batch lines at ~20 Hz before sending to GTK. Logcat emits
+                # thousands of lines per second on a busy device — per-line
+                # idle_add floods the main thread and freezes the UI hard
+                # ("not responding") the instant we attach. Same pattern as
+                # BuildWorker / ProgressListener / RemoteRunner.
+                import time as _t
+                pending = []
+                last_flush = [0.0]
+                def flush():
+                    if not pending: return
+                    batch = pending[:]
+                    pending.clear()
+                    last_flush[0] = _t.monotonic()
+                    def _deliver(lines=batch):
+                        try: self._logcat_view.append_lines(lines)
+                        except Exception: pass
+                        return False
+                    GLib.idle_add(_deliver)
+
                 for line in proc.stdout:
                     if self._logcat_proc is None:
                         break
-                    GLib.idle_add(self._logcat_view.append_line, line)
+                    pending.append(line)
+                    if _t.monotonic() - last_flush[0] >= 0.05:
+                        flush()
+                flush()
             except Exception as e:
                 GLib.idle_add(self._logcat_view.append_line, f"Error: {e}\n")
 
