@@ -171,6 +171,9 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._sidebar_collapsed = False
         self._sidebar_labels = []  # filled below
         self._sidebar_header_title = None
+        # Restore sidebar collapsed state from prior session.
+        if cfg.get("sidebar_collapsed", False):
+            self._apply_sidebar_state(True)
 
         # ── Content pages ──
         self._content_page = Adw.NavigationPage(title="Projects")
@@ -322,9 +325,11 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     # ── Sidebar ──
 
-    def _toggle_sidebar(self):
-        self._sidebar_collapsed = not self._sidebar_collapsed
-        collapsed = self._sidebar_collapsed
+    def _apply_sidebar_state(self, collapsed):
+        """Set the sidebar's collapsed/expanded visuals. Pure render — no
+        toggle, no save. Used both by _toggle_sidebar and on startup to
+        restore the persisted state from cfg."""
+        self._sidebar_collapsed = collapsed
 
         # Toggle labels, centering, header
         all_rows = []
@@ -361,6 +366,13 @@ class BuilderWindow(Adw.ApplicationWindow):
         else:
             self._split.set_min_sidebar_width(110)
             self._split.set_max_sidebar_width(140)
+
+    def _toggle_sidebar(self):
+        self._apply_sidebar_state(not self._sidebar_collapsed)
+        # Persist the new state so the next launch opens with the same width.
+        self.cfg["sidebar_collapsed"] = self._sidebar_collapsed
+        try: save_config(self.cfg)
+        except Exception: pass
 
     # ── Sidebar navigation ──
 
