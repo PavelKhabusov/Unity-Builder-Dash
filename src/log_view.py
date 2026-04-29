@@ -46,7 +46,7 @@ class LogView(Gtk.Box):
     get_tag(line) should return a tag name string (e.g. "error") or None.
     """
 
-    def __init__(self, levels=None, get_tag=None, margin=12, extra_start=None, extra_end=None, exclude_patterns=None):
+    def __init__(self, levels=None, get_tag=None, margin=12, extra_start=None, extra_end=None, exclude_patterns=None, compact_re=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
         if margin:
             self.set_margin_top(4)
@@ -58,6 +58,11 @@ class LogView(Gtk.Box):
         self._full_lines = []  # all raw lines for refilter
         self._paused = False
         self._exclude_patterns = exclude_patterns or []
+        # Optional regex stripped from each line when "Compact view" toggle
+        # is on. Designed for logcat threadtime where the timestamp + PID/TID
+        # prefix dominates each line. Raw lines are still kept in
+        # _full_lines so toggling off restores them.
+        self._compact_re = compact_re
 
         # ── Filter bar ──
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -109,6 +114,20 @@ class LogView(Gtk.Box):
             active=False)
         self._trace_toggle.connect("toggled", self._on_trace_toggle)
         search_box.append(self._trace_toggle)
+
+        # Compact-mode toggle. Visible only if a compact_re was supplied
+        # (logcat case). Strips the metadata prefix from displayed lines so
+        # the actual TAG: MSG payload doesn't get pushed off-screen by
+        # timestamps + PIDs.
+        if self._compact_re is not None:
+            self._compact_toggle = Gtk.ToggleButton(
+                icon_name="zoom-fit-best-symbolic",
+                tooltip_text="Compact (hide timestamps / PIDs)",
+                active=True)
+            self._compact_toggle.connect("toggled", lambda *_: self._rebuild())
+            search_box.append(self._compact_toggle)
+        else:
+            self._compact_toggle = None
 
         copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
                               tooltip_text="Copy visible log", css_classes=["flat"])
@@ -394,7 +413,7 @@ class LogView(Gtk.Box):
                     if not self._buffer.get_tag_table().lookup("trace_hidden"):
                         self._buffer.create_tag("trace_hidden", invisible=True,
                                                  foreground="#888888", scale=0.85)
-                    self._buffer.insert_with_tags_by_name(end, text, "trace_hidden")
+                    self._buffer.insert_with_tags_by_name(end, self._compact(text), "trace_hidden")
                 return
             # No recent trace: merge with previous visible line
             if self._full_lines:
@@ -448,7 +467,12 @@ class LogView(Gtk.Box):
             if self._dedup_try_absorb(text):
                 return
             self._insert_tagged(text)
-            self._dedup_record_last_line(text)
+            # Skip trace frames in dedup history — they vary line-to-line
+            # but represent the same logical event. Without this, two
+            # identical exception headers separated by their stack traces
+            # never match (hist[-1] is always the last "at ..." frame).
+            if not self._is_trace_line(text):
+                self._dedup_record_last_line(text)
 
     def get_full_text(self):
         """Return all raw lines joined."""
@@ -502,8 +526,14 @@ class LogView(Gtk.Box):
             if tag not in allowed:
                 return False
 
-        if query and query not in text.lower():
-            return False
+        # Match search against the visible (compact) form so a user typing
+        # part of TAG or message text doesn't get a "no results" result just
+        # because the prefix is hidden. When compact toggle is off this is
+        # a no-op (returns text unchanged).
+        if query:
+            haystack = self._compact(text).lower()
+            if query not in haystack:
+                return False
         return True
 
     @staticmethod
@@ -522,6 +552,12 @@ class LogView(Gtk.Box):
                 "--- End of" in s or
                 (s.startswith("0x") and " in " in s) or
                 ("(at " in s and ".cs:" in s)):
+            return True
+        # Android logcat / Java stack frames — each frame is a separate line
+        # of the form "<TAG>: \tat <method>(<File>.java:<line>)". The literal
+        # tab+"at "+space pattern is unambiguous and matches both the raw
+        # threadtime line and the compact-stripped form.
+        if "\tat " in line or " \tat " in line:
             return True
         # clang / Xcode warning/error continuation lines.
         if s.startswith("In file included from "):
@@ -568,7 +604,22 @@ class LogView(Gtk.Box):
             return True
         return False
 
+    def _compact(self, text):
+        """Strip the configured prefix when 'compact view' toggle is on.
+        Returns text unchanged if no compact_re or toggle off. Cheap no-op
+        in the common case so we can call it from every insert site."""
+        if (self._compact_re is None
+                or self._compact_toggle is None
+                or not self._compact_toggle.get_active()):
+            return text
+        return self._compact_re.sub("", text, count=1)
+
     def _insert_tagged(self, text, scroll=True):
+        # Apply compact-mode strip before everything else: trace detection,
+        # tag selection, and the actual buffer insert all run on the form
+        # the user will see. Raw text is preserved in self._full_lines so
+        # toggling compact off rebuilds with the original.
+        text = self._compact(text)
         is_trace = self._is_trace_line(text)
         if is_trace:
             self._trace_ended_ago = 0
@@ -694,12 +745,21 @@ class LogView(Gtk.Box):
             self._dedup_hist = []
             self._dedup_active = None
             self._buffer_first_idx = 0
+            compact_active = (
+                self._compact_re is not None
+                and self._compact_toggle is not None
+                and self._compact_toggle.get_active())
             for line in self._full_lines:
+                # Compact-aware checks: tag and search query are evaluated
+                # on the form the user will see in the buffer, otherwise
+                # searching for a tag-name substring fails when timestamps
+                # are stripped from view.
+                disp = self._compact_re.sub("", line, count=1) if compact_active else line
                 if allowed is not None:
-                    tag = self._get_tag(line)
+                    tag = self._get_tag(disp)
                     if tag not in allowed:
                         continue
-                if query and query not in line.lower():
+                if query and query not in disp.lower():
                     continue
                 if self._dedup_try_absorb(line):
                     continue
@@ -797,6 +857,21 @@ class LogView(Gtk.Box):
         # Extend active group?
         act = self._dedup_active
         if act is not None:
+            # Trace frames after a deduped header belong to the same logical
+            # event (same exception → same stack). Fold them into the active
+            # group's hidden content without bumping count/phase, so the
+            # marker keeps showing N (header occurrences), not N + frames.
+            if self._is_trace_line(text):
+                tag_table = self._buffer.get_tag_table()
+                if not tag_table.lookup("trace_hidden"):
+                    self._buffer.create_tag("trace_hidden", invisible=True,
+                                             foreground="#888888", scale=0.85)
+                end = self._buffer.get_end_iter()
+                self._buffer.insert_with_tags_by_name(end, self._compact(text), "trace_hidden")
+                ce = act["group"].get("content_end")
+                if ce:
+                    self._buffer.move_mark(ce, self._buffer.get_end_iter())
+                return True
             norms = act["norms"]
             expected = norms[act["phase"]]
             if norm == expected:
@@ -806,7 +881,7 @@ class LogView(Gtk.Box):
                     self._buffer.create_tag("trace_hidden", invisible=True,
                                              foreground="#888888", scale=0.85)
                 end = self._buffer.get_end_iter()
-                self._buffer.insert_with_tags_by_name(end, text, "trace_hidden")
+                self._buffer.insert_with_tags_by_name(end, self._compact(text), "trace_hidden")
                 ce = act["group"].get("content_end")
                 if ce:
                     self._buffer.move_mark(ce, self._buffer.get_end_iter())
@@ -878,7 +953,7 @@ class LogView(Gtk.Box):
         all_lines = [t for (_, t, _) in retracted] + [text]
         for line in all_lines:
             end = self._buffer.get_end_iter()
-            self._buffer.insert_with_tags_by_name(end, line, "trace_hidden")
+            self._buffer.insert_with_tags_by_name(end, self._compact(line), "trace_hidden")
         content_end = self._buffer.create_mark(
             None, self._buffer.get_end_iter(), False)
 
@@ -1000,12 +1075,13 @@ class LogView(Gtk.Box):
                         content_start_offset = offset
                         for line in lines:
                             it = buf.get_iter_at_offset(offset)
-                            tag = self._get_tag(line)
+                            disp = self._compact(line)
+                            tag = self._get_tag(disp)
                             if tag:
-                                buf.insert_with_tags_by_name(it, line, tag, "trace_hidden")
+                                buf.insert_with_tags_by_name(it, disp, tag, "trace_hidden")
                             else:
-                                buf.insert_with_tags_by_name(it, line, "trace_hidden")
-                            offset += len(line)
+                                buf.insert_with_tags_by_name(it, disp, "trace_hidden")
+                            offset += len(disp)
                         cs = buf.create_mark(None,
                             buf.get_iter_at_offset(content_start_offset), True)
                         ce = buf.create_mark(None,
@@ -1019,12 +1095,13 @@ class LogView(Gtk.Box):
                     else:
                         for line in lines:
                             it = buf.get_iter_at_offset(offset)
-                            tag = self._get_tag(line)
+                            disp = self._compact(line)
+                            tag = self._get_tag(disp)
                             if tag:
-                                buf.insert_with_tags_by_name(it, line, tag)
+                                buf.insert_with_tags_by_name(it, disp, tag)
                             else:
-                                buf.insert(it, line)
-                            offset += len(line)
+                                buf.insert(it, disp)
+                            offset += len(disp)
                 # Prepend preserving visual order
                 self._trace_groups = new_groups + self._trace_groups
             finally:

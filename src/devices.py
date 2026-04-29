@@ -1,8 +1,14 @@
 """Device manager page — ADB device management UI."""
-import os, subprocess, threading
+import os, re, subprocess, threading
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 from .log_view import LogView
 from . import ios_remote
+
+
+# logcat -v threadtime line prefix: "MM-DD HH:MM:SS.mmm  PID  TID  "
+# Stripped when the user toggles Compact view on the LogView toolbar.
+LOGCAT_PREFIX_RE = re.compile(
+    r"^\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\d+\s+")
 
 
 def _adb(*args, device=None, timeout=15):
@@ -118,11 +124,17 @@ def _get_apps_info(device_id, packages):
 
 
 def _get_logcat_tag(line):
+    """Extract the priority letter (E/W/I/D/V). Works on both the raw
+    threadtime form ("MM-DD HH:MM:SS.mmm  PID  TID  W TAG: ...") and the
+    compact form with the timestamp prefix already stripped — LogView's
+    level filter calls this on the visible string."""
     parts = line.split(None, 5)
-    if len(parts) >= 5:
-        lvl = parts[4][:1]
-        if lvl in ("E", "W", "I", "D", "V"):
-            return lvl
+    # Raw: parts[4] is the level. Compact: parts[0] is the level.
+    for idx in (4, 0):
+        if idx < len(parts):
+            lvl = parts[idx][:1]
+            if lvl in ("E", "W", "I", "D", "V"):
+                return lvl
     return None
 
 
@@ -213,7 +225,8 @@ class DevicesPage(Gtk.Box):
             levels=["All", "Error", "Warning", "Info", "Debug"],
             get_tag=_get_logcat_tag, margin=8,
             extra_start=[self._logcat_app_filter],
-            extra_end=[self._logcat_clear, self._logcat_pause, self._logcat_close])
+            extra_end=[self._logcat_clear, self._logcat_pause, self._logcat_close],
+            compact_re=LOGCAT_PREFIX_RE)
         self._logcat_box.append(self._logcat_view)
 
         self._paned.set_end_child(self._logcat_box)
