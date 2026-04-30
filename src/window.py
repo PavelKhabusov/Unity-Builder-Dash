@@ -590,10 +590,11 @@ class BuilderWindow(Adw.ApplicationWindow):
             actions.append(deploy)
             buttons.append(deploy)
 
-        scan_btn = Gtk.Button(icon_name="security-medium-symbolic",
-                              tooltip_text="Health check", css_classes=["flat"])
-        scan_btn.connect("clicked", lambda _, p=proj: self._on_scan(p))
-        actions.append(scan_btn)
+        open_unity_btn = Gtk.Button(icon_name="ubd-unity",
+                                    tooltip_text="Open in Unity",
+                                    css_classes=["flat"])
+        open_unity_btn.connect("clicked", lambda _, p=proj: self._open_in_unity(p))
+        actions.append(open_unity_btn)
 
         menu = Gio.Menu()
         proj_id = proj["name"].replace(" ", "_")
@@ -602,11 +603,13 @@ class BuilderWindow(Adw.ApplicationWindow):
         if has_upload:
             menu.append("Upload to Server", f"win.upload-{proj_id}")
 
+        # Android-only: APK push + AAB build (Google Play) — keep them adjacent
+        # since both deal with Android shipping artifacts.
         if "android" in proj.get("targets", []):
             menu.append("Push APK to Device", f"win.push-{proj_id}")
+            menu.append("Build AAB (Google Play)", f"win.build-aab-{proj_id}")
 
         open_section = Gio.Menu()
-        open_section.append("Open in Unity", f"win.open-unity-{proj_id}")
         open_section.append("Open Build Folder", f"win.folder-{proj_id}")
         open_section.append("Open Project Folder", f"win.proj-folder-{proj_id}")
         menu.append_section(None, open_section)
@@ -617,15 +620,19 @@ class BuilderWindow(Adw.ApplicationWindow):
         test_section.append("Select Tests…", f"win.test-pick-{proj_id}")
         menu.append_section(None, test_section)
 
+        diag_section = Gio.Menu()
+        diag_section.append("Health Check", f"win.scan-{proj_id}")
+        menu.append_section(None, diag_section)
+
         clean_section = Gio.Menu()
         clean_section.append("Clear Build Cache", f"win.clear-cache-{proj_id}")
         clean_section.append("Clean Build (delete Library)", f"win.clean-{proj_id}")
         menu.append_section(None, clean_section)
 
         action_list = [
+            (f"build-aab-{proj_id}", lambda *_, p=proj: self._on_build_aab(p)),
             (f"upload-{proj_id}", lambda *_, p=proj: self._on_upload(p)),
             (f"push-{proj_id}", lambda *_, p=proj: self._on_push_to_device(p)),
-            (f"open-unity-{proj_id}", lambda *_, p=proj: self._open_in_unity(p)),
             (f"folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
                 ["xdg-open", p.get("build_dir") or p["path"]])),
             (f"proj-folder-{proj_id}", lambda *_, p=proj: subprocess.Popen(
@@ -633,6 +640,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             (f"test-edit-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "EditMode")),
             (f"test-play-{proj_id}", lambda *_, p=proj: self._on_run_tests(p, "PlayMode")),
             (f"test-pick-{proj_id}", lambda *_, p=proj: self._show_test_picker(p)),
+            (f"scan-{proj_id}", lambda *_, p=proj: self._on_scan(p)),
             (f"clear-cache-{proj_id}", lambda *_, p=proj: self._on_clear_cache(p)),
             (f"clean-{proj_id}", lambda *_, p=proj: self._on_clean_build(p)),
         ]
@@ -1096,6 +1104,14 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Done" if ok else "Failed")
         self.progress_bar.set_fraction(1.0 if ok else 0)
 
+    def _on_build_aab(self, proj):
+        """Trigger an AAB (Google Play app bundle) build via the
+        BuildAndroidAAB / BuildAndroidAABIncrement variants. Honors the
+        auto-increment toggle but ignores Scripts Only — release artifacts
+        always need a clean full build."""
+        self._build_queue = []
+        self._start(proj, "android", aab=True)
+
     def _on_build_all(self, _):
         q = [(p, t) for p in self.cfg["projects"] for t in p["targets"] if t == "android"]
         if not q: return
@@ -1103,7 +1119,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._build_queue = q
         self._start(f[0], f[1])
 
-    def _start(self, proj, target_key):
+    def _start(self, proj, target_key, aab=False):
         unity = get_unity_for_project(self.cfg, proj)
         if not unity or not os.path.isfile(unity):
             self._log("Unity editor not found. Check Settings.\n")
@@ -1113,7 +1129,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._set_building(True)
         now = datetime.datetime.now().strftime("%H:%M:%S")
         info = TARGET_INFO[target_key]
-        self.status.set_text(f"{proj['name']} / {info['label']}  {now}")
+        label = f"{info['label']} AAB" if aab else info['label']
+        self.status.set_text(f"{proj['name']} / {label}  {now}")
         self.cards[proj["name"]]["status"].set_text("Building...")
         self.progress_bar.set_fraction(0)
         self.stage_label.set_text("Starting Unity...")
@@ -1121,6 +1138,7 @@ class BuilderWindow(Adw.ApplicationWindow):
                                   self._log, self._on_done, self._on_stage,
                                   auto_increment=self.increment_toggle.get_active(),
                                   scripts_only=self.scripts_only_toggle.get_active(),
+                                  aab=aab,
                                   log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 

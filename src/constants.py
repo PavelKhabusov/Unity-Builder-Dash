@@ -13,15 +13,24 @@ TARGET_INFO = {
 }
 
 
-def resolve_build_method(base_method: str, increment: bool, scripts_only: bool) -> str:
-    """Compose Unity -executeMethod name from the 4 BuildScript variants.
+def resolve_build_method(base_method: str, increment: bool, scripts_only: bool,
+                         aab: bool = False) -> str:
+    """Compose Unity -executeMethod name from the BuildScript variants.
 
     Expected BuildScript.cs static methods per target:
       * Build{Target}                       — increment + full
       * Build{Target}NoIncrement            — no-increment + full
       * Build{Target}ScriptsOnly            — no-increment + scripts only
       * Build{Target}ScriptsOnlyIncrement   — increment + scripts only
+    Android-only AAB variants for Google Play:
+      * BuildAndroidAAB                     — no-increment + AAB
+      * BuildAndroidAABIncrement            — increment + AAB
+
+    AAB takes priority over Scripts Only — they're mutually exclusive
+    (Scripts Only is a dev-iteration loop; AAB is a release artifact).
     """
+    if aab:
+        return base_method + ("AABIncrement" if increment else "AAB")
     if scripts_only:
         return base_method + ("ScriptsOnlyIncrement" if increment else "ScriptsOnly")
     return base_method if increment else base_method + "NoIncrement"

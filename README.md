@@ -130,14 +130,18 @@ streaming back into the app's LogView.
 
 ## Unity BuildScript
 
-Place this in `Assets/Editor/BuildScript.cs` of each project. UBD invokes
-**eight** entry points via `-executeMethod`, chosen from the cross of the
-auto-increment and Scripts Only toggles:
+Copy [examples/BuildScript.cs](examples/BuildScript.cs) into
+`Assets/Editor/BuildScript.cs` of each project. UBD invokes its static
+methods via `-executeMethod`, chosen from the cross of three toggles:
 
-| Target  | Full, incr.                 | Full, no-incr.                      | Scripts Only, incr.                        | Scripts Only, no-incr.              |
-|---------|-----------------------------|-------------------------------------|--------------------------------------------|-------------------------------------|
-| Android | `BuildScript.BuildAndroid`  | `BuildScript.BuildAndroidNoIncrement` | `BuildScript.BuildAndroidScriptsOnlyIncrement` | `BuildScript.BuildAndroidScriptsOnly` |
-| iOS     | `BuildScript.BuildiOS`      | `BuildScript.BuildiOSNoIncrement`     | `BuildScript.BuildiOSScriptsOnlyIncrement`     | `BuildScript.BuildiOSScriptsOnly`     |
+- **Auto-increment** (top bar +/− toggle)
+- **Scripts Only**   (top bar fast-forward toggle)
+- **AAB**            (project context menu → *Build AAB (Google Play)*)
+
+| Target  | Full, incr.                 | Full, no-incr.                      | Scripts Only, incr.                            | Scripts Only, no-incr.                | AAB, incr.                              | AAB, no-incr.                  |
+|---------|-----------------------------|-------------------------------------|------------------------------------------------|---------------------------------------|-----------------------------------------|--------------------------------|
+| Android | `BuildScript.BuildAndroid`  | `BuildScript.BuildAndroidNoIncrement` | `BuildScript.BuildAndroidScriptsOnlyIncrement` | `BuildScript.BuildAndroidScriptsOnly` | `BuildScript.BuildAndroidAABIncrement`  | `BuildScript.BuildAndroidAAB`  |
+| iOS     | `BuildScript.BuildiOS`      | `BuildScript.BuildiOSNoIncrement`     | `BuildScript.BuildiOSScriptsOnlyIncrement`     | `BuildScript.BuildiOSScriptsOnly`     | (n/a)                                   | (n/a)                          |
 
 **Scripts Only** (`BuildOptions.BuildScriptsOnly`) rebuilds just the C#
 assemblies and patches them into the existing player bundle — skipping
@@ -145,71 +149,15 @@ IL2CPP, asset importing, shader compilation, Gradle/Xcode packaging.
 Typical iteration: 10-15× faster than a clean build. Only usable after
 a full build has produced a bundle at the same `locationPathName`.
 
+**AAB** (`EditorUserBuildSettings.buildAppBundle = true`) produces a
+Google Play app bundle (`.aab`) instead of a sideload-ready APK. Mutually
+exclusive with Scripts Only — UBD ignores the Scripts Only toggle when
+AAB is requested. Android-only.
+
 Android and iOS build numbers are incremented **independently** —
 `PlayerSettings.Android.bundleVersionCode` vs `PlayerSettings.iOS.buildNumber`.
 UBD reads both from `ProjectSettings.asset` and shows them in the project
 row (e.g. `v1.0.0 · iOS 325 / A 452`).
-
-```csharp
-using UnityEditor;
-using UnityEditor.Build.Reporting;
-using System.Linq;
-
-public static class BuildScript {
-    private static string[] GetScenes() =>
-        EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
-
-    private static void RunBuild(BuildPlayerOptions options) {
-        var report = BuildPipeline.BuildPlayer(options);
-        if (report.summary.result == BuildResult.Succeeded)
-            UnityEngine.Debug.Log("[Build] OK");
-        else {
-            UnityEngine.Debug.LogError("[Build] FAILED");
-            EditorApplication.Exit(1);
-        }
-    }
-
-    // ── Android ──
-    [MenuItem("Build/Android APK")]
-    public static void BuildAndroid() => DoBuildAndroid(true);
-    public static void BuildAndroidNoIncrement() => DoBuildAndroid(false);
-    [MenuItem("Build/Android APK (Scripts Only)")]
-    public static void BuildAndroidScriptsOnly() => DoBuildAndroid(false, scriptsOnly: true);
-    public static void BuildAndroidScriptsOnlyIncrement() => DoBuildAndroid(true, scriptsOnly: true);
-
-    private static void DoBuildAndroid(bool increment, bool scriptsOnly = false) {
-        if (increment) PlayerSettings.Android.bundleVersionCode++;
-        EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
-        RunBuild(new BuildPlayerOptions {
-            scenes = GetScenes(),
-            locationPathName = "Builds/MyApp",
-            target = BuildTarget.Android,
-            options = scriptsOnly ? BuildOptions.BuildScriptsOnly : BuildOptions.None
-        });
-    }
-
-    // ── iOS ──
-    [MenuItem("Build/iOS Xcode")]
-    public static void BuildiOS() => DoBuildiOS(true);
-    public static void BuildiOSNoIncrement() => DoBuildiOS(false);
-    [MenuItem("Build/iOS Xcode (Scripts Only)")]
-    public static void BuildiOSScriptsOnly() => DoBuildiOS(false, scriptsOnly: true);
-    public static void BuildiOSScriptsOnlyIncrement() => DoBuildiOS(true, scriptsOnly: true);
-
-    private static void DoBuildiOS(bool increment, bool scriptsOnly = false) {
-        if (increment) {
-            int current = int.TryParse(PlayerSettings.iOS.buildNumber, out var n) ? n : 0;
-            PlayerSettings.iOS.buildNumber = (current + 1).ToString();
-        }
-        RunBuild(new BuildPlayerOptions {
-            scenes = GetScenes(),
-            locationPathName = "Builds/iOS",
-            target = BuildTarget.iOS,
-            options = scriptsOnly ? BuildOptions.BuildScriptsOnly : BuildOptions.None
-        });
-    }
-}
-```
 
 ## Install as GNOME app
 

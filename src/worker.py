@@ -6,7 +6,7 @@ from .config import find_apk, get_unity_for_project, APP_DIR
 
 
 class BuildWorker:
-    def __init__(self, cfg, project, target, log_cb, done_cb, stage_cb, auto_increment=True, log_bulk_cb=None, scripts_only=False):
+    def __init__(self, cfg, project, target, log_cb, done_cb, stage_cb, auto_increment=True, log_bulk_cb=None, scripts_only=False, aab=False):
         self.cfg = cfg
         self.unity = get_unity_for_project(cfg, project)
         self.project = project
@@ -17,6 +17,7 @@ class BuildWorker:
         self.stage_cb = stage_cb
         self.auto_increment = auto_increment
         self.scripts_only = scripts_only
+        self.aab = aab
         self.process = None
         self.cancelled = False
         self.start_time = None
@@ -62,7 +63,8 @@ class BuildWorker:
     def _run(self):
         path = self.project["path"]
         info = TARGET_INFO[self.target]
-        method = resolve_build_method(info["method"], self.auto_increment, self.scripts_only)
+        method = resolve_build_method(info["method"], self.auto_increment,
+                                      self.scripts_only, aab=self.aab)
         build_target = "Android" if self.target == "android" else "iOS"
         cmd = [self.unity, "-quit", "-batchmode",
                "-buildTarget", build_target,        # pre-set target, skip platform switch
