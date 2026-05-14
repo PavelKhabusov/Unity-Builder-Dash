@@ -24,9 +24,34 @@ def _adb(*args, device=None, timeout=15):
         return False, "", str(e)
 
 
-def _parse_devices():
-    """Parse `adb devices -l` output into list of dicts."""
-    ok, out, _ = _adb("devices", "-l")
+def _adb_daemon_alive(timeout=2):
+    """Cheap probe: 0 exit on `adb get-state` (with no -s) means client
+    could reach the server. Returns True/False, doesn't auto-start it."""
+    try:
+        # `adb devices` triggers auto-start; we want pure "is it up?". Use
+        # `nc -z` on port 5037? Simpler: run with ANDROID_ADB_SERVER_START=0
+        # so the client fails fast instead of forking a daemon. Available
+        # on adb >= 28.0 (platform-tools).
+        env = dict(os.environ); env["ANDROID_ADB_SERVER_START"] = "0"
+        r = subprocess.run(["adb", "devices"], capture_output=True,
+                           text=True, timeout=timeout, env=env)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _parse_devices(timeout=5):
+    """Parse `adb devices -l` output into list of dicts.
+
+    Default timeout dropped from 15s to 5s — `adb devices -l` returns in
+    ~50ms when the daemon's up. A 15s wait was masking the symptom of a
+    stalled daemon (post-build kill-server) and blocking polling for
+    seconds on each tick."""
+    ok, out, _ = _adb("devices", "-l", timeout=timeout)
+    # First call after a kill-server prints daemon-startup chatter to stderr
+    # and exits 0 — treat that as "daemon up" even though it took a couple
+    # of seconds. Caller can use _adb_daemon_alive() if it needs a finer
+    # check.
     if not ok:
         return []
     devices = []
@@ -168,6 +193,16 @@ class DevicesPage(Gtk.Box):
         kill_mtp.connect("clicked", self._on_kill_mtp)
         top.append(kill_mtp)
 
+        # ADB daemon state indicator — updated by every poll tick. Distinguishes
+        # "daemon up, no devices" from "daemon down" so the user can see when
+        # a build's kill-server left things in a bad state. Click to force
+        # `adb start-server` without nuking the daemon (unlike "Restart ADB").
+        self._adb_state_lbl = Gtk.Button(label="● ADB ?", css_classes=["flat", "dim-label"],
+                                          tooltip_text="ADB daemon state (click to start)")
+        self._adb_state_lbl.connect("clicked", self._on_adb_state_clicked)
+        top.append(self._adb_state_lbl)
+        self._adb_state = None  # None / "up" / "down" / "starting"
+
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         top.append(spacer)
@@ -253,11 +288,25 @@ class DevicesPage(Gtk.Box):
         self.add_controller(drop)
         self._logcat_pkg_pids = {}  # pkg -> set of pids
 
+        # Auto-poll device presence while this page is visible. Plug/unplug
+        # is detected within ~3s without the user having to click refresh.
+        # Tied to window-level start/stop_polling() calls from
+        # _on_sidebar_selected so we don't churn adb in the background when
+        # the user is on a different tab.
+        self._poll_timer = None
+        self._last_device_ids = None  # None = "haven't probed yet"
+
     def _stop_logcat(self):
         """Stop logcat stream and hide panel."""
         proc = self._logcat_proc
         self._logcat_proc = None
         self._logcat_dev = None
+        self._logcat_filter_pkg = None
+        self._logcat_filter_pids = set()
+        t = getattr(self, "_logcat_pid_timer", None)
+        if t is not None:
+            GLib.source_remove(t)
+            self._logcat_pid_timer = None
         if proc:
             try: proc.kill()
             except: pass
@@ -276,7 +325,12 @@ class DevicesPage(Gtk.Box):
         self._status.set_text("Scanning...")
         def do_scan():
             try:
+                alive = _adb_daemon_alive(timeout=1)
+                GLib.idle_add(self._set_adb_state, "up" if alive else "down")
                 devs = _parse_devices()
+                # After _parse_devices the daemon is definitely up (it
+                # auto-spawns on first call). Reflect that.
+                GLib.idle_add(self._set_adb_state, "up")
                 for dev in devs:
                     if dev["state"] == "device":
                         dev["running_apps"] = _get_running_apps(dev["id"])
@@ -284,10 +338,97 @@ class DevicesPage(Gtk.Box):
                     else:
                         dev["running_apps"] = []
                         dev["installed_apps"] = []
+                # Remember the set so the lightweight poller can decide if
+                # anything actually changed and skip the heavy re-render.
+                self._last_device_ids = {(d["id"], d["state"]) for d in devs}
                 GLib.idle_add(self._update_list, devs)
             finally:
                 self._refresh_running = False
         threading.Thread(target=do_scan, daemon=True).start()
+
+    def start_polling(self):
+        """Begin background plug/unplug detection. Called when this page
+        becomes the active tab. Cheap — `adb devices -l` only; full refresh
+        (running apps + packages per device) fires only when the device set
+        actually changes."""
+        if self._poll_timer is not None:
+            return
+        # Kick an immediate scan so the user sees current state without
+        # waiting for the first 3s tick. refresh() is idempotent and uses
+        # _refresh_running so the immediate + scheduled call don't race.
+        self.refresh()
+        self._poll_timer = GLib.timeout_add_seconds(3, self._poll_devices)
+
+    def stop_polling(self):
+        if self._poll_timer is not None:
+            GLib.source_remove(self._poll_timer)
+            self._poll_timer = None
+
+    def _poll_devices(self):
+        """Lightweight presence check. Runs adb devices -l in a worker
+        thread; if the (id, state) set differs from the last full refresh,
+        triggers refresh() to re-render with up-to-date app/package data."""
+        if getattr(self, "_refresh_running", False):
+            return True  # already scanning — skip this tick
+        # Skip polling while a build is running. worker.py / test runner
+        # both `adb kill-server` at build start; polling against a stalled
+        # daemon racks up multi-second timeouts and makes the UI feel laggy.
+        # The build's _on_done callback restores the daemon and the next
+        # tick (≤3s later) picks up the device again.
+        win = self.get_root()
+        if win and getattr(win, "worker", None) is not None:
+            GLib.idle_add(self._set_adb_state, "paused")
+            return True
+        def probe():
+            alive = _adb_daemon_alive(timeout=1)
+            new_state = "up" if alive else "down"
+            try:
+                devs = _parse_devices(timeout=3) if alive else []
+            except Exception:
+                devs = []
+            ids = {(d["id"], d["state"]) for d in devs}
+            def react():
+                self._set_adb_state(new_state)
+                if ids != self._last_device_ids:
+                    self.refresh()
+                return False
+            GLib.idle_add(react)
+        threading.Thread(target=probe, daemon=True).start()
+        return True
+
+    def _set_adb_state(self, state):
+        """Update the toolbar ADB indicator. `state` is one of
+        up / down / starting / paused. No-op if state is unchanged."""
+        if state == self._adb_state:
+            return
+        self._adb_state = state
+        labels = {
+            "up":       ("● ADB up",       "success",   "ADB daemon running"),
+            "down":     ("● ADB down",     "error",     "ADB daemon not running — click to start"),
+            "starting": ("● ADB starting", "warning",   "ADB daemon starting up..."),
+            "paused":   ("● ADB (build)",  "dim-label", "Polling paused while build runs"),
+        }
+        text, css, tip = labels.get(state, ("● ADB ?", "dim-label", ""))
+        self._adb_state_lbl.set_label(text)
+        for c in ("success", "error", "warning", "dim-label"):
+            self._adb_state_lbl.remove_css_class(c)
+        self._adb_state_lbl.add_css_class(css)
+        self._adb_state_lbl.set_tooltip_text(tip)
+
+    def _on_adb_state_clicked(self, _btn):
+        """Click handler — fire `adb start-server` and re-probe. Soft
+        recovery without the `Restart ADB` button's destructive kill-then-
+        start cycle."""
+        self._set_adb_state("starting")
+        def do_start():
+            try:
+                subprocess.run(["adb", "start-server"], timeout=5,
+                               capture_output=True)
+            except Exception:
+                pass
+            # Probe right after — refreshes label + reloads device list.
+            GLib.idle_add(self._poll_devices)
+        threading.Thread(target=do_start, daemon=True).start()
 
     def _update_list(self, devices):
         self._devices = devices
@@ -903,13 +1044,20 @@ class DevicesPage(Gtk.Box):
         self._start_logcat_stream(dev)
 
     def _start_logcat_stream(self, dev):
-        """Start or restart logcat process, optionally filtered by app."""
-        # Kill previous
+        """Start or restart logcat. Filter-by-app uses client-side PID
+        matching with a background poller that refreshes the PID set every
+        2s — survives app restart (new PID picked up) and lets us catch
+        lines from an app that wasn't running when logcat attached."""
+        # Kill previous + stop previous PID poller
         proc = self._logcat_proc
         self._logcat_proc = None
         if proc:
             try: proc.kill()
             except: pass
+        t = getattr(self, "_logcat_pid_timer", None)
+        if t is not None:
+            GLib.source_remove(t)
+            self._logcat_pid_timer = None
 
         self._logcat_view.clear()
 
@@ -917,22 +1065,31 @@ class DevicesPage(Gtk.Box):
         idx = self._logcat_app_filter.get_selected()
         installed = dev.get("installed_apps", [])
         selected_pkg = installed[idx - 1] if idx > 0 and idx - 1 < len(installed) else None
+        self._logcat_filter_pkg = selected_pkg
+        self._logcat_filter_pids = set()
+
+        if selected_pkg:
+            # Initial PID snapshot (runs synchronously on the GTK thread — it's
+            # one cheap adb call; we want the user to see filtered lines from
+            # the first one if the app's already running).
+            self._refresh_logcat_pids(dev["id"])
+            if not self._logcat_filter_pids:
+                GLib.idle_add(self._logcat_view.append_line,
+                              f"⏳ Waiting for {selected_pkg} to start...\n")
+            # Re-probe pidof every 2s so app restart / new child processes are
+            # picked up without restarting logcat.
+            def _tick(dev_id=dev["id"], pkg=selected_pkg):
+                if self._logcat_filter_pkg != pkg or self._logcat_proc is None:
+                    return False
+                threading.Thread(
+                    target=lambda: self._refresh_logcat_pids(dev_id),
+                    daemon=True).start()
+                return True
+            self._logcat_pid_timer = GLib.timeout_add_seconds(2, _tick)
 
         def reader_thread():
             try:
                 cmd = ["adb", "-s", dev["id"], "logcat", "-v", "threadtime"]
-
-                # If filtering by app, get its PID(s) first
-                if selected_pkg:
-                    ok, pidof_out, _ = _adb("shell", "pidof", selected_pkg, device=dev["id"])
-                    if ok and pidof_out.strip():
-                        pids = pidof_out.strip().split()
-                        for pid in pids:
-                            cmd += ["--pid", pid]
-                    else:
-                        GLib.idle_add(self._logcat_view.append_line,
-                                      f"App {selected_pkg} not running, showing all\n")
-
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1)
@@ -960,6 +1117,21 @@ class DevicesPage(Gtk.Box):
                 for line in proc.stdout:
                     if self._logcat_proc is None:
                         break
+                    # Client-side app filter. PID is the 3rd whitespace token
+                    # of `-v threadtime` lines:
+                    #   "MM-DD HH:MM:SS.mmm  PID  TID  LEVEL TAG: MSG"
+                    # When no app filter is active (_logcat_filter_pkg is None)
+                    # everything passes through.
+                    if self._logcat_filter_pkg:
+                        parts = line.split(None, 4)
+                        if len(parts) >= 4:
+                            pid = parts[2]
+                            if pid not in self._logcat_filter_pids:
+                                continue
+                        else:
+                            # Non-conforming line (probably logcat banner) —
+                            # let it through so users see startup output.
+                            pass
                     pending.append(line)
                     if _t.monotonic() - last_flush[0] >= 0.05:
                         flush()
@@ -968,6 +1140,36 @@ class DevicesPage(Gtk.Box):
                 GLib.idle_add(self._logcat_view.append_line, f"Error: {e}\n")
 
         threading.Thread(target=reader_thread, daemon=True).start()
+
+    def _refresh_logcat_pids(self, dev_id):
+        """Update _logcat_filter_pids for the current _logcat_filter_pkg.
+        `pidof -s` returns single PID, plain `pidof` returns all matching —
+        Quest's BusyBox pidof emits space-separated PIDs for processes with
+        the same package (rare but possible: app + isolated service). Also
+        scan `ps` for child processes whose comm starts with the package."""
+        pkg = self._logcat_filter_pkg
+        if not pkg:
+            return
+        new_pids = set()
+        ok, out, _ = _adb("shell", "pidof", pkg, device=dev_id, timeout=5)
+        if ok and out.strip():
+            new_pids.update(out.strip().split())
+        # Fallback / supplement: scan `ps` for processes whose name contains
+        # the package (covers package:childN sub-processes some apps spawn).
+        ok2, ps_out, _ = _adb("shell", "ps", "-A", "-o", "PID,NAME",
+                              device=dev_id, timeout=5)
+        if ok2:
+            for ln in ps_out.splitlines():
+                p = ln.strip().split(None, 1)
+                if len(p) == 2 and pkg in p[1]:
+                    new_pids.add(p[0])
+        # Detect newly appeared PIDs (app just launched).
+        was_empty = not self._logcat_filter_pids
+        appeared = new_pids - self._logcat_filter_pids
+        self._logcat_filter_pids = new_pids
+        if was_empty and appeared:
+            GLib.idle_add(self._logcat_view.append_line,
+                          f"▶ {pkg} started (PID {', '.join(sorted(appeared))})\n")
 
     def _on_files(self, dev):
         """Open native file manager via MTP or adb pull to tmp."""

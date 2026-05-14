@@ -395,13 +395,23 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._log_toggle.set_visible(is_projects)
         self._settings_save_btn.set_visible(page_id == "settings")
 
-        # Refresh data on page switch
+        # Refresh data on page switch + start/stop background adb polling.
+        # Polling auto-detects plug/unplug while the page is visible — no
+        # manual refresh required — and stops the moment the user leaves
+        # the tab so we don't churn adb in the background.
         if page_id == "history":
             self._history_page.refresh()
+            self._devices_page.stop_polling()
+            self._profiler_page.stop_polling()
         elif page_id == "devices":
-            self._devices_page.refresh()
+            self._devices_page.start_polling()
+            self._profiler_page.stop_polling()
         elif page_id == "profiler":
-            self._profiler_page.refresh()
+            self._profiler_page.start_polling()
+            self._devices_page.stop_polling()
+        else:
+            self._devices_page.stop_polling()
+            self._profiler_page.stop_polling()
 
     # ── Projects page ──
 
@@ -1710,10 +1720,6 @@ class BuilderWindow(Adw.ApplicationWindow):
         if platform == "EditMode":
             cmd.insert(2, "-nographics")
 
-        # Kill adb server to avoid conflicts
-        try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
-        except: pass
-
         lock = os.path.join(proj["path"], "Temp", "UnityLockfile")
         if os.path.exists(lock):
             os.remove(lock)
@@ -1723,6 +1729,13 @@ class BuilderWindow(Adw.ApplicationWindow):
             "Data/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb")
         adb_hidden = unity_adb + ".disabled"
         adb_was_hidden = False
+        # Same logic as the build worker: kill the system adb daemon only
+        # when Unity's adb isn't hidden (hide_adb=False). If we're about to
+        # hide Unity's adb anyway, there's nothing to conflict with — leave
+        # the daemon up so device-tab polling stays responsive.
+        if not proj.get("hide_adb"):
+            try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
+            except: pass
         if proj.get("hide_adb") and os.path.exists(unity_adb):
             try:
                 os.rename(unity_adb, adb_hidden)
@@ -1733,6 +1746,13 @@ class BuilderWindow(Adw.ApplicationWindow):
             if adb_was_hidden and not os.path.exists(unity_adb) and os.path.exists(adb_hidden):
                 try: os.rename(adb_hidden, unity_adb)
                 except: pass
+            # Restart the system adb daemon. The previous version only
+            # un-hid Unity's adb file but never brought the daemon back —
+            # so after every test run the device tab had to pay a 1-2s
+            # cold-start on the next `adb devices -l`. start-server is a
+            # no-op if the daemon's already alive.
+            try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
+            except: pass
 
         # Log file
         import datetime as _dt

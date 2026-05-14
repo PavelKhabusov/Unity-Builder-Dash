@@ -397,11 +397,51 @@ class ProfilerPage(Gtk.Box):
             self._refresh_devices()
         # Don't refresh if already running — would reset selection
 
+    def start_polling(self):
+        """Auto-detect plug/unplug while the profiler page is visible.
+        Cheap — only re-renders the device dropdown when the ID set changes,
+        so the user's selected device/app isn't reset on every tick."""
+        if getattr(self, "_poll_timer", None) is not None:
+            return
+        self._last_device_ids = None
+        # Trigger the first scan immediately so users get a refresh on each
+        # visit (previously only fired once via _initialized).
+        self._refresh_devices()
+        self._poll_timer = GLib.timeout_add_seconds(3, self._poll_devices)
+
+    def stop_polling(self):
+        t = getattr(self, "_poll_timer", None)
+        if t is not None:
+            GLib.source_remove(t)
+            self._poll_timer = None
+
+    def _poll_devices(self):
+        # Skip polling while a build is running — the build's adb kill-server
+        # would make our probe time out and freeze the UI for seconds.
+        win = self.get_root()
+        if win and getattr(win, "worker", None) is not None:
+            return True
+        def probe():
+            try:
+                devs = _parse_devices_simple()
+            except Exception:
+                return
+            ids = {d["id"] for d in devs}
+            def react():
+                if ids != getattr(self, "_last_device_ids", None):
+                    self._last_device_ids = ids
+                    self._update_devices(devs)
+                return False
+            GLib.idle_add(react)
+        threading.Thread(target=probe, daemon=True).start()
+        return True
+
     def _refresh_devices(self):
         # Save current selection
         self._save_selection()
         def do_scan():
             devs = _parse_devices_simple()
+            self._last_device_ids = {d["id"] for d in devs}
             GLib.idle_add(self._update_devices, devs)
         threading.Thread(target=do_scan, daemon=True).start()
 

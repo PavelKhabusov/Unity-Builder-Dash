@@ -95,8 +95,13 @@ class BuildWorker:
                     os.rename(unity_adb, adb_hidden)
                     adb_was_hidden = True
             except: pass
-        try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
-        except: pass
+        # Kill system adb ONLY when Unity's own adb is in play (hide_adb=False).
+        # If we hid Unity's adb above, there's no conflict — system adb can
+        # keep running through the build, and UBD's device-tab polling won't
+        # eat 2s cold-start penalties on every other tick.
+        if not hide_adb:
+            try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
+            except: pass
 
         GLib.idle_add(self.log_cb, f"  {path}\n\n")
 
