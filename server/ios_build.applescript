@@ -307,21 +307,22 @@ if isinstance(sm, dict):
 	end try
 
 	-- Patch Podfile post_install:
-	--   IPHONEOS_DEPLOYMENT_TARGET=12.0 — silence old-target warnings from legacy pods
+	--   IPHONEOS_DEPLOYMENT_TARGET=15.0 — FirebaseAuth/Analytics требуют iOS 13+; ставим 15.0
+	--     потому что Unity тоже ставит 15.0 (см. ProjectSettings.iOSTargetOSVersionString).
 	--   ENABLE_USER_SCRIPT_SANDBOXING=NO — Xcode 15+ sandboxing breaks gRPC-Core
 	--     libtool step with "Command Libtool failed with a nonzero exit code";
 	--     gRPC's header-symlink script phase can't write inside the sandbox.
 	--   ALWAYS_OUT_OF_DATE=YES on script phases — silences Xcode's
 	--     "Run script build phase will be run during every build" warnings
 	--     emitted for Unity's GameAssembly + gRPC/BoringSSL/abseil.
-	-- Versioned marker ("# ubd-post-install v2") lets us re-patch when we
+	-- Versioned marker ("# ubd-post-install v4") lets us re-patch when we
 	-- add settings in a newer version without duplicating the block.
 	set podfilePatch to "
-# ubd-post-install v3
+# ubd-post-install v4
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     target.build_configurations.each do |config|
-      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
       config.build_settings['ENABLE_USER_SCRIPT_SANDBOXING'] = 'NO'
       config.build_settings['ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES'] = 'NO'
       config.build_settings['ENABLE_APP_SHORTCUTS_FLEXIBLE_MATCHING'] = 'NO'
@@ -353,9 +354,11 @@ open(p,'w').write(s.rstrip() + '\\n')
 
 	tell application "Terminal"
 		activate
-		do script my nccmd("cd {{WORK_DIR}}/iOS && pod install")
+		-- touch sentinel когда pod install реально завершился, чтобы дальше polling-ом дождаться
+		do script my nccmd("cd {{WORK_DIR}}/iOS && rm -f /tmp/ubd_pod_done && pod install; touch /tmp/ubd_pod_done")
 	end tell
-	delay 25
+	-- Ждём pod install до 10 минут, потом сдаёмся (раньше был тупой delay 25 → обрезалось при долгих pod install).
+	do shell script "for i in $(seq 1 600); do [ -f /tmp/ubd_pod_done ] && exit 0; sleep 1; done; exit 1"
 
 	tell application "Terminal"
 		close windows

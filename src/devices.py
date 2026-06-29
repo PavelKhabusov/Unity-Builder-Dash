@@ -1,5 +1,5 @@
 """Device manager page — ADB device management UI."""
-import os, re, subprocess, threading
+import os, re, socket, subprocess, threading
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 from .log_view import LogView
 from . import ios_remote
@@ -24,20 +24,121 @@ def _adb(*args, device=None, timeout=15):
         return False, "", str(e)
 
 
-def _adb_daemon_alive(timeout=2):
-    """Cheap probe: 0 exit on `adb get-state` (with no -s) means client
-    could reach the server. Returns True/False, doesn't auto-start it."""
+def _adb_daemon_alive(timeout=0.5):
+    """Pure TCP probe to 127.0.0.1:5037 (adb server socket). Returns True
+    if a daemon is listening, False otherwise — no auto-start side effect
+    (unlike `adb devices` which forks a daemon on miss), no env-var hacks
+    (ANDROID_ADB_SERVER_START is undocumented and not honored on the
+    Arch platform-tools build), and instant — ~1ms either way."""
     try:
-        # `adb devices` triggers auto-start; we want pure "is it up?". Use
-        # `nc -z` on port 5037? Simpler: run with ANDROID_ADB_SERVER_START=0
-        # so the client fails fast instead of forking a daemon. Available
-        # on adb >= 28.0 (platform-tools).
-        env = dict(os.environ); env["ANDROID_ADB_SERVER_START"] = "0"
-        r = subprocess.run(["adb", "devices"], capture_output=True,
-                           text=True, timeout=timeout, env=env)
-        return r.returncode == 0
+        with socket.create_connection(("127.0.0.1", 5037), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def _find_stuck_adb_clients(min_age_seconds=30):
+    """Return labels of `adb` client processes (push/pull/shell/logcat/
+    install) that have been running longer than min_age_seconds. A long
+    push is normal; a multi-minute one usually means the daemon wedged
+    mid-command. `ps -o pid,etimes,args` gives elapsed time in seconds."""
+    stuck = []
+    try:
+        r = subprocess.run(
+            ["ps", "-eo", "pid,etimes,args"],
+            capture_output=True, text=True, timeout=2)
+        if r.returncode != 0:
+            return stuck
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, etimes, cmd = parts
+            if not cmd.startswith("adb "):
+                continue
+            # Skip server itself, only count clients waiting on the daemon.
+            if "fork-server" in cmd or "start-server" in cmd:
+                continue
+            # Filter to commands that block on the daemon.
+            if not any(x in cmd for x in (
+                    " push ", " pull ", " install ", " shell ",
+                    " logcat", " devices")):
+                continue
+            try:
+                if int(etimes) < min_age_seconds:
+                    continue
+            except ValueError:
+                continue
+            stuck.append(f"pid {pid} ({int(etimes)}s): {cmd[:60]}")
+    except Exception:
+        pass
+    return stuck
+
+
+def _usb_has_android_device():
+    """True if `lsusb` shows a known Android / VR device VID. Used to
+    detect the MTP-conflict case: device physically connected but adb
+    sees zero — usually gvfsd-mtp / gvfsd-gphoto2 grabbed it first."""
+    try:
+        r = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=2)
+        if r.returncode != 0:
+            return False
+        # Common Android USB vendor IDs:
+        #   18d1 Google Pixel/Nexus    04e8 Samsung    2833 Oculus/Meta
+        #   2717 Xiaomi                12d1 Huawei     0bb4 HTC
+        #   22b8 Motorola
+        return any(vid in r.stdout.lower() for vid in (
+            "18d1", "04e8", "2833", "2717", "12d1", "0bb4", "22b8"))
     except Exception:
         return False
+
+
+def _probe_adb_health():
+    """Single-shot health probe for the toolbar indicator.
+
+    Returns a dict with: alive, responsive, device_count, stuck (list of
+    descriptors), usb_present (USB shows an Android device), _devices."""
+    info = {"alive": False, "responsive": False, "device_count": 0,
+            "stuck": [], "usb_present": False, "_devices": []}
+    info["alive"] = _adb_daemon_alive(timeout=0.5)
+    if info["alive"]:
+        try:
+            r = subprocess.run(["adb", "devices", "-l"],
+                               capture_output=True, text=True, timeout=2)
+            info["responsive"] = (r.returncode == 0)
+            if info["responsive"]:
+                # Reuse _parse_devices output format via the same parser by
+                # feeding it our own quick call (avoid double timeout cost).
+                devs = []
+                for line in r.stdout.strip().splitlines()[1:]:
+                    line = line.strip()
+                    if not line or "List of" in line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    props = {}
+                    for p in parts[2:]:
+                        if ":" in p:
+                            k, v = p.split(":", 1)
+                            props[k] = v
+                    devs.append({
+                        "id": parts[0], "state": parts[1],
+                        "model": props.get("model", "?"),
+                        "product": props.get("product", "?"),
+                        "transport_id": props.get("transport_id", "?"),
+                        "wireless": ":" in parts[0],
+                    })
+                info["_devices"] = devs
+                info["device_count"] = sum(
+                    1 for d in devs if d["state"] == "device")
+        except subprocess.TimeoutExpired:
+            info["responsive"] = False
+        except Exception:
+            info["responsive"] = False
+    info["stuck"] = _find_stuck_adb_clients()
+    info["usb_present"] = _usb_has_android_device()
+    return info
 
 
 def _parse_devices(timeout=5):
@@ -171,50 +272,59 @@ class DevicesPage(Gtk.Box):
         self._cfg = cfg or {}
         self._mac_online = None  # None=unknown, True=ok, False=offline
 
-        # ── Top bar: refresh + connect ──
+        # ── Top bar ──
+        # Drastically simplified: just the ADB state indicator + a kebab
+        # popover for the rarely-used wireless `adb connect` flow. There's
+        # no Refresh button — auto-poll picks up plug/unplug within 3s.
+        # No Restart ADB / Kill MTP buttons — those recoveries fire from
+        # the polling loop automatically when the indicator detects the
+        # corresponding bad state.
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.set_margin_top(8)
         top.set_margin_start(12)
         top.set_margin_end(12)
         top.set_margin_bottom(4)
 
-        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic",
-                                 tooltip_text="Refresh devices")
-        refresh_btn.connect("clicked", lambda _: self.refresh())
-        top.append(refresh_btn)
-
-        restart_btn = Gtk.Button(icon_name="system-reboot-symbolic",
-                                 tooltip_text="Restart ADB server")
-        restart_btn.add_css_class("destructive-action")
-        restart_btn.connect("clicked", self._on_restart_adb)
-        top.append(restart_btn)
-
-        kill_mtp = Gtk.Button(label="Kill MTP", tooltip_text="Kill gvfsd-mtp/gphoto2 conflicts")
-        kill_mtp.connect("clicked", self._on_kill_mtp)
-        top.append(kill_mtp)
-
-        # ADB daemon state indicator — updated by every poll tick. Distinguishes
-        # "daemon up, no devices" from "daemon down" so the user can see when
-        # a build's kill-server left things in a bad state. Click to force
-        # `adb start-server` without nuking the daemon (unlike "Restart ADB").
+        # ADB state indicator. Polling auto-detects daemon problems and
+        # recovers in the background:
+        #   down         → adb start-server
+        #   wedged       → pkill -9 adb fork-server + start-server
+        #   mtp_blocked  → killall gvfsd-mtp + start-server (frees USB
+        #                  endpoint when Files/Nautilus grabbed it via MTP)
+        #   stuck        → kill -9 the hung adb client pids
+        # Click bypasses the cooldown for immediate recovery.
         self._adb_state_lbl = Gtk.Button(label="● ADB ?", css_classes=["flat", "dim-label"],
-                                          tooltip_text="ADB daemon state (click to start)")
+                                          tooltip_text="ADB daemon state (click for immediate recovery)")
         self._adb_state_lbl.connect("clicked", self._on_adb_state_clicked)
         top.append(self._adb_state_lbl)
-        self._adb_state = None  # None / "up" / "down" / "starting"
+        self._adb_state = None
+        self._adb_recovery_at = {}  # state -> last auto-recovery timestamp
 
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         top.append(spacer)
 
+        # Wireless-ADB popover. `adb connect <ip>:5555` is niche (USB is
+        # the common path) — tucked behind one icon button so it doesn't
+        # clutter the bar.
+        wireless_btn = Gtk.MenuButton(icon_name="network-wireless-symbolic",
+                                       css_classes=["flat"],
+                                       tooltip_text="Wireless ADB (connect by IP)")
+        popover = Gtk.Popover()
+        pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                       margin_top=8, margin_bottom=8,
+                       margin_start=12, margin_end=12)
         self._ip_entry = Gtk.Entry(placeholder_text="192.168.1.x:5555")
         self._ip_entry.set_width_chars(20)
-        top.append(self._ip_entry)
-
+        pbox.append(self._ip_entry)
         connect_btn = Gtk.Button(label="Connect")
         connect_btn.add_css_class("suggested-action")
-        connect_btn.connect("clicked", self._on_connect)
-        top.append(connect_btn)
+        connect_btn.connect("clicked",
+            lambda b: (self._on_connect(b), popover.popdown()))
+        pbox.append(connect_btn)
+        popover.set_child(pbox)
+        wireless_btn.set_popover(popover)
+        top.append(wireless_btn)
 
         self.append(top)
 
@@ -365,30 +475,19 @@ class DevicesPage(Gtk.Box):
             self._poll_timer = None
 
     def _poll_devices(self):
-        """Lightweight presence check. Runs adb devices -l in a worker
-        thread; if the (id, state) set differs from the last full refresh,
-        triggers refresh() to re-render with up-to-date app/package data."""
+        """Lightweight presence check + ADB health probe."""
         if getattr(self, "_refresh_running", False):
-            return True  # already scanning — skip this tick
-        # Skip polling while a build is running. worker.py / test runner
-        # both `adb kill-server` at build start; polling against a stalled
-        # daemon racks up multi-second timeouts and makes the UI feel laggy.
-        # The build's _on_done callback restores the daemon and the next
-        # tick (≤3s later) picks up the device again.
+            return True
         win = self.get_root()
         if win and getattr(win, "worker", None) is not None:
             GLib.idle_add(self._set_adb_state, "paused")
             return True
         def probe():
-            alive = _adb_daemon_alive(timeout=1)
-            new_state = "up" if alive else "down"
-            try:
-                devs = _parse_devices(timeout=3) if alive else []
-            except Exception:
-                devs = []
+            info = _probe_adb_health()
+            devs = info.pop("_devices", [])
             ids = {(d["id"], d["state"]) for d in devs}
             def react():
-                self._set_adb_state(new_state)
+                self._set_adb_state(info)
                 if ids != self._last_device_ids:
                     self.refresh()
                 return False
@@ -396,19 +495,167 @@ class DevicesPage(Gtk.Box):
         threading.Thread(target=probe, daemon=True).start()
         return True
 
-    def _set_adb_state(self, state):
-        """Update the toolbar ADB indicator. `state` is one of
-        up / down / starting / paused. No-op if state is unchanged."""
-        if state == self._adb_state:
+    def _run_recovery(self, state, info):
+        """Background recovery actions per state. See `_set_adb_state`
+        docstring for state → action mapping."""
+        import time as _t
+        try:
+            if state == "down":
+                # If start-server times out, the OS-level USB stack is
+                # likely wedged (Quest in bad state after reboot, cable
+                # half-disconnected, etc.). Record that so the indicator
+                # can surface a more actionable "replug device" hint
+                # instead of looping silently on "down".
+                try:
+                    subprocess.run(["adb", "start-server"], timeout=5,
+                                   capture_output=True)
+                    self._adb_start_server_hung = False
+                except subprocess.TimeoutExpired:
+                    self._adb_start_server_hung = True
+                    # Kill the hung start-server so the next attempt isn't
+                    # blocked by its leftover process holding USB ioctls.
+                    subprocess.run(["pkill", "-9", "-f", "adb start-server"],
+                                   timeout=3, capture_output=True)
+            elif state == "wedged":
+                # Can't use `adb kill-server` — it tries to talk to the
+                # same wedged socket and hangs. pkill the fork-server
+                # process directly, then auto-spawn a fresh one.
+                subprocess.run(["pkill", "-9", "-f", "adb.*fork-server"],
+                               timeout=3, capture_output=True)
+                _t.sleep(0.3)
+                subprocess.run(["adb", "start-server"], timeout=5,
+                               capture_output=True)
+            elif state == "mtp_blocked":
+                # Frees the USB endpoint that gvfsd-mtp/gphoto2 holds.
+                # Files app's MTP browse breaks until next replug — fair
+                # trade for getting adb back.
+                for proc in ("gvfsd-mtp", "gvfsd-gphoto2"):
+                    subprocess.run(["killall", proc],
+                                   capture_output=True, timeout=2)
+                _t.sleep(0.5)
+                subprocess.run(["adb", "kill-server"], timeout=3,
+                               capture_output=True)
+                _t.sleep(0.3)
+                subprocess.run(["adb", "start-server"], timeout=5,
+                               capture_output=True)
+            elif state == "stuck":
+                for line in info.get("stuck", []):
+                    # "pid <N> (<etimes>s): <cmd>"
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            subprocess.run(["kill", "-9", parts[1]],
+                                           timeout=2, capture_output=True)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # Trigger an immediate re-poll so the indicator updates.
+        def _one_shot():
+            self._poll_devices()
+            return False
+        GLib.idle_add(_one_shot)
+
+    def _set_adb_state(self, info):
+        """Update the toolbar ADB indicator from a state dict OR a string
+        state name for fast paths ("starting", "paused").
+
+        Dict keys:
+          alive:       bool  — TCP probe to 127.0.0.1:5037 succeeded
+          responsive:  bool  — `adb devices` returned within timeout
+          device_count int   — number of devices (only meaningful if responsive)
+          stuck:       list  — pids of long-running `adb push|pull|shell|logcat`
+                               client processes (indicates wedged commands)
+        """
+        # Fast-path string states: starting / paused. Keep simple, no probe.
+        if isinstance(info, str):
+            fast = {
+                "starting": ("● ADB starting", "warning",   "ADB daemon starting up..."),
+                "paused":   ("● ADB (build)",  "dim-label", "Polling paused while build runs"),
+            }
+            if info in fast:
+                text, css, tip = fast[info]
+                self._adb_state = info
+                # Invalidate the dedup signature — otherwise the next probe
+                # tick computing the SAME (state, count, stuck) tuple as
+                # before this fast-path call would skip the label update,
+                # freezing the indicator on "starting" forever.
+                self._adb_state_signature = None
+                self._render_adb_label(text, css, tip)
+                return
             return
-        self._adb_state = state
-        labels = {
-            "up":       ("● ADB up",       "success",   "ADB daemon running"),
-            "down":     ("● ADB down",     "error",     "ADB daemon not running — click to start"),
-            "starting": ("● ADB starting", "warning",   "ADB daemon starting up..."),
-            "paused":   ("● ADB (build)",  "dim-label", "Polling paused while build runs"),
-        }
-        text, css, tip = labels.get(state, ("● ADB ?", "dim-label", ""))
+
+        alive = info.get("alive", False)
+        responsive = info.get("responsive", False)
+        device_count = info.get("device_count", 0)
+        stuck = info.get("stuck", [])
+        usb_present = info.get("usb_present", False)
+        # Derive the logical state from the probe result.
+        if not alive:
+            new_state = "down"
+        elif not responsive:
+            new_state = "wedged"
+        elif stuck:
+            new_state = "stuck"
+        elif device_count > 0:
+            new_state = "ok"
+        elif usb_present:
+            # Daemon up, no devices, but USB shows an Android VID — most
+            # likely gvfsd-mtp / gvfsd-gphoto2 grabbed the USB endpoint
+            # before adb could.
+            new_state = "mtp_blocked"
+        else:
+            new_state = "empty"
+        # Avoid re-rendering when nothing changed — except on state-bearing
+        # subtleties (e.g. device count went from 0→1). Use a tuple cache.
+        signature = (new_state, device_count, len(stuck))
+        if getattr(self, "_adb_state_signature", None) == signature:
+            return
+        self._adb_state_signature = signature
+        self._adb_state = new_state
+
+        if new_state == "down":
+            if getattr(self, "_adb_start_server_hung", False):
+                text = "● ADB stuck (replug?)"
+                css = "error"
+                tip = ("`adb start-server` is hanging — the USB stack is "
+                       "wedged (common after a Quest reboot or a yanked\n"
+                       "cable). Unplug the device, wait a second, plug back\n"
+                       "in. Click here to retry the start.")
+            else:
+                text = "● ADB down"
+                css = "error"
+                tip = ("ADB daemon not listening on tcp:5037.\n"
+                       "Click to run `adb start-server`.")
+        elif new_state == "wedged":
+            text = "● ADB wedged"
+            css = "error"
+            tip = ("Daemon listens on tcp:5037 but `adb devices` times out — "
+                   "wedged state, normal kill-server can't recover.\n"
+                   "Click to force-kill the daemon process and restart it.")
+        elif new_state == "stuck":
+            text = f"● ADB up · {len(stuck)} stuck"
+            css = "warning"
+            tip = ("Daemon healthy but some adb client commands are stuck:\n  "
+                   + "\n  ".join(stuck) + "\n\nClick to kill stuck processes.")
+        elif new_state == "mtp_blocked":
+            text = "● ADB · MTP blocking"
+            css = "warning"
+            tip = ("USB shows an Android/VR device but adb sees nothing — "
+                   "gvfsd-mtp / gvfsd-gphoto2 likely grabbed the endpoint.\n"
+                   "Auto-recovery will killall the MTP services shortly; "
+                   "click to do it now.")
+        elif new_state == "ok":
+            text = f"● ADB up · {device_count} dev"
+            css = "success"
+            tip = f"ADB daemon healthy, {device_count} device(s) attached"
+        else:  # empty
+            text = "● ADB up · 0 dev"
+            css = "warning"
+            tip = "ADB daemon up but no devices attached"
+        self._render_adb_label(text, css, tip)
+
+    def _render_adb_label(self, text, css, tip):
         self._adb_state_lbl.set_label(text)
         for c in ("success", "error", "warning", "dim-label"):
             self._adb_state_lbl.remove_css_class(c)
@@ -416,19 +663,20 @@ class DevicesPage(Gtk.Box):
         self._adb_state_lbl.set_tooltip_text(tip)
 
     def _on_adb_state_clicked(self, _btn):
-        """Click handler — fire `adb start-server` and re-probe. Soft
-        recovery without the `Restart ADB` button's destructive kill-then-
-        start cycle."""
+        """Manual recovery trigger. Single-flight: if a recovery thread is
+        already running, ignore the click — otherwise spam-clicking
+        accumulates competing `adb start-server` processes that fight over
+        the USB stack and wedge the daemon for good."""
+        if getattr(self, "_recovery_in_flight", False):
+            return
+        state = self._adb_state or "down"
+        self._recovery_in_flight = True
         self._set_adb_state("starting")
-        def do_start():
-            try:
-                subprocess.run(["adb", "start-server"], timeout=5,
-                               capture_output=True)
-            except Exception:
-                pass
-            # Probe right after — refreshes label + reloads device list.
-            GLib.idle_add(self._poll_devices)
-        threading.Thread(target=do_start, daemon=True).start()
+        info = {"stuck": _find_stuck_adb_clients()} if state == "stuck" else {}
+        def do():
+            try: self._run_recovery(state, info)
+            finally: self._recovery_in_flight = False
+        threading.Thread(target=do, daemon=True).start()
 
     def _update_list(self, devices):
         self._devices = devices
@@ -927,19 +1175,6 @@ class DevicesPage(Gtk.Box):
             if on_done:
                 GLib.idle_add(on_done, ok)
         threading.Thread(target=worker, daemon=True).start()
-
-    def _on_restart_adb(self, _):
-        def do_restart():
-            _adb("kill-server")
-            return _adb("start-server")
-        self._run_async("Restart ADB", do_restart, lambda ok: self.refresh())
-
-    def _on_kill_mtp(self, _):
-        def do_kill():
-            for proc in ["gvfsd-mtp", "gvfsd-gphoto2"]:
-                subprocess.run(["killall", proc], capture_output=True)
-            return True, "Done", ""
-        self._run_async("Kill MTP", do_kill)
 
     def _on_connect(self, _):
         ip = self._ip_entry.get_text().strip()
