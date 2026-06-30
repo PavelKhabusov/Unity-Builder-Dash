@@ -3,7 +3,8 @@ import os, subprocess, threading
 from gi.repository import Gtk, Adw, GLib
 from .config import scan_project
 from .ios_remote import (get_devices, get_remote_cfg, test_connection,
-                         generate_ssh_key, copy_key_to_mac, install_mac_server)
+                         generate_ssh_key, copy_key_to_mac, install_mac_server,
+                         set_mac_keep_awake, get_mac_keep_awake)
 
 
 def show_scan(parent, proj):
@@ -209,6 +210,56 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     terminal_check.connect("toggled", _on_terminal_toggle)
     menu_box.append(terminal_check)
 
+    # Keep Mac awake — installs/removes a LaunchAgent running `caffeinate -i -s`
+    # so the Mac never idle-sleeps while it's a build host. REQUIRED for remote
+    # builds while away: an Apple Silicon MacBook on Wi-Fi+battery cannot be
+    # woken over the network (verified), so it must be kept awake BEFORE it
+    # sleeps. Enable this while the Mac is in front of you / awake, then leave.
+    keepawake_check = Gtk.CheckButton(label="Keep Mac awake (no sleep)",
+        margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
+    keepawake_check.set_tooltip_text(
+        "Stops the Mac from sleeping so remote builds keep working while you're "
+        "away. A sleeping Wi-Fi MacBook can't be woken over the network — "
+        "enable this before you step away. Screen still dims/locks normally.")
+    # Guard so programmatic set_active() (reflecting real Mac state) doesn't
+    # fire the SSH toggle handler and bounce the agent.
+    _ka_syncing = {"v": False}
+
+    def _on_keepawake_toggle(b):
+        if _ka_syncing["v"]:
+            return
+        enable = b.get_active()
+        b.set_sensitive(False)
+        popup_log("Enabling Mac keep-awake...\n" if enable
+                  else "Disabling Mac keep-awake...\n")
+        def _work():
+            ok = set_mac_keep_awake(get_remote_cfg(cfg), enable, popup_log)
+            def _settle():
+                _ka_syncing["v"] = True
+                # On failure, snap the checkbox back to the prior state.
+                if not ok:
+                    b.set_active(not enable)
+                _ka_syncing["v"] = False
+                b.set_sensitive(True)
+                return False
+            GLib.idle_add(_settle)
+        threading.Thread(target=_work, daemon=True).start()
+    keepawake_check.connect("toggled", _on_keepawake_toggle)
+    menu_box.append(keepawake_check)
+
+    # Reflect the Mac's actual keep-awake state on open (if reachable).
+    def _sync_keepawake():
+        state = get_mac_keep_awake(get_remote_cfg(cfg))
+        def _apply():
+            if state is not None:
+                _ka_syncing["v"] = True
+                keepawake_check.set_active(state)
+                _ka_syncing["v"] = False
+            return False
+        GLib.idle_add(_apply)
+    if remote.get("mac_ip") and remote.get("mac_auth") == "key":
+        threading.Thread(target=_sync_keepawake, daemon=True).start()
+
     menu_popover.set_child(menu_box)
     menu_btn.set_popover(menu_popover)
     header.pack_end(menu_btn)
@@ -411,6 +462,31 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     extra_row.set_child(extra_box)
     extra_grp.add(extra_row)
     page.append(extra_grp)
+
+    # ── Release (App Store) ──
+    # Run in order: Archive → Validate → Distribute. Each acts on the
+    # already-unpacked iOS/ project on the Mac (no Unity rebuild). Validate
+    # exports the .ipa that Distribute then uploads to App Store Connect.
+    rel_grp = Adw.PreferencesGroup(title="Release (App Store)")
+    rel_row = Adw.ActionRow()
+    rel_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                      valign=Gtk.Align.CENTER, hexpand=True, homogeneous=True,
+                      margin_top=6, margin_bottom=6,
+                      margin_start=12, margin_end=12)
+    for lbl, action_id, tip in [
+        ("Archive",    "archive_app",
+         "xcodebuild archive (Release, App Store signing) → .xcarchive"),
+        ("Validate",   "validate_app",
+         "Export .ipa from the archive and validate it against App Store Connect"),
+        ("Distribute", "distribute_app",
+         "Upload the exported .ipa to App Store Connect (TestFlight after processing)"),
+    ]:
+        b = Gtk.Button(label=lbl, tooltip_text=tip)
+        b.connect("clicked", lambda _w, a=action_id: _fire(a))
+        rel_box.append(b)
+    rel_row.set_child(rel_box)
+    rel_grp.add(rel_row)
+    page.append(rel_grp)
 
     content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     page.set_vexpand(True)

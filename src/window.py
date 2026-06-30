@@ -959,6 +959,13 @@ class BuilderWindow(Adw.ApplicationWindow):
         "clear_build":   (False, False, False, lambda _: "clearBuild",              "Clean build"),
         "update_pod":    (False, False, False, lambda _: "updatePod",               "Update Pod"),
         "open_xcode":    (False, False, False, lambda _: "openXcode",               "Open in Xcode"),
+        # Release pipeline (App Store). Each runs on the already-unpacked iOS/
+        # project on the Mac — no Unity rebuild, no re-zip. archive → validate →
+        # distribute, run in order. Validate exports the .ipa that distribute
+        # then uploads, so run Validate before Distribute.
+        "archive_app":   (False, False, False, lambda _: "archiveApp",              "Archive (App Store)"),
+        "validate_app":  (False, False, False, lambda _: "validateApp",             "Validate archive"),
+        "distribute_app":(False, False, False, lambda _: "distributeApp",           "Distribute to App Store"),
     }
 
     def _on_ios_action(self, proj, action_id, device_target):
@@ -1074,6 +1081,16 @@ class BuilderWindow(Adw.ApplicationWindow):
             except Exception as e:
                 GLib.idle_add(self._log, f"Zip failed: {e}\n")
                 ok = False
+
+        # Anything below talks to the Mac over SSH (scp / osascript). Wake it
+        # first — an Apple Silicon MacBook on Wi-Fi+battery sleeps with sshd
+        # down and won't wake from the network on its own, so a bare scp/ssh
+        # would just hang until timeout. wake_mac() hammers it awake and starts
+        # caffeinate so it can't doze off mid-build.
+        if ok and (needs_scp or osa_arg is not None):
+            GLib.idle_add(self.stage_label.set_text, f"{status_text} — waking Mac")
+            remote = ios_remote.get_remote_cfg(self.cfg)
+            ok = ios_remote.wake_mac(remote, log_cb=self._log)
 
         if ok and needs_scp:
             GLib.idle_add(self.stage_label.set_text, f"{status_text} — uploading")

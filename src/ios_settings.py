@@ -187,4 +187,33 @@ def build_ios_settings_groups(cfg, save_cfg, log_cb=None):
         _add_device_row(d)
     add_dev_btn.connect("clicked", lambda _b: _add_device_row())
 
-    return [conn_grp, widget_grp, devices_grp]
+    # ── App Store Release group ──
+    # Credentials for the Archive/Validate/Distribute pipeline. Pushed into the
+    # Mac's config.json before each release action (no reinstall needed). The
+    # app-specific password is created at appleid.apple.com → Sign-In & Security.
+    release_grp = Adw.PreferencesGroup(title="App Store Release",
+        description="Used by Archive / Validate / Distribute. App-specific "
+                    "password: appleid.apple.com → Sign-In & Security.")
+
+    apple_id_row = Adw.EntryRow(title="Apple ID (email)")
+    apple_id_row.set_text(remote.get("apple_id", ""))
+    apple_id_row.connect("changed", lambda r: (
+        cfg.setdefault("ios_remote", {}).__setitem__("apple_id", r.get_text().strip()),
+        save_cfg(cfg)))
+    release_grp.add(apple_id_row)
+
+    apple_pw_row = Adw.PasswordEntryRow(title="App-specific password")
+    apple_pw_row.set_text(remote.get("apple_app_password", ""))
+    apple_pw_row.connect("changed", lambda r: (
+        cfg.setdefault("ios_remote", {}).__setitem__("apple_app_password", r.get_text()),
+        save_cfg(cfg)))
+    release_grp.add(apple_pw_row)
+
+    team_row = Adw.EntryRow(title="Release Team ID (optional)")
+    team_row.set_text(remote.get("release_team_id", ""))
+    team_row.connect("changed", lambda r: (
+        cfg.setdefault("ios_remote", {}).__setitem__("release_team_id", r.get_text().strip()),
+        save_cfg(cfg)))
+    release_grp.add(team_row)
+
+    return [conn_grp, widget_grp, devices_grp, release_grp]

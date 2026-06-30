@@ -38,8 +38,9 @@ property IPADDRESS : "127.0.0.1"
 -- multi-line/multi-statement string, not just the last one. Requires bash or
 -- zsh for process substitution; Terminal's default on macOS is zsh.
 on nccmd(cmd)
-	return "{ " & cmd & "
- ; } 2>&1 | tee >(nc " & IPADDRESS & " 8080)"
+	-- ВАЖНО: без literal newline перед "; }" — в zsh-Terminal newline трактуется как Enter
+	-- и команда исполняется частично, ловит `cursh>` continuation prompt.
+	return "{ " & cmd & "; } 2>&1 | tee >(nc " & IPADDRESS & " 8080)"
 end nccmd
 
 -- Read host_ip from {{WORK_DIR}}/config.json (written by the host on every
@@ -52,6 +53,32 @@ on readIPFromFile()
 	end try
 end readIPFromFile
 
+-- Read an arbitrary key from {{WORK_DIR}}/config.json. Used for release
+-- secrets (Apple ID, app-specific password, team/bundle id) so they live in
+-- config.json (refreshed by the host each run) rather than baked into the
+-- compiled .scpt on disk. Returns "" if missing/malformed.
+on readConfigKey(keyName)
+	try
+		return (do shell script "python3 -c 'import json,sys; print(json.load(open(\"{{WORK_DIR}}/config.json\")).get(sys.argv[1],\"\"))' " & quoted form of keyName)
+	on error
+		return ""
+	end try
+end readConfigKey
+
+-- Unlock the login keychain for THIS (SSH) session. Without it, codesign /
+-- exportArchive / altool hit "User interaction is not allowed" → "No Accounts"
+-- and can't read the Distribution cert or Xcode account credentials, because
+-- an SSH session has no GUI to prompt for the keychain password. Returns a
+-- shell prefix (ending in &&) to chain before the real command, or "" if no
+-- password is configured. Password is read from config.json at runtime.
+on keychainUnlockPrefix()
+	set pw to my readConfigKey("mac_unlock_password")
+	if pw is "" then return ""
+	-- security reads -p <pw>; we also set a long keychain timeout so it doesn't
+	-- relock mid-build. quoted form escapes the password safely for the shell.
+	return "security unlock-keychain -p " & quoted form of pw & " ~/Library/Keychains/login.keychain-db && security set-keychain-settings -t 3600 -l ~/Library/Keychains/login.keychain-db; "
+end keychainUnlockPrefix
+
 on stopTerminal()
 	-- Kill build/deploy tools running in the Terminal tab. `kill $(jobs -p)`
 	-- in the shell only touches background jobs; xcodebuild / pod install
@@ -59,8 +86,17 @@ on stopTerminal()
 	-- pkill them by name instead — reliably interrupts the build. SIGINT
 	-- (== Ctrl+C) lets the tool print a "User interrupted" summary and
 	-- clean up, rather than leaving half-written derived data.
+	-- Also kill the BUILD's caffeinate (we wrap xcodebuild/pod in
+	-- `caffeinate -i -s <cmd>`): it's the PARENT, so killing xcodebuild alone
+	-- leaves caffeinate holding the tab "busy" → the close below would pop a
+	-- "terminate running processes?" dialog nobody can confirm on a locked Mac.
+	--
+	-- CRITICAL: match only `caffeinate -i -s <something>` (a trailing arg after
+	-- -s), NOT the keep-awake LaunchAgent's bare `caffeinate -i -s`. Killing the
+	-- agent's caffeinate would let the Mac sleep while keep-awake is still ON.
+	-- launchd would respawn it (KeepAlive), but we must not fight the agent.
 	try
-		do shell script "pkill -INT -x xcodebuild; pkill -INT -f 'pod install'; pkill -INT -f 'pod update'; pkill -INT -f 'pod repo'; pkill -INT -f 'add_widget_dependency'; true"
+		do shell script "pkill -INT -x xcodebuild; pkill -INT -f 'pod install'; pkill -INT -f 'pod update'; pkill -INT -f 'pod repo'; pkill -INT -f 'add_widget_dependency'; pkill -INT -f 'caffeinate -i -s .'; true"
 	end try
 	delay 0.3
 	tell application "Terminal"
@@ -76,12 +112,67 @@ on stopTerminal()
 				if busy of activeTab is false then exit repeat
 				delay 0.2
 			end repeat
-			try
-				close activeWindow saving no
-			end try
+			my forceCloseAllWindows()
 		end if
 	end tell
 end stopTerminal
+
+-- Close every Terminal window WITHOUT the "terminate running processes?"
+-- confirmation dialog. That dialog is fatal on a headless/sleeping/locked Mac
+-- (no one to click "Terminate"), so we first SIGKILL whatever could still be
+-- running in any tab, wait for the shells to report idle, then close. As a
+-- last resort we close with `saving no`, which suppresses the *unsaved*
+-- prompt; the kill above is what removes the *running-process* prompt.
+on forceCloseAllWindows()
+	-- Hard-kill anything our pipeline could have spawned so no tab stays busy.
+	-- Order matters: kill the build tools, then their children (clang/swiftc/
+	-- xctest spawned by xcodebuild can keep a tab "busy" after xcodebuild dies).
+	--
+	-- The `caffeinate -i -s .` pattern (trailing arg after -s) kills ONLY the
+	-- build-wrapping caffeinate, sparing the keep-awake LaunchAgent's bare
+	-- `caffeinate -i -s` — so closing a build window never lets the Mac sleep
+	-- while keep-awake is enabled.
+	try
+		do shell script "pkill -9 -f 'caffeinate -i -s .'; pkill -9 -x xcodebuild; pkill -9 -f 'pod install'; pkill -9 -f 'pod update'; pkill -9 -f 'pod repo'; pkill -9 -f xcrun; pkill -9 -f devicectl; pkill -9 -x XCTest; pkill -9 -x clang; pkill -9 -x swiftc; pkill -9 -x ibtool; pkill -9 -x actool; true"
+	end try
+	delay 0.4 -- give SIGKILL time to land before we inspect "busy"
+	tell application "Terminal"
+		-- Wait (bounded) for tabs to drop out of "busy" after the kills land,
+		-- so close() sees idle shells and shows no confirmation.
+		repeat 15 times
+			set anyBusy to false
+			try
+				repeat with w in windows
+					repeat with t in tabs of w
+						if busy of t is true then set anyBusy to true
+					end repeat
+				end repeat
+			end try
+			if not anyBusy then exit repeat
+			delay 0.2
+		end repeat
+		-- If something STILL holds a tab busy (a child we didn't name), kill the
+		-- tab's own shell by its tty so the window has no running process left,
+		-- then close. This is the belt that removes the "terminate running
+		-- processes?" modal entirely — there's nothing left to terminate.
+		try
+			repeat with w in windows
+				repeat with t in tabs of w
+					if busy of t is true then
+						set ttyName to tty of t
+						if ttyName is not missing value and ttyName is not "" then
+							do shell script "pkill -9 -t " & (do shell script "basename " & quoted form of ttyName) & " 2>/dev/null; true"
+						end if
+					end if
+				end repeat
+			end repeat
+		end try
+		delay 0.2
+		try
+			close windows saving no
+		end try
+	end tell
+end forceCloseAllWindows
 
 on clearCache()
 	-- Silent bulk delete via shell. Finder's `delete` moves items to Trash
@@ -166,16 +257,31 @@ MAIN_SHORT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' " & 
 cd {{WORK_DIR}}/iOS;
 gem list -i xcodeproj >/dev/null 2>&1 || gem install xcodeproj --no-document --user-install;
 WIDGET_BUNDLE_ID='{{WIDGET_BUNDLE_ID}}' WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' WIDGET_TARGET_NAME='{{WIDGET_TARGET}}' ruby {{WORK_DIR}}/add_widget_dependency.rb;
+echo $? > /tmp/ubd_widget_exit;
+touch /tmp/ubd_widget_done;
 "
+	-- ВАЖНО: чистим sentinel ДО запуска Terminal — иначе polling сразу видит файл от прошлого запуска.
+	do shell script "rm -f /tmp/ubd_widget_done /tmp/ubd_widget_exit"
 	tell application "Terminal"
 		do script my nccmd(terminalCommand)
 	end tell
+	-- Ждём завершения add_widget_dependency.rb до 5 минут.
+	do shell script "for i in $(seq 1 300); do [ -f /tmp/ubd_widget_done ] && exit 0; sleep 1; done; exit 1"
+	set widgetExit to do shell script "cat /tmp/ubd_widget_exit 2>/dev/null || echo unknown"
+	if widgetExit is not "0" then
+		display dialog "addWidgetToProject FAILED (exit=" & widgetExit & "). Проверь лог в Terminal." buttons {"OK"} default button 1
+		error "addWidget failed (exit=" & widgetExit & ")"
+	end if
 end addWidgetToProject
 
 on updatePod()
+	do shell script "rm -f /tmp/ubd_pod_done /tmp/ubd_pod_exit"
 	tell application "Terminal"
 		activate
-		do script my nccmd("cd {{WORK_DIR}}/iOS && \\
+		-- `caffeinate -i -s &` runs as a sibling that holds the no-sleep
+		-- assertion for the whole chain; `kill` drops it at the end. Simpler &
+		-- quote-safe vs wrapping the multi-line `&&` chain in `caffeinate sh -c`.
+		do script my nccmd("cd {{WORK_DIR}}/iOS && caffeinate -i -s & CAF=$!; { \\
 			pod cache clean --all && \\
 			rm -rf Pods && \\
 			rm -rf Podfile.lock && \\
@@ -184,16 +290,23 @@ on updatePod()
 			pod setup && \\
 			pod update && \\
 			pod repo update && \\
-			pod install --repo-update")
+			pod install --repo-update; }; echo $? > /tmp/ubd_pod_exit; kill $CAF 2>/dev/null; touch /tmp/ubd_pod_done")
 	end tell
-	delay 15
+	-- Ждём pod install до 10 минут (с repo-update может быть долго).
+	do shell script "for i in $(seq 1 600); do [ -f /tmp/ubd_pod_done ] && exit 0; sleep 1; done; exit 1"
+	set podExit to do shell script "cat /tmp/ubd_pod_exit 2>/dev/null || echo unknown"
+	if podExit is not "0" then
+		display dialog "pod install (updatePod) FAILED (exit=" & podExit & "). Проверь лог в Terminal." buttons {"OK"} default button 1
+		error "updatePod pod install failed (exit=" & podExit & ")"
+	end if
 	addWidgetToProject()
 end updatePod
 
 on unpack()
-	tell application "Terminal"
-		close windows
-	end tell
+	-- forceCloseAllWindows (not bare `close windows`) so a still-running
+	-- xcodebuild/caffeinate from a previous run can't trigger the modal
+	-- "terminate running processes?" dialog — fatal on a sleeping/locked Mac.
+	my forceCloseAllWindows()
 
 	-- Delete old iOS/ directory if present (shell is reliable with missing paths)
 	do shell script "rm -rf " & quoted form of "{{WORK_DIR}}/iOS"
@@ -352,20 +465,34 @@ open(p,'w').write(s.rstrip() + '\\n')
 		do shell script "printf '%s' " & quoted form of podfilePatch & " >> " & quoted form of "{{WORK_DIR}}/iOS/Podfile"
 	end try
 
+	-- ВАЖНО: чистим sentinel-файлы ДО запуска Terminal — иначе polling сразу видит файл от прошлого падения и не ждёт.
+	do shell script "rm -f /tmp/ubd_pod_done /tmp/ubd_pod_exit"
+
 	tell application "Terminal"
 		activate
-		-- touch sentinel когда pod install реально завершился, чтобы дальше polling-ом дождаться
-		do script my nccmd("cd {{WORK_DIR}}/iOS && rm -f /tmp/ubd_pod_done && pod install; touch /tmp/ubd_pod_done")
+		-- Sentinel: /tmp/ubd_pod_done создаётся когда pod install завершился (успешно или нет), exit code → /tmp/ubd_pod_exit
+		-- caffeinate -i -s wraps pod install — it's the longest pre-build phase
+		-- (up to 10 min). Without it the Mac can idle-sleep mid-install, drop
+		-- sshd, and the host loses the build with "server not responding".
+		do script my nccmd("cd {{WORK_DIR}}/iOS && caffeinate -i -s pod install; echo $? > /tmp/ubd_pod_exit; touch /tmp/ubd_pod_done")
 	end tell
-	-- Ждём pod install до 10 минут, потом сдаёмся (раньше был тупой delay 25 → обрезалось при долгих pod install).
+	-- Ждём pod install до 10 минут.
 	do shell script "for i in $(seq 1 600); do [ -f /tmp/ubd_pod_done ] && exit 0; sleep 1; done; exit 1"
 
-	tell application "Terminal"
-		close windows
-	end tell
+	-- Проверяем exit code pod install и наличие workspace.
+	set podExit to do shell script "cat /tmp/ubd_pod_exit 2>/dev/null || echo unknown"
+	if podExit is not "0" then
+		display dialog "pod install FAILED (exit=" & podExit & "). Открой Terminal, посмотри ошибку, исправь и перезапусти билд." buttons {"OK"} default button 1
+		error "pod install failed (exit=" & podExit & ")"
+	end if
+	if not (do shell script "[ -d '{{WORK_DIR}}/iOS/Unity-iPhone.xcworkspace' ] && echo ok || echo missing") is "ok" then
+		display dialog "Unity-iPhone.xcworkspace не создан после pod install. Проверь Podfile и pod install лог в Terminal." buttons {"OK"} default button 1
+		error "xcworkspace missing"
+	end if
+
+	my forceCloseAllWindows()
 
 	addWidgetToProject()
-	delay 20
 end unpack
 
 -- Build + test: runs the app through xctest, which auto-launches it on device.
@@ -375,7 +502,11 @@ end unpack
 on runDevice(deviceName)
 	stopTerminal()
 	tell application "Terminal"
-		do script my nccmd("cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates test")
+		-- caffeinate -i -s wraps xcodebuild so the Mac can't idle-sleep during
+		-- a long build. Critical on Apple Silicon laptops on battery: if it
+		-- dozes, sshd dies and the host loses the build mid-flight. caffeinate
+		-- holds the assertion only while xcodebuild runs, then releases it.
+		do script my nccmd("cd {{WORK_DIR}}/iOS && caffeinate -i -s xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates test")
 	end tell
 end runDevice
 
@@ -390,11 +521,100 @@ end runDevice
 -- and bake it into the profile embedded in the .app.
 on installDevice(deviceName)
 	stopTerminal()
-	set cmd to "cd {{WORK_DIR}}/iOS && xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
+	-- caffeinate -i -s prefixes only xcodebuild (the long-running step). The
+	-- subsequent `&& APP_PATH=… && xcrun …` run in the same Terminal shell
+	-- right after, so install completes before any idle-sleep could trigger.
+	-- Keeps the Mac awake during the build on an Apple Silicon laptop on
+	-- battery, where dozing would drop sshd and lose the build mid-flight.
+	set cmd to "cd {{WORK_DIR}}/iOS && caffeinate -i -s xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
 	tell application "Terminal"
 		do script my nccmd(cmd)
 	end tell
 end installDevice
+
+-- ── Release pipeline: Archive → Validate → Distribute (App Store) ──
+--
+-- Three separate steps so the user controls each. All sign for the App Store
+-- (Apple Distribution cert + App Store provisioning profile) and rely on
+-- `-allowProvisioningUpdates` to create/refresh them via the Apple ID logged
+-- into Xcode. Auth for validate/upload is Apple ID + app-specific password,
+-- read from config.json at runtime (not baked into the .scpt).
+--
+-- Layout under {{WORK_DIR}}/iOS/:
+--   build/Unity-iPhone.xcarchive   ← archiveApp
+--   build/export/*.ipa             ← validateApp (exportArchive)
+
+-- ExportOptions.plist for app-store export. Written fresh each run so a Team
+-- ID change in config.json takes effect. teamID empty → xcodebuild infers it.
+on writeExportOptions(teamID)
+	set plistPath to "{{WORK_DIR}}/iOS/build/ExportOptions.plist"
+	do shell script "mkdir -p {{WORK_DIR}}/iOS/build"
+	set teamLine to ""
+	if teamID is not "" then set teamLine to "<key>teamID</key><string>" & teamID & "</string>"
+	set xml to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>method</key><string>app-store</string><key>destination</key><string>export</string><key>signingStyle</key><string>automatic</string>" & teamLine & "</dict></plist>"
+	do shell script "printf '%s' " & quoted form of xml & " > " & quoted form of plistPath
+	return plistPath
+end writeExportOptions
+
+-- xcodebuild archive → build/Unity-iPhone.xcarchive (Release, App Store signed).
+on archiveApp()
+	stopTerminal()
+	set teamID to my readConfigKey("release_team_id")
+	set teamArg to ""
+	if teamID is not "" then set teamArg to " DEVELOPMENT_TEAM=" & teamID
+	set unlockPfx to my keychainUnlockPrefix()
+	-- caffeinate sibling holds the no-sleep assertion for the whole archive
+	-- (the longest release step), killed at the end. Sentinel files let the
+	-- host/poll know when it finished and with what exit code. Keychain is
+	-- unlocked first so auto-signing can read the Distribution cert.
+	set cmd to "cd {{WORK_DIR}}/iOS && " & unlockPfx & "rm -f /tmp/ubd_arch_done /tmp/ubd_arch_exit && caffeinate -i -s & CAF=$!; { xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Release -destination 'generic/platform=iOS' -allowProvisioningUpdates -archivePath build/Unity-iPhone.xcarchive" & teamArg & " archive; }; echo $? > /tmp/ubd_arch_exit; kill $CAF 2>/dev/null; touch /tmp/ubd_arch_done; echo 'Archive step finished.'"
+	tell application "Terminal"
+		activate
+		do script my nccmd(cmd)
+	end tell
+end archiveApp
+
+-- exportArchive → .ipa, then `altool --validate-app` against App Store Connect.
+on validateApp()
+	stopTerminal()
+	set appleID to my readConfigKey("apple_id")
+	set appPass to my readConfigKey("apple_app_password")
+	set teamID to my readConfigKey("release_team_id")
+	if appleID is "" or appPass is "" then
+		display dialog "Apple ID / app-specific password not set in config (iOS settings). Validate needs them." buttons {"OK"} default button 1
+		error "missing Apple ID credentials"
+	end if
+	my writeExportOptions(teamID)
+	set unlockPfx to my keychainUnlockPrefix()
+	-- 0) Unlock the login keychain (SSH session) so exportArchive sees the
+	--    Xcode account + Distribution cert (else "No Accounts").
+	-- 1) Export the archive to an .ipa using the app-store ExportOptions.
+	-- 2) Find the produced .ipa and run altool --validate-app on it.
+	-- altool reads APP_PASS from an env var (not argv) so the password never
+	-- appears in the process list / Terminal scrollback.
+	set cmd to "cd {{WORK_DIR}}/iOS && " & unlockPfx & "rm -f /tmp/ubd_val_done /tmp/ubd_val_exit && export ALTOOL_PASS=" & quoted form of appPass & " && caffeinate -i -s & CAF=$!; { rm -rf build/export && xcodebuild -exportArchive -archivePath build/Unity-iPhone.xcarchive -exportPath build/export -exportOptionsPlist build/ExportOptions.plist -allowProvisioningUpdates && IPA=$(/usr/bin/find build/export -maxdepth 1 -name '*.ipa' | /usr/bin/head -1) && echo \"Validating $IPA\" && xcrun altool --validate-app -f \"$IPA\" -t ios -u " & quoted form of appleID & " -p \"@env:ALTOOL_PASS\"; }; echo $? > /tmp/ubd_val_exit; kill $CAF 2>/dev/null; unset ALTOOL_PASS; touch /tmp/ubd_val_done; echo 'Validate step finished.'"
+	tell application "Terminal"
+		activate
+		do script my nccmd(cmd)
+	end tell
+end validateApp
+
+-- `altool --upload-app` → uploads the exported .ipa to App Store Connect
+-- (appears in TestFlight after Apple processing). Reuses the .ipa from validate.
+on distributeApp()
+	stopTerminal()
+	set appleID to my readConfigKey("apple_id")
+	set appPass to my readConfigKey("apple_app_password")
+	if appleID is "" or appPass is "" then
+		display dialog "Apple ID / app-specific password not set in config (iOS settings). Distribute needs them." buttons {"OK"} default button 1
+		error "missing Apple ID credentials"
+	end if
+	set cmd to "cd {{WORK_DIR}}/iOS && rm -f /tmp/ubd_dist_done /tmp/ubd_dist_exit && export ALTOOL_PASS=" & quoted form of appPass & " && caffeinate -i -s & CAF=$!; { IPA=$(/usr/bin/find build/export -maxdepth 1 -name '*.ipa' | /usr/bin/head -1); if [ -z \"$IPA\" ]; then echo 'No .ipa found — run Validate (export) first.'; false; else echo \"Uploading $IPA\" && xcrun altool --upload-app -f \"$IPA\" -t ios -u " & quoted form of appleID & " -p \"@env:ALTOOL_PASS\"; fi; }; echo $? > /tmp/ubd_dist_exit; kill $CAF 2>/dev/null; unset ALTOOL_PASS; touch /tmp/ubd_dist_done; echo 'Distribute step finished.'"
+	tell application "Terminal"
+		activate
+		do script my nccmd(cmd)
+	end tell
+end distributeApp
 
 -- ── Windows-host legacy: SMB mount for reading iOS.zip from a shared folder ──
 -- Linux and Windows-10+ hosts should use scp instead and ignore these handlers.
@@ -478,5 +698,11 @@ on run argv
 		clearBuild()
 	else if command is "openXcode" then
 		openXcode()
+	else if command is "archiveApp" then
+		archiveApp()
+	else if command is "validateApp" then
+		validateApp()
+	else if command is "distributeApp" then
+		distributeApp()
 	end if
 end run

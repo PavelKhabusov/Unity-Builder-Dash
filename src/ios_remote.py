@@ -37,6 +37,12 @@ DEFAULT_REMOTE = {
     "smb_user":       "",
     "smb_password":   "",
     "smb_build_path": "",
+    # Release pipeline (App Store: archive / validate / distribute).
+    # apple_id + apple_app_password authenticate altool against App Store
+    # Connect; release_team_id signs the archive (empty → xcodebuild infers).
+    "apple_id":            "",
+    "apple_app_password":  "",
+    "release_team_id":     "",
 }
 
 
@@ -245,6 +251,10 @@ def _build_mac_config(remote):
         "widget_folder":       remote.get("widget_folder_name")  or "kartoteka.widget",
         "widget_app_group_id": remote.get("widget_app_group_id") or "group.com.example.myapp",
         "devices":             remote.get("devices") or [],
+        # Release pipeline secrets — read by ios_build.scpt via readConfigKey().
+        "apple_id":            remote.get("apple_id")           or "",
+        "apple_app_password":  remote.get("apple_app_password") or "",
+        "release_team_id":     remote.get("release_team_id")    or "",
     }
 
 
@@ -294,6 +304,177 @@ def test_connection(remote, log_cb=None, notify=True):
         return False
 
 
+def _ssh_probe(remote, command, timeout, connect_timeout):
+    """Single SSH attempt running `command`. Returns (ok, stdout+stderr)."""
+    cmd = ["ssh"] + _ssh_common_opts(remote) + [
+        "-o", f"ConnectTimeout={connect_timeout}",
+        "-o", "BatchMode=yes" if remote["mac_auth"] == "key" else "BatchMode=no",
+        f'{remote["mac_user"]}@{remote["mac_ip"]}', command]
+    cmd = _wrap_sshpass(remote, cmd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout + r.stderr)
+    except Exception as e:
+        return False, str(e)
+
+
+# ── Mac keep-awake (LaunchAgent) ──
+#
+# Tested fact: an Apple Silicon MacBook on Wi-Fi + battery CANNOT be woken over
+# the network. Asleep it answers ICMP from the network coprocessor but sshd is
+# down, and an incoming connection does not wake the full system (verified: 132s
+# of ping+SSH probing never brought sshd up). So the only reliable way to build
+# remotely is to stop the Mac from sleeping in the first place. We install a
+# user LaunchAgent that runs `caffeinate -i -s` forever (KeepAlive=true), so the
+# system never idle-sleeps while the Mac is a build host. The user enables it
+# once before stepping away; the screen still dims/locks normally.
+
+KEEPAWAKE_LABEL = "com.unitybuilderdash.keepawake"
+
+
+def _keepawake_plist_path(remote):
+    return f'/Users/{remote["mac_user"]}/Library/LaunchAgents/{KEEPAWAKE_LABEL}.plist'
+
+
+def _keepawake_plist_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        '<plist version="1.0"><dict>'
+        f'<key>Label</key><string>{KEEPAWAKE_LABEL}</string>'
+        '<key>ProgramArguments</key><array>'
+        '<string>/usr/bin/caffeinate</string>'
+        '<string>-i</string><string>-s</string>'
+        '</array>'
+        '<key>RunAtLoad</key><true/>'
+        '<key>KeepAlive</key><true/>'
+        '</dict></plist>'
+    )
+
+
+def set_mac_keep_awake(remote, enable, log_cb=None):
+    """Install/remove a LaunchAgent that pins the Mac awake via caffeinate.
+
+    enable=True  → write the plist, load it, caffeinate starts now and on every
+                   login/reboot until disabled. The Mac will not idle-sleep.
+    enable=False → unload and delete the plist; the Mac returns to normal sleep.
+
+    Returns True on success. Requires the Mac to be reachable RIGHT NOW (you
+    can't toggle this on a Mac that's already asleep — wake it via lid/keyboard
+    first, which is exactly why this is a "set it before you leave" switch).
+    """
+    if not remote.get("mac_ip"):
+        if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
+        return False
+    plist = _keepawake_plist_path(remote)
+    if enable:
+        import base64 as _b64
+        b64 = _b64.b64encode(_keepawake_plist_xml().encode()).decode()
+        # Write plist, (re)load it. bootout first so a re-enable picks up changes
+        # without erroring on "already loaded". `|| true` keeps it idempotent.
+        cmd = (
+            f'mkdir -p "$(dirname {plist})" && '
+            f'echo {b64} | base64 -d > "{plist}" && '
+            f'launchctl bootout gui/$(id -u)/{KEEPAWAKE_LABEL} 2>/dev/null || true; '
+            f'launchctl bootstrap gui/$(id -u) "{plist}" && echo enabled'
+        )
+        ok, out = _ssh_probe(remote, cmd, timeout=15, connect_timeout=8)
+        ok = ok and "enabled" in out
+        if log_cb:
+            GLib.idle_add(log_cb,
+                "Mac keep-awake ENABLED — it won't sleep until you disable it.\n"
+                if ok else f"Failed to enable keep-awake: {out.strip()}\n")
+        return ok
+    else:
+        # bootout stops launchd from respawning it, then kill ONLY the agent's
+        # bare `caffeinate -i -s` (anchored with $ so a build's
+        # `caffeinate -i -s xcodebuild …` is spared — disabling keep-awake mid
+        # build must not kill the running build's own no-sleep wrapper).
+        cmd = (
+            f'launchctl bootout gui/$(id -u)/{KEEPAWAKE_LABEL} 2>/dev/null || true; '
+            f'rm -f "{plist}"; '
+            f"pkill -f 'caffeinate -i -s$' 2>/dev/null || true; echo disabled"
+        )
+        ok, out = _ssh_probe(remote, cmd, timeout=15, connect_timeout=8)
+        ok = ok and "disabled" in out
+        if log_cb:
+            GLib.idle_add(log_cb,
+                "Mac keep-awake DISABLED — normal sleep restored.\n"
+                if ok else f"Failed to disable keep-awake: {out.strip()}\n")
+        return ok
+
+
+def get_mac_keep_awake(remote):
+    """Return True if the keep-awake LaunchAgent is currently loaded.
+
+    Returns None if the Mac is unreachable (asleep / offline / not configured).
+    """
+    if not remote.get("mac_ip"):
+        return None
+    ok, out = _ssh_probe(
+        remote, f'launchctl print gui/$(id -u)/{KEEPAWAKE_LABEL} >/dev/null 2>&1 '
+                f'&& echo on || echo off',
+        timeout=10, connect_timeout=6)
+    if not ok:
+        return None
+    return "on" in out
+
+
+def wake_mac(remote, log_cb=None, max_wait=30):
+    """Best-effort: confirm the Mac is reachable over SSH before a remote build.
+
+    Network wake does NOT work on Apple Silicon + Wi-Fi + battery (proven), so
+    this does a short retry — enough to catch a Mac that's mid-darkwake or just
+    woke — and otherwise tells the user to wake it / enable keep-awake. It also
+    refreshes a bounded `caffeinate` so the Mac can't doze between scp and the
+    end of the build even if the persistent keep-awake agent isn't installed.
+
+    Returns True if reachable, False otherwise.
+    """
+    if not remote.get("mac_ip"):
+        if log_cb: GLib.idle_add(log_cb, "Mac IP is empty\n")
+        return False
+    ip = remote["mac_ip"]
+
+    ok, _ = _ssh_probe(remote, "echo ok", timeout=10, connect_timeout=8)
+    if not ok:
+        if log_cb:
+            GLib.idle_add(log_cb, f"Mac not responding — retrying {ip} ({max_wait}s)...\n")
+        import time as _t
+        deadline = _t.monotonic() + max_wait
+        while _t.monotonic() < deadline and not ok:
+            try:
+                subprocess.run(["ping", "-c", "2", "-i", "0.3", "-W", "1", ip],
+                               capture_output=True, timeout=4)
+            except Exception:
+                pass
+            ok, _ = _ssh_probe(remote, "echo ok", timeout=8, connect_timeout=6)
+        if not ok:
+            if log_cb:
+                GLib.idle_add(log_cb,
+                    "Mac is asleep and won't wake over Wi-Fi (Apple Silicon "
+                    "limitation). Wake it manually (lid/keyboard), or enable "
+                    '"Keep Mac awake" before stepping away.\n')
+            return False
+
+    # Ensure the Mac stays awake for the WHOLE build, not just the SSH session.
+    # A detached `caffeinate &` over SSH is unreliable (it gets reaped when the
+    # ssh session ends, and on Apple Silicon `-i` alone doesn't block system
+    # sleep on battery) — proven: a build died mid-`pod install` with the Mac
+    # asleep. The LaunchAgent is the only thing that reliably pins it awake, so
+    # if the user hasn't enabled keep-awake we load it now. It persists until
+    # explicitly disabled — matching "the Mac stays awake while it's a build
+    # host". The user's checkbox reflects this state on next popup open.
+    if get_mac_keep_awake(remote) is not True:
+        if log_cb:
+            GLib.idle_add(log_cb,
+                "Keep-awake not active — enabling it so the Mac can't sleep "
+                "during the build.\n")
+        set_mac_keep_awake(remote, True, log_cb)
+    return True
+
+
 def scp_to_mac(zip_path, remote, log_cb=None):
     """Upload zip to {mac_zip_dest}. Returns True on success."""
     dest = f'{remote["mac_user"]}@{remote["mac_ip"]}:{remote["mac_zip_dest"]}'
@@ -335,6 +516,31 @@ class RemoteRunner:
         """Start SSH + osascript in a background thread."""
         threading.Thread(target=self._run, args=(target_arg,), daemon=True).start()
 
+    def _release_config_cmd(self):
+        """Shell snippet that merges the current release secrets into the Mac's
+        config.json — so editing Apple ID / password / team in Settings takes
+        effect without reinstalling the server. Only emitted for release actions
+        (archiveApp/validateApp/distributeApp) to avoid pushing secrets every
+        run. Returns '' for non-release actions. Base64-encoded to dodge quoting.
+        """
+        import base64 as _b64, json as _json
+        r = self.remote
+        rel = {k: r.get(k) or "" for k in
+               ("apple_id", "apple_app_password", "release_team_id")}
+        # Mac login password — needed to unlock the login keychain in the SSH
+        # session so exportArchive/altool can read the Distribution cert and
+        # the Xcode account (otherwise "User interaction is not allowed" →
+        # "No Accounts"). Reuse mac_password (already configured for SSH auth).
+        rel["mac_unlock_password"] = r.get("mac_password") or ""
+        b64 = _b64.b64encode(_json.dumps(rel).encode()).decode()
+        wd = r["mac_work_dir"]
+        return (
+            f'python3 -c "import json,os,base64; p=\'{wd}/config.json\'; '
+            f'd=json.load(open(p)) if os.path.isfile(p) else {{}}; '
+            f'd.update(json.loads(base64.b64decode(\'{b64}\'))); '
+            f'open(p,\'w\').write(json.dumps(d,indent=2))"'
+        )
+
     def _build_cmd(self, target_arg):
         r = self.remote
         script = r["mac_script_path"]
@@ -343,6 +549,11 @@ class RemoteRunner:
         # Refresh ip_address.txt every run so Mac always knows where to POST
         # progress back, even if our IP changed (DHCP, VPN, laptop move).
         remote_cmd = f"{_write_client_ip_cmd(r['mac_work_dir'])} && {osa}"
+        # For release actions, also push the latest Apple ID / password / team
+        # into config.json right before osascript reads them.
+        if target_arg in ("archiveApp", "validateApp", "distributeApp"):
+            remote_cmd = (f"{_write_client_ip_cmd(r['mac_work_dir'])} && "
+                          f"{self._release_config_cmd()} && {osa}")
         cmd = ["ssh"] + _ssh_common_opts(r) + [
             f'{r["mac_user"]}@{r["mac_ip"]}', remote_cmd]
         return _wrap_sshpass(r, cmd)
