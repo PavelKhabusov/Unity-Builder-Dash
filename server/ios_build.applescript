@@ -65,19 +65,18 @@ on readConfigKey(keyName)
 	end try
 end readConfigKey
 
--- Unlock the login keychain for THIS (SSH) session. Without it, codesign /
--- exportArchive / altool hit "User interaction is not allowed" → "No Accounts"
--- and can't read the Distribution cert or Xcode account credentials, because
--- an SSH session has no GUI to prompt for the keychain password. Returns a
--- shell prefix (ending in &&) to chain before the real command, or "" if no
--- password is configured. Password is read from config.json at runtime.
-on keychainUnlockPrefix()
-	set pw to my readConfigKey("mac_unlock_password")
-	if pw is "" then return ""
-	-- security reads -p <pw>; we also set a long keychain timeout so it doesn't
-	-- relock mid-build. quoted form escapes the password safely for the shell.
-	return "security unlock-keychain -p " & quoted form of pw & " ~/Library/Keychains/login.keychain-db && security set-keychain-settings -t 3600 -l ~/Library/Keychains/login.keychain-db; "
-end keychainUnlockPrefix
+-- App Store Connect API key (.p8) details, read from config.json. The host
+-- copies the .p8 into ~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8 (the
+-- standard location xcrun/altool auto-discover) on install. Using an API key
+-- is the ONLY headless auth that works for `xcodebuild -exportArchive` and
+-- `altool` — the Xcode GUI account is NOT visible to the command line
+-- ("No Accounts" bug), but an API key bypasses accounts entirely.
+on ascKeyID()
+	return my readConfigKey("asc_key_id")
+end ascKeyID
+on ascIssuerID()
+	return my readConfigKey("asc_issuer_id")
+end ascIssuerID
 
 on stopTerminal()
 	-- Kill build/deploy tools running in the Terminal tab. `kill $(jobs -p)`
@@ -101,17 +100,26 @@ on stopTerminal()
 	delay 0.3
 	tell application "Terminal"
 		if (count of windows) > 0 then
-			set activeWindow to front window
-			set activeTab to selected tab of activeWindow
+			-- front window / selected tab can be `missing value` even when a
+			-- window exists (window mid-close, or no selected tab) → reading
+			-- `busy of <missing value>` throws -1728. Guard the whole block and
+			-- skip straight to forceCloseAllWindows, which closes everything
+			-- safely regardless.
 			try
-				tell activeTab to do script "kill $(jobs -p) 2>/dev/null; exit" in activeTab
+				set activeWindow to front window
+				set activeTab to selected tab of activeWindow
+				if activeTab is not missing value then
+					try
+						tell activeTab to do script "kill $(jobs -p) 2>/dev/null; exit" in activeTab
+					end try
+					-- Bounded wait for the tab to idle; don't block forever if
+					-- the shell is stuck.
+					repeat 10 times
+						if busy of activeTab is false then exit repeat
+						delay 0.2
+					end repeat
+				end if
 			end try
-			-- Don't block indefinitely waiting for the tab to idle — if the
-			-- shell is stuck it'll never go un-busy. Bounded wait then close.
-			repeat 10 times
-				if busy of activeTab is false then exit repeat
-				delay 0.2
-			end repeat
 			my forceCloseAllWindows()
 		end if
 	end tell
@@ -544,76 +552,64 @@ end installDevice
 --   build/Unity-iPhone.xcarchive   ← archiveApp
 --   build/export/*.ipa             ← validateApp (exportArchive)
 
--- ExportOptions.plist for app-store export. Written fresh each run so a Team
--- ID change in config.json takes effect. teamID empty → xcodebuild infers it.
+-- ExportOptions.plist for App Store Connect export. Written fresh each run so a
+-- Team ID change in config.json takes effect. teamID empty → xcodebuild infers.
 on writeExportOptions(teamID)
 	set plistPath to "{{WORK_DIR}}/iOS/build/ExportOptions.plist"
 	do shell script "mkdir -p {{WORK_DIR}}/iOS/build"
 	set teamLine to ""
 	if teamID is not "" then set teamLine to "<key>teamID</key><string>" & teamID & "</string>"
-	set xml to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>method</key><string>app-store</string><key>destination</key><string>export</string><key>signingStyle</key><string>automatic</string>" & teamLine & "</dict></plist>"
+	-- method=app-store-connect (Xcode 15.3+ name; old "app-store" is deprecated
+	-- and prints a warning on every export).
+	set xml to "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>method</key><string>app-store-connect</string><key>destination</key><string>export</string><key>signingStyle</key><string>automatic</string>" & teamLine & "</dict></plist>"
 	do shell script "printf '%s' " & quoted form of xml & " > " & quoted form of plistPath
 	return plistPath
 end writeExportOptions
 
+-- Run one release step via release.sh (archive|validate|distribute). The heavy
+-- logic lives in {{WORK_DIR}}/release.sh — keeping the giant xcodebuild/altool
+-- lines OUT of the .scpt (they used to truncate and hide all progress). The
+-- script emits "[n/m] …" lines that the host ProgressListener renders live via
+-- the Terminal `tee >(nc …)` wrapper. We only add: sentinel files (so the host
+-- can poll completion + exit code) and a success/fail notification.
+on runReleaseStep(action)
+	set sentinel to "/tmp/ubd_" & action
+	-- stdbuf -oL/-eL → line-buffered so nc streams progress live, not at the end.
+	set cmd to "cd {{WORK_DIR}} && rm -f " & sentinel & "_done " & sentinel & "_exit; WORK_DIR={{WORK_DIR}} stdbuf -oL -eL bash {{WORK_DIR}}/release.sh " & action & "; RC=$?; echo $RC > " & sentinel & "_exit; touch " & sentinel & "_done; if [ \"$RC\" = \"0\" ]; then osascript -e \"display notification \\\"" & action & " succeeded\\\" with title \\\"iOS Release\\\" sound name \\\"Glass\\\"\"; else osascript -e \"display notification \\\"" & action & " FAILED (exit $RC)\\\" with title \\\"iOS Release\\\" sound name \\\"Basso\\\"\"; fi"
+	tell application "Terminal"
+		activate
+		do script my nccmd(cmd)
+	end tell
+end runReleaseStep
+
 -- xcodebuild archive → build/Unity-iPhone.xcarchive (Release, App Store signed).
 on archiveApp()
 	stopTerminal()
-	set teamID to my readConfigKey("release_team_id")
-	set teamArg to ""
-	if teamID is not "" then set teamArg to " DEVELOPMENT_TEAM=" & teamID
-	set unlockPfx to my keychainUnlockPrefix()
-	-- caffeinate sibling holds the no-sleep assertion for the whole archive
-	-- (the longest release step), killed at the end. Sentinel files let the
-	-- host/poll know when it finished and with what exit code. Keychain is
-	-- unlocked first so auto-signing can read the Distribution cert.
-	set cmd to "cd {{WORK_DIR}}/iOS && " & unlockPfx & "rm -f /tmp/ubd_arch_done /tmp/ubd_arch_exit && caffeinate -i -s & CAF=$!; { xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Release -destination 'generic/platform=iOS' -allowProvisioningUpdates -archivePath build/Unity-iPhone.xcarchive" & teamArg & " archive; }; echo $? > /tmp/ubd_arch_exit; kill $CAF 2>/dev/null; touch /tmp/ubd_arch_done; echo 'Archive step finished.'"
-	tell application "Terminal"
-		activate
-		do script my nccmd(cmd)
-	end tell
+	my runReleaseStep("archive")
 end archiveApp
 
 -- exportArchive → .ipa, then `altool --validate-app` against App Store Connect.
+-- Auth is via App Store Connect API key (read from config by release.sh).
 on validateApp()
 	stopTerminal()
-	set appleID to my readConfigKey("apple_id")
-	set appPass to my readConfigKey("apple_app_password")
-	set teamID to my readConfigKey("release_team_id")
-	if appleID is "" or appPass is "" then
-		display dialog "Apple ID / app-specific password not set in config (iOS settings). Validate needs them." buttons {"OK"} default button 1
-		error "missing Apple ID credentials"
+	set keyID to my ascKeyID()
+	if keyID is "" or my ascIssuerID() is "" then
+		display dialog "App Store Connect API key not set (iOS settings: Key ID + Issuer ID + .p8). Validate needs them." buttons {"OK"} default button 1
+		error "missing API key"
 	end if
-	my writeExportOptions(teamID)
-	set unlockPfx to my keychainUnlockPrefix()
-	-- 0) Unlock the login keychain (SSH session) so exportArchive sees the
-	--    Xcode account + Distribution cert (else "No Accounts").
-	-- 1) Export the archive to an .ipa using the app-store ExportOptions.
-	-- 2) Find the produced .ipa and run altool --validate-app on it.
-	-- altool reads APP_PASS from an env var (not argv) so the password never
-	-- appears in the process list / Terminal scrollback.
-	set cmd to "cd {{WORK_DIR}}/iOS && " & unlockPfx & "rm -f /tmp/ubd_val_done /tmp/ubd_val_exit && export ALTOOL_PASS=" & quoted form of appPass & " && caffeinate -i -s & CAF=$!; { rm -rf build/export && xcodebuild -exportArchive -archivePath build/Unity-iPhone.xcarchive -exportPath build/export -exportOptionsPlist build/ExportOptions.plist -allowProvisioningUpdates && IPA=$(/usr/bin/find build/export -maxdepth 1 -name '*.ipa' | /usr/bin/head -1) && echo \"Validating $IPA\" && xcrun altool --validate-app -f \"$IPA\" -t ios -u " & quoted form of appleID & " -p \"@env:ALTOOL_PASS\"; }; echo $? > /tmp/ubd_val_exit; kill $CAF 2>/dev/null; unset ALTOOL_PASS; touch /tmp/ubd_val_done; echo 'Validate step finished.'"
-	tell application "Terminal"
-		activate
-		do script my nccmd(cmd)
-	end tell
+	-- ExportOptions.plist still written here so a Team ID change takes effect.
+	my writeExportOptions(my readConfigKey("release_team_id"))
+	my runReleaseStep("validate")
 end validateApp
 
--- `altool --upload-app` → uploads the exported .ipa to App Store Connect
--- (appears in TestFlight after Apple processing). Reuses the .ipa from validate.
+-- altool --upload-app → uploads the exported .ipa to App Store Connect.
 on distributeApp()
 	stopTerminal()
-	set appleID to my readConfigKey("apple_id")
-	set appPass to my readConfigKey("apple_app_password")
-	if appleID is "" or appPass is "" then
-		display dialog "Apple ID / app-specific password not set in config (iOS settings). Distribute needs them." buttons {"OK"} default button 1
-		error "missing Apple ID credentials"
+	if my ascKeyID() is "" or my ascIssuerID() is "" then
+		display dialog "App Store Connect API key not set (iOS settings: Key ID + Issuer ID + .p8). Distribute needs them." buttons {"OK"} default button 1
+		error "missing API key"
 	end if
-	set cmd to "cd {{WORK_DIR}}/iOS && rm -f /tmp/ubd_dist_done /tmp/ubd_dist_exit && export ALTOOL_PASS=" & quoted form of appPass & " && caffeinate -i -s & CAF=$!; { IPA=$(/usr/bin/find build/export -maxdepth 1 -name '*.ipa' | /usr/bin/head -1); if [ -z \"$IPA\" ]; then echo 'No .ipa found — run Validate (export) first.'; false; else echo \"Uploading $IPA\" && xcrun altool --upload-app -f \"$IPA\" -t ios -u " & quoted form of appleID & " -p \"@env:ALTOOL_PASS\"; fi; }; echo $? > /tmp/ubd_dist_exit; kill $CAF 2>/dev/null; unset ALTOOL_PASS; touch /tmp/ubd_dist_done; echo 'Distribute step finished.'"
-	tell application "Terminal"
-		activate
-		do script my nccmd(cmd)
-	end tell
+	my runReleaseStep("distribute")
 end distributeApp
 
 -- ── Windows-host legacy: SMB mount for reading iOS.zip from a shared folder ──

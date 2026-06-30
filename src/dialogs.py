@@ -425,68 +425,45 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     build_grp.add(build_row)
     page.append(build_grp)
 
+    # ── Single-row groups (title inside the row, buttons sized to text on the
+    # right) — same layout as the Build row above, via Adw.ActionRow title +
+    # add_suffix. Helper builds one such group from (label, action_id, tip).
+    def _action_row_group(row_title, buttons):
+        grp = Adw.PreferencesGroup()
+        row = Adw.ActionRow(title=row_title)
+        for lbl, action_id, tip in buttons:
+            b = Gtk.Button(label=lbl, valign=Gtk.Align.CENTER, tooltip_text=tip)
+            b.connect("clicked", lambda _w, a=action_id: _fire(a))
+            row.add_suffix(b)
+        grp.add(row)
+        page.append(grp)
+
     # ── Archive ──
-    arch_grp = Adw.PreferencesGroup(title="Archive")
-    arch_row = Adw.ActionRow()
-    arch_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
-                       valign=Gtk.Align.CENTER, hexpand=True, homogeneous=True,
-                       margin_top=6, margin_bottom=6,
-                       margin_start=12, margin_end=12)
-    for lbl, action_id in [
-        ("Pack",   "archive"),
-        ("Unpack", "unpack"),
-        ("All",    "all"),
-    ]:
-        b = Gtk.Button(label=lbl)
-        b.connect("clicked", lambda _w, a=action_id: _fire(a))
-        arch_box.append(b)
-    arch_row.set_child(arch_box)
-    arch_grp.add(arch_row)
-    page.append(arch_grp)
+    _action_row_group("Archive", [
+        ("Pack",   "archive", "Zip the built iOS/ project"),
+        ("Unpack", "unpack",  "Unpack on Mac (pods + widget)"),
+        ("All",    "all",     "Pack and unpack"),
+    ])
 
     # ── Extras ──
-    extra_grp = Adw.PreferencesGroup(title="Extras")
-    extra_row = Adw.ActionRow()
-    extra_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
-                        valign=Gtk.Align.CENTER, hexpand=True, homogeneous=True,
-                        margin_top=6, margin_bottom=6,
-                        margin_start=12, margin_end=12)
-    for lbl, action_id in [
-        ("Clear .pcm cache", "clear_cache"),
-        ("Add widget",       "add_widget"),
-        ("Clean build",      "clear_build"),
-    ]:
-        b = Gtk.Button(label=lbl)
-        b.connect("clicked", lambda _w, a=action_id: _fire(a))
-        extra_box.append(b)
-    extra_row.set_child(extra_box)
-    extra_grp.add(extra_row)
-    page.append(extra_grp)
+    _action_row_group("Extras", [
+        ("Clear .pcm cache", "clear_cache", "Remove Xcode DerivedData .pcm cache"),
+        ("Add widget",       "add_widget",  "Re-run add_widget_dependency.rb"),
+        ("Clean build",      "clear_build", "xcodebuild clean"),
+    ])
 
     # ── Release (App Store) ──
     # Run in order: Archive → Validate → Distribute. Each acts on the
     # already-unpacked iOS/ project on the Mac (no Unity rebuild). Validate
     # exports the .ipa that Distribute then uploads to App Store Connect.
-    rel_grp = Adw.PreferencesGroup(title="Release (App Store)")
-    rel_row = Adw.ActionRow()
-    rel_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
-                      valign=Gtk.Align.CENTER, hexpand=True, homogeneous=True,
-                      margin_top=6, margin_bottom=6,
-                      margin_start=12, margin_end=12)
-    for lbl, action_id, tip in [
+    _action_row_group("Release (App Store)", [
         ("Archive",    "archive_app",
          "xcodebuild archive (Release, App Store signing) → .xcarchive"),
         ("Validate",   "validate_app",
          "Export .ipa from the archive and validate it against App Store Connect"),
         ("Distribute", "distribute_app",
          "Upload the exported .ipa to App Store Connect (TestFlight after processing)"),
-    ]:
-        b = Gtk.Button(label=lbl, tooltip_text=tip)
-        b.connect("clicked", lambda _w, a=action_id: _fire(a))
-        rel_box.append(b)
-    rel_row.set_child(rel_box)
-    rel_grp.add(rel_row)
-    page.append(rel_grp)
+    ])
 
     content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     page.set_vexpand(True)

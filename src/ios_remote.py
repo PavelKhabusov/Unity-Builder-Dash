@@ -38,11 +38,17 @@ DEFAULT_REMOTE = {
     "smb_password":   "",
     "smb_build_path": "",
     # Release pipeline (App Store: archive / validate / distribute).
-    # apple_id + apple_app_password authenticate altool against App Store
-    # Connect; release_team_id signs the archive (empty → xcodebuild infers).
-    "apple_id":            "",
-    "apple_app_password":  "",
-    "release_team_id":     "",
+    # App Store Connect API key (.p8) is the auth that actually works headless —
+    # the Xcode GUI account is invisible to xcodebuild/altool ("No Accounts").
+    #   asc_key_id     — the key's Key ID (e.g. ABC123DEF4)
+    #   asc_issuer_id  — the issuer UUID from App Store Connect
+    #   asc_key_p8_path— path to the .p8 file ON THE HOST; copied to the Mac's
+    #                    ~/.appstoreconnect/private_keys/AuthKey_<id>.p8 on use.
+    # The signing team reuses widget_team_id (same developer team) — no separate
+    # release_team_id field.
+    "asc_key_id":          "",
+    "asc_issuer_id":       "",
+    "asc_key_p8_path":     "",
 }
 
 
@@ -252,9 +258,10 @@ def _build_mac_config(remote):
         "widget_app_group_id": remote.get("widget_app_group_id") or "group.com.example.myapp",
         "devices":             remote.get("devices") or [],
         # Release pipeline secrets — read by ios_build.scpt via readConfigKey().
-        "apple_id":            remote.get("apple_id")           or "",
-        "apple_app_password":  remote.get("apple_app_password") or "",
-        "release_team_id":     remote.get("release_team_id")    or "",
+        # release_team_id reuses widget_team_id (same developer team).
+        "asc_key_id":          remote.get("asc_key_id")      or "",
+        "asc_issuer_id":       remote.get("asc_issuer_id")   or "",
+        "release_team_id":     remote.get("widget_team_id")  or "",
     }
 
 
@@ -518,28 +525,44 @@ class RemoteRunner:
 
     def _release_config_cmd(self):
         """Shell snippet that merges the current release secrets into the Mac's
-        config.json — so editing Apple ID / password / team in Settings takes
-        effect without reinstalling the server. Only emitted for release actions
-        (archiveApp/validateApp/distributeApp) to avoid pushing secrets every
-        run. Returns '' for non-release actions. Base64-encoded to dodge quoting.
+        config.json AND installs the App Store Connect .p8 key into the Mac's
+        ~/.appstoreconnect/private_keys/ — so editing them in Settings takes
+        effect without reinstalling the server. Only emitted for release actions.
+        Everything is base64-encoded to dodge quoting over SSH.
         """
-        import base64 as _b64, json as _json
+        import base64 as _b64, json as _json, os as _os
         r = self.remote
-        rel = {k: r.get(k) or "" for k in
-               ("apple_id", "apple_app_password", "release_team_id")}
-        # Mac login password — needed to unlock the login keychain in the SSH
-        # session so exportArchive/altool can read the Distribution cert and
-        # the Xcode account (otherwise "User interaction is not allowed" →
-        # "No Accounts"). Reuse mac_password (already configured for SSH auth).
+        rel = {k: r.get(k) or "" for k in ("asc_key_id", "asc_issuer_id")}
+        # Signing team reuses widget_team_id (same developer team) — exposed to
+        # the .scpt under the release_team_id key it already reads.
+        rel["release_team_id"] = r.get("widget_team_id") or ""
+        # Mac login password — unlocks the login keychain in the SSH session so
+        # codesign can read the Distribution cert (else "User interaction is not
+        # allowed"). Reuse mac_password (already configured for SSH auth).
         rel["mac_unlock_password"] = r.get("mac_password") or ""
         b64 = _b64.b64encode(_json.dumps(rel).encode()).decode()
         wd = r["mac_work_dir"]
-        return (
+        merge = (
             f'python3 -c "import json,os,base64; p=\'{wd}/config.json\'; '
             f'd=json.load(open(p)) if os.path.isfile(p) else {{}}; '
             f'd.update(json.loads(base64.b64decode(\'{b64}\'))); '
             f'open(p,\'w\').write(json.dumps(d,indent=2))"'
         )
+        # Install the .p8 into the standard auto-discovery location if both the
+        # key id and a readable .p8 file on the host are configured. xcrun/altool
+        # look for ~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8.
+        p8_path = _os.path.expanduser(r.get("asc_key_p8_path") or "")
+        key_id = r.get("asc_key_id") or ""
+        if key_id and p8_path and _os.path.isfile(p8_path):
+            with open(p8_path, "rb") as f:
+                p8_b64 = _b64.b64encode(f.read()).decode()
+            dest = f"$HOME/.appstoreconnect/private_keys/AuthKey_{key_id}.p8"
+            install_p8 = (
+                f'mkdir -p "$HOME/.appstoreconnect/private_keys" && '
+                f'echo {p8_b64} | base64 -d > "{dest}" && chmod 600 "{dest}"'
+            )
+            return f"{merge} && {install_p8}"
+        return merge
 
     def _build_cmd(self, target_arg):
         r = self.remote
@@ -650,7 +673,7 @@ def install_mac_server(remote, log_cb=None):
     here = os.path.dirname(os.path.abspath(__file__))
     server_dir = os.path.join(os.path.dirname(here), "server")
     files = ["ios_build.applescript", "add_widget_dependency.rb", "patch_scpt.sh",
-             "mac_console.applescript"]
+             "mac_console.applescript", "release.sh"]
     missing = [f for f in files if not os.path.isfile(os.path.join(server_dir, f))]
     if missing:
         if log_cb:

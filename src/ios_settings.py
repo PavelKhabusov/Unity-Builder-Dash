@@ -3,7 +3,7 @@ and any other UI that needs them. Returns Adw.PreferencesGroup widgets that
 can be added to any PreferencesPage or plain Box.
 """
 import threading
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Gtk, Adw, GLib, Gio
 from .ios_remote import (get_remote_cfg, copy_key_to_mac, generate_ssh_key,
                          install_mac_server)
 
@@ -188,32 +188,62 @@ def build_ios_settings_groups(cfg, save_cfg, log_cb=None):
     add_dev_btn.connect("clicked", lambda _b: _add_device_row())
 
     # ── App Store Release group ──
-    # Credentials for the Archive/Validate/Distribute pipeline. Pushed into the
-    # Mac's config.json before each release action (no reinstall needed). The
-    # app-specific password is created at appleid.apple.com → Sign-In & Security.
+    # App Store Connect API key for the Archive/Validate/Distribute pipeline.
+    # The Xcode GUI account is invisible to xcodebuild/altool ("No Accounts"),
+    # so we authenticate with an API key (.p8 + Key ID + Issuer ID) instead.
+    # Create it at App Store Connect → Users and Access → Integrations.
     release_grp = Adw.PreferencesGroup(title="App Store Release",
-        description="Used by Archive / Validate / Distribute. App-specific "
-                    "password: appleid.apple.com → Sign-In & Security.")
+        description="API key for Archive / Validate / Distribute. Create at "
+                    "App Store Connect → Users and Access → Integrations.")
 
-    apple_id_row = Adw.EntryRow(title="Apple ID (email)")
-    apple_id_row.set_text(remote.get("apple_id", ""))
-    apple_id_row.connect("changed", lambda r: (
-        cfg.setdefault("ios_remote", {}).__setitem__("apple_id", r.get_text().strip()),
+    key_id_row = Adw.EntryRow(title="API Key ID")
+    key_id_row.set_text(remote.get("asc_key_id", ""))
+    key_id_row.connect("changed", lambda r: (
+        cfg.setdefault("ios_remote", {}).__setitem__("asc_key_id", r.get_text().strip()),
         save_cfg(cfg)))
-    release_grp.add(apple_id_row)
+    release_grp.add(key_id_row)
 
-    apple_pw_row = Adw.PasswordEntryRow(title="App-specific password")
-    apple_pw_row.set_text(remote.get("apple_app_password", ""))
-    apple_pw_row.connect("changed", lambda r: (
-        cfg.setdefault("ios_remote", {}).__setitem__("apple_app_password", r.get_text()),
+    issuer_row = Adw.EntryRow(title="API Issuer ID")
+    issuer_row.set_text(remote.get("asc_issuer_id", ""))
+    issuer_row.connect("changed", lambda r: (
+        cfg.setdefault("ios_remote", {}).__setitem__("asc_issuer_id", r.get_text().strip()),
         save_cfg(cfg)))
-    release_grp.add(apple_pw_row)
+    release_grp.add(issuer_row)
 
-    team_row = Adw.EntryRow(title="Release Team ID (optional)")
-    team_row.set_text(remote.get("release_team_id", ""))
-    team_row.connect("changed", lambda r: (
-        cfg.setdefault("ios_remote", {}).__setitem__("release_team_id", r.get_text().strip()),
+    # .p8 path with a file picker (the file lives on the host; it's copied to
+    # the Mac's ~/.appstoreconnect/private_keys/ before each release action).
+    p8_row = Adw.EntryRow(title="API Key .p8 file")
+    p8_row.set_text(remote.get("asc_key_p8_path", ""))
+    p8_row.connect("changed", lambda r: (
+        cfg.setdefault("ios_remote", {}).__setitem__("asc_key_p8_path", r.get_text().strip()),
         save_cfg(cfg)))
-    release_grp.add(team_row)
+    browse_btn = Gtk.Button(icon_name="document-open-symbolic",
+                            valign=Gtk.Align.CENTER, css_classes=["flat"])
+
+    def _pick_p8(_b):
+        dlg = Gtk.FileDialog(title="Select App Store Connect API key (.p8)")
+        flt = Gtk.FileFilter()
+        flt.set_name("API key (.p8)")
+        flt.add_pattern("*.p8")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(flt)
+        dlg.set_filters(filters)
+        root = browse_btn.get_root()
+
+        def _done(d, res):
+            try:
+                f = d.open_finish(res)
+                if f:
+                    path = f.get_path()
+                    p8_row.set_text(path)  # triggers "changed" → saves
+            except Exception:
+                pass
+        dlg.open(root, None, _done)
+    browse_btn.connect("clicked", _pick_p8)
+    p8_row.add_suffix(browse_btn)
+    release_grp.add(p8_row)
+
+    # Team ID for release signing reuses "Apple Team ID" from the Widget group
+    # (widget_team_id) — no separate field, it's the same developer team.
 
     return [conn_grp, widget_grp, devices_grp, release_grp]
