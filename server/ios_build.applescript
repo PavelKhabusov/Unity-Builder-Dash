@@ -78,6 +78,20 @@ on ascIssuerID()
 	return my readConfigKey("asc_issuer_id")
 end ascIssuerID
 
+-- Unlock the login keychain for THIS (SSH) session so codesign can read the
+-- signing key. Over SSH the keychain is locked ("User interaction is not
+-- allowed") → CodeSign fails (notably the widget .appex). Also grants
+-- non-interactive key access (set-key-partition-list) to avoid the modal
+-- "allow key access?" prompt that beeps and hangs headless. Returns a shell
+-- prefix ending in ';' to chain before build commands, or "" if no password.
+on keychainUnlockPrefix()
+	set pw to my readConfigKey("mac_unlock_password")
+	if pw is "" then return ""
+	set q to quoted form of pw
+	set kc to "~/Library/Keychains/login.keychain-db"
+	return "security unlock-keychain -p " & q & " " & kc & " && security set-keychain-settings -t 3600 -l " & kc & "; security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k " & q & " " & kc & " >/dev/null 2>&1; "
+end keychainUnlockPrefix
+
 on stopTerminal()
 	-- Kill build/deploy tools running in the Terminal tab. `kill $(jobs -p)`
 	-- in the shell only touches background jobs; xcodebuild / pod install
@@ -286,10 +300,9 @@ on updatePod()
 	do shell script "rm -f /tmp/ubd_pod_done /tmp/ubd_pod_exit"
 	tell application "Terminal"
 		activate
-		-- `caffeinate -i -s &` runs as a sibling that holds the no-sleep
-		-- assertion for the whole chain; `kill` drops it at the end. Simpler &
-		-- quote-safe vs wrapping the multi-line `&&` chain in `caffeinate sh -c`.
-		do script my nccmd("cd {{WORK_DIR}}/iOS && caffeinate -i -s & CAF=$!; { \\
+		-- No caffeinate — the keep-awake toggle keeps the Mac awake through this
+		-- long pod reinstall.
+		do script my nccmd("cd {{WORK_DIR}}/iOS && { \\
 			pod cache clean --all && \\
 			rm -rf Pods && \\
 			rm -rf Podfile.lock && \\
@@ -298,7 +311,7 @@ on updatePod()
 			pod setup && \\
 			pod update && \\
 			pod repo update && \\
-			pod install --repo-update; }; echo $? > /tmp/ubd_pod_exit; kill $CAF 2>/dev/null; touch /tmp/ubd_pod_done")
+			pod install --repo-update; }; echo $? > /tmp/ubd_pod_exit; touch /tmp/ubd_pod_done")
 	end tell
 	-- Ждём pod install до 10 минут (с repo-update может быть долго).
 	do shell script "for i in $(seq 1 600); do [ -f /tmp/ubd_pod_done ] && exit 0; sleep 1; done; exit 1"
@@ -479,10 +492,9 @@ open(p,'w').write(s.rstrip() + '\\n')
 	tell application "Terminal"
 		activate
 		-- Sentinel: /tmp/ubd_pod_done создаётся когда pod install завершился (успешно или нет), exit code → /tmp/ubd_pod_exit
-		-- caffeinate -i -s wraps pod install — it's the longest pre-build phase
-		-- (up to 10 min). Without it the Mac can idle-sleep mid-install, drop
-		-- sshd, and the host loses the build with "server not responding".
-		do script my nccmd("cd {{WORK_DIR}}/iOS && caffeinate -i -s pod install; echo $? > /tmp/ubd_pod_exit; touch /tmp/ubd_pod_done")
+		-- No caffeinate — the keep-awake toggle keeps the Mac awake through this
+		-- (the longest, up to 10 min) phase.
+		do script my nccmd("cd {{WORK_DIR}}/iOS && pod install; echo $? > /tmp/ubd_pod_exit; touch /tmp/ubd_pod_done")
 	end tell
 	-- Ждём pod install до 10 минут.
 	do shell script "for i in $(seq 1 600); do [ -f /tmp/ubd_pod_done ] && exit 0; sleep 1; done; exit 1"
@@ -509,12 +521,13 @@ end unpack
 -- `installDevice` mode instead (Settings → iOS → "Run mode: Install only").
 on runDevice(deviceName)
 	stopTerminal()
+	set unlockPfx to my keychainUnlockPrefix()
 	tell application "Terminal"
-		-- caffeinate -i -s wraps xcodebuild so the Mac can't idle-sleep during
-		-- a long build. Critical on Apple Silicon laptops on battery: if it
-		-- dozes, sshd dies and the host loses the build mid-flight. caffeinate
-		-- holds the assertion only while xcodebuild runs, then releases it.
-		do script my nccmd("cd {{WORK_DIR}}/iOS && caffeinate -i -s xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates test")
+		-- keychainUnlockPrefix first: over SSH the login keychain is locked, so
+		-- codesign (esp. the widget .appex) fails with "User interaction is not
+		-- allowed" / "Command CodeSign failed". No per-build caffeinate — the
+		-- keep-awake toggle (LaunchAgent) keeps the Mac awake the whole time.
+		do script my nccmd("cd {{WORK_DIR}}/iOS && " & unlockPfx & "xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates test")
 	end tell
 end runDevice
 
@@ -529,12 +542,10 @@ end runDevice
 -- and bake it into the profile embedded in the .app.
 on installDevice(deviceName)
 	stopTerminal()
-	-- caffeinate -i -s prefixes only xcodebuild (the long-running step). The
-	-- subsequent `&& APP_PATH=… && xcrun …` run in the same Terminal shell
-	-- right after, so install completes before any idle-sleep could trigger.
-	-- Keeps the Mac awake during the build on an Apple Silicon laptop on
-	-- battery, where dozing would drop sshd and lose the build mid-flight.
-	set cmd to "cd {{WORK_DIR}}/iOS && caffeinate -i -s xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
+	set unlockPfx to my keychainUnlockPrefix()
+	-- keychainUnlockPrefix so codesign can read the signing key over SSH. No
+	-- per-build caffeinate — the keep-awake toggle keeps the Mac awake.
+	set cmd to "cd {{WORK_DIR}}/iOS && " & unlockPfx & "xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone -configuration Debug -destination 'platform=iOS,name=" & deviceName & "' -allowProvisioningUpdates -derivedDataPath build/DerivedData build && APP_PATH=$(/usr/bin/find build/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' | /usr/bin/grep -v Tests | /usr/bin/head -1) && echo \"Installing $APP_PATH on " & deviceName & "\" && xcrun devicectl device install app --device '" & deviceName & "' \"$APP_PATH\""
 	tell application "Terminal"
 		do script my nccmd(cmd)
 	end tell

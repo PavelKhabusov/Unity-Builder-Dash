@@ -45,10 +45,10 @@ esac
 step() { echo "[$1/$TOTAL] $2"; }   # ProgressListener parses [n/m]
 fail() { echo "ERROR: $1"; exit "${2:-1}"; }
 
-# ── shared prep: keep awake + unlock keychain + grant codesign key access ──
-# caffeinate as a sibling so the Mac can't sleep mid-step; killed on exit.
-caffeinate -i -s & CAF=$!
-trap 'kill $CAF 2>/dev/null' EXIT
+# ── shared prep: unlock keychain + grant codesign key access ──
+# No caffeinate here — the app's keep-awake toggle (caffeinate LaunchAgent)
+# keeps the Mac awake for the whole session; a per-step caffeinate would just
+# duplicate that.
 
 unlock_keychain() {
   # Without unlock+partition-list, codesign pops a modal "allow key access?"

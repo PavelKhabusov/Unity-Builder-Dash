@@ -134,6 +134,11 @@ class LogView(Gtk.Box):
         copy_btn.connect("clicked", self._on_copy)
         search_box.append(copy_btn)
 
+        clear_btn = Gtk.Button(icon_name="user-trash-symbolic",
+                               tooltip_text="Clear log", css_classes=["flat"])
+        clear_btn.connect("clicked", lambda *_: self.clear())
+        search_box.append(clear_btn)
+
         # Extra widgets at end
         for w in (extra_end or []):
             search_box.append(w)

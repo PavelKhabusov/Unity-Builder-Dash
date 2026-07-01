@@ -578,6 +578,9 @@ class BuilderWindow(Adw.ApplicationWindow):
             btn = Gtk.Button(icon_name=t_info["icon"],
                              tooltip_text=f"Build {t_info['label']}", css_classes=["flat"])
             if t_key == "ios":
+                # Keep the iOS button usable during a build so the remote popup
+                # (log, stop, extras, release) can be opened while a build runs.
+                btn._keep_enabled_while_building = True
                 btn.connect("clicked", lambda _, p=proj: self._show_ios_popup(p))
                 # Right-click → quick build variants (4 combinations of
                 # increment/scripts-only) that bypass the remote-pipeline popup.
@@ -677,7 +680,12 @@ class BuilderWindow(Adw.ApplicationWindow):
 
     def _set_building(self, on):
         for c in self.cards.values():
-            for b in c["buttons"]: b.set_sensitive(not on)
+            for b in c["buttons"]:
+                # The iOS button stays enabled during a build so its popup can
+                # be opened mid-build (see _keep_enabled_while_building).
+                if getattr(b, "_keep_enabled_while_building", False):
+                    continue
+                b.set_sensitive(not on)
         self.build_all_btn.set_sensitive(not on)
         self.cancel_btn.set_sensitive(on)
         if on:

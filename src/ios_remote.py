@@ -232,18 +232,27 @@ def _wrap_sshpass(remote, cmd):
     return cmd
 
 
-def _write_client_ip_cmd(work_dir):
+def _write_client_ip_cmd(work_dir, unlock_pw=""):
     """Shell snippet (Mac-side) that updates host_ip in config.json.
 
     Host runs this via SSH before every action. Uses $SSH_CLIENT (set by
     sshd) — no host-side IP detection. Creates config.json if missing.
+
+    Also writes mac_unlock_password (the Mac login password) so the .scpt's
+    keychainUnlockPrefix can unlock the keychain for codesign on EVERY build,
+    not just release actions (the widget .appex fails to sign otherwise). The
+    password is base64-encoded to survive the shell/SSH quoting.
     """
+    import base64 as _b64
+    pw_b64 = _b64.b64encode((unlock_pw or "").encode()).decode()
     return (
         f'mkdir -p "{work_dir}" && '
         f'IP=$(echo "$SSH_CLIENT" | awk \'{{print $1}}\') && '
-        f'python3 -c "import json, os; p=\'{work_dir}/config.json\'; '
+        f'python3 -c "import json, os, base64; p=\'{work_dir}/config.json\'; '
         f'd=json.load(open(p)) if os.path.isfile(p) else {{}}; '
-        f'd[\'host_ip\']=\'$IP\'; open(p,\'w\').write(json.dumps(d,indent=2))"'
+        f'd[\'host_ip\']=\'$IP\'; '
+        f'd[\'mac_unlock_password\']=base64.b64decode(\'{pw_b64}\').decode(); '
+        f'open(p,\'w\').write(json.dumps(d,indent=2))"'
     )
 
 
@@ -282,7 +291,7 @@ def test_connection(remote, log_cb=None, notify=True):
     # Always write the client IP — silent probes too, so mac_console.app
     # and any in-flight .scpt have a current value. Notifications stay
     # opt-in (noisy macOS banner / Glass sound on the Mac).
-    base = f'{_write_client_ip_cmd(remote["mac_work_dir"])} && echo ok'
+    base = f'{_write_client_ip_cmd(remote["mac_work_dir"], remote.get("mac_password") or "")} && echo ok'
     if notify:
         remote_cmd = (
             f'{base} && osascript -e '
@@ -569,14 +578,13 @@ class RemoteRunner:
         script = r["mac_script_path"]
         osa = (f"osascript '{script}' '{target_arg}'" if target_arg
                else f"osascript '{script}'")
-        # Refresh ip_address.txt every run so Mac always knows where to POST
-        # progress back, even if our IP changed (DHCP, VPN, laptop move).
-        remote_cmd = f"{_write_client_ip_cmd(r['mac_work_dir'])} && {osa}"
-        # For release actions, also push the latest Apple ID / password / team
-        # into config.json right before osascript reads them.
+        # Refresh host_ip + mac_unlock_password every run so the Mac knows where
+        # to POST progress and can unlock the keychain for codesign on any build.
+        ip_cmd = _write_client_ip_cmd(r['mac_work_dir'], r.get("mac_password") or "")
+        remote_cmd = f"{ip_cmd} && {osa}"
+        # For release actions, also push the API key / team into config.json.
         if target_arg in ("archiveApp", "validateApp", "distributeApp"):
-            remote_cmd = (f"{_write_client_ip_cmd(r['mac_work_dir'])} && "
-                          f"{self._release_config_cmd()} && {osa}")
+            remote_cmd = f"{ip_cmd} && {self._release_config_cmd()} && {osa}"
         cmd = ["ssh"] + _ssh_common_opts(r) + [
             f'{r["mac_user"]}@{r["mac_ip"]}', remote_cmd]
         return _wrap_sshpass(r, cmd)
