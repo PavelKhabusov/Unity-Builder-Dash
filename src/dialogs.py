@@ -4,7 +4,7 @@ from gi.repository import Gtk, Adw, GLib
 from .config import scan_project
 from .ios_remote import (get_devices, get_remote_cfg, test_connection,
                          generate_ssh_key, copy_key_to_mac, install_mac_server,
-                         set_mac_keep_awake, get_mac_keep_awake)
+                         set_mac_keep_awake, get_mac_keep_awake, get_mac_battery)
 
 
 def show_scan(parent, proj):
@@ -283,6 +283,56 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
         status_dot.set_tooltip_text(label)
     set_connected(None)
 
+    # Mac battery indicator: a crisp symbolic battery icon (theme-colored, not
+    # an emoji) + percent text. Uses the system battery-NNN(-charging)-symbolic
+    # icons, which are SVG and adapt to light/dark.
+    battery_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3,
+                          valign=Gtk.Align.CENTER, margin_end=4)
+    battery_icon = Gtk.Image()
+    battery_pct_lbl = Gtk.Label()
+    battery_pct_lbl.add_css_class("caption")
+    battery_box.append(battery_icon)
+    battery_box.append(battery_pct_lbl)
+    battery_box.set_visible(False)
+
+    def _set_battery(info):
+        if not info:
+            battery_box.set_visible(False)
+            return
+        pct = info["percent"]
+        charging = info.get("ac") or info.get("state") == "charging"
+        # Adwaita naming: battery-level-{0,10,…,100}-symbolic, with -charging
+        # when powered, and -charged at 100%. (NOT the breeze battery-050 form.)
+        bucket = max(0, min(100, round(pct / 10) * 10))
+        if charging:
+            suffix = "-charged" if bucket == 100 and info.get("ac") else "-charging"
+        else:
+            suffix = ""
+        name = f"battery-level-{bucket}{suffix}-symbolic"
+        # Guard against themes lacking the level icons → fall back to a generic
+        # battery glyph instead of a broken-image square.
+        disp = battery_icon.get_display()
+        if disp is not None:
+            theme = Gtk.IconTheme.get_for_display(disp)
+            if not theme.has_icon(name):
+                name = "battery-symbolic"
+        battery_icon.set_from_icon_name(name)
+        # Low + not charging → tint red via the "error" style class.
+        if pct <= 20 and not charging:
+            battery_icon.add_css_class("error")
+            battery_pct_lbl.add_css_class("error")
+        else:
+            battery_icon.remove_css_class("error")
+            battery_pct_lbl.remove_css_class("error")
+        battery_pct_lbl.set_text(f"{pct}%")
+        state = info.get("state") or ""
+        battery_box.set_tooltip_text(f"Mac battery: {pct}% {state}".strip())
+        battery_box.set_visible(True)
+
+    def _refresh_battery():
+        info = get_mac_battery(get_remote_cfg(cfg))
+        GLib.idle_add(lambda: (_set_battery(info), False)[1])
+
     ip_entry = Gtk.Entry(text=remote.get("mac_ip", ""), hexpand=True,
                          valign=Gtk.Align.CENTER, width_chars=16)
     connect_btn = Gtk.Button(label="Connect", css_classes=["suggested-action"],
@@ -297,6 +347,10 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     def _do_test(r, notify):
         ok = test_connection(r, popup_log, notify=notify)
         GLib.idle_add(lambda: set_connected(ok))
+        # Pull battery only when reachable, in the same worker thread.
+        if ok:
+            info = get_mac_battery(r)
+            GLib.idle_add(lambda: (_set_battery(info), False)[1])
 
     def _on_connect(_b):
         r = get_remote_cfg(cfg)
@@ -306,6 +360,7 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     connect_btn.connect("clicked", _on_connect)
 
     ip_row.add_prefix(status_dot)
+    ip_row.add_suffix(battery_box)
     ip_row.add_suffix(ip_entry)
     ip_row.add_suffix(connect_btn)
     conn_grp.add(ip_row)

@@ -16,7 +16,8 @@ except (ValueError, ImportError):
 from .constants import APP_NAME, TARGET_INFO, STAGE_PATTERNS, SKIP_PATTERNS
 from .config import (load_config, load_history, save_history, save_build_entry,
                      load_builds_log, find_apk, get_version, get_build_number,
-                     get_unity_for_project, upload_apk, save_test_entry, APP_DIR)
+                     get_unity_for_project, upload_apk, save_test_entry, APP_DIR,
+                     find_unity_hub, is_unity_running)
 from .worker import BuildWorker
 from .settings_page import SettingsPage
 from .history_page import HistoryPage
@@ -219,6 +220,15 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._settings_save_btn.set_visible(False)
         self._content_header.pack_end(self._settings_save_btn)
         self._content_header.pack_end(self._log_toggle)
+
+        # Single Unity Hub launcher for the whole app (Hub is system-wide, not
+        # per-project) — only shown if Unity Hub is actually installed.
+        if find_unity_hub():
+            hub_btn = Gtk.Button(icon_name="window-new-symbolic",
+                                 tooltip_text="Open Unity Hub",
+                                 css_classes=["flat"])
+            hub_btn.connect("clicked", lambda _: self._open_unity_hub())
+            self._content_header.pack_end(hub_btn)
         self._content_header.pack_end(self.spinner)
         self._content_header.pack_end(self.elapsed_label)
 
@@ -516,6 +526,43 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.cards = {}
         for proj in self.cfg.get("projects", []):
             self.projects_list.append(self._make_row(proj))
+        # Start (once) a low-frequency poll that highlights the Unity icon of
+        # projects currently open in the editor.
+        if not getattr(self, "_unity_poll_id", None):
+            self._unity_poll_id = GLib.timeout_add_seconds(
+                3, self._poll_unity_running)
+
+    def _poll_unity_running(self):
+        """Highlight the Unity button of any project open in the editor.
+
+        The pgrep check runs off the UI thread (a stray editor scan shouldn't
+        stutter the UI); the CSS class flip is marshalled back via idle_add.
+        """
+        cards = list(self.cards.items())
+
+        def _work():
+            states = {name: is_unity_running(c.get("path"))
+                      for name, c in cards}
+            def _apply():
+                for name, running in states.items():
+                    c = self.cards.get(name)
+                    if not c:
+                        continue
+                    btn = c.get("unity_btn")
+                    if not btn:
+                        continue
+                    # "accent" is a built-in libadwaita class → tints the icon
+                    # with the accent color, no custom CSS provider needed.
+                    if running:
+                        btn.add_css_class("accent")
+                        btn.set_tooltip_text("Open in Unity (editor is open)")
+                    else:
+                        btn.remove_css_class("accent")
+                        btn.set_tooltip_text("Open in Unity")
+                return False
+            GLib.idle_add(_apply)
+        threading.Thread(target=_work, daemon=True).start()
+        return True  # keep polling
 
     def _make_row(self, proj):
         """Create a horizontal project row like Unity Hub."""
@@ -673,6 +720,7 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.cards[proj["name"]] = {
             "buttons": buttons, "status": stat,
             "version": ver, "deploy": deploy,
+            "unity_btn": open_unity_btn, "path": proj["path"],
         }
         return row
 
@@ -1295,6 +1343,22 @@ class BuilderWindow(Adw.ApplicationWindow):
             return
         subprocess.Popen([unity, "-projectPath", proj["path"]])
         self._log(f"Opening {proj['name']} in Unity...\n")
+
+    def _open_unity_hub(self, proj=None):
+        """Launch Unity Hub. Opening via the Hub (vs the editor binary directly)
+        goes through Hub's account/license flow — the editor picks up the signed
+        in account and services, which a bare `-projectPath` launch can miss.
+        Hub is system-wide, so no project argument is needed."""
+        cmd = find_unity_hub()
+        if not cmd:
+            self._log("Unity Hub not found (looked for unityhub on PATH and the "
+                      ".app bundle).\n")
+            return
+        try:
+            subprocess.Popen(cmd)
+            self._log("Opening Unity Hub...\n")
+        except Exception as e:
+            self._log(f"Failed to launch Unity Hub: {e}\n")
 
     def _on_scan(self, proj):
         show_scan(self, proj)

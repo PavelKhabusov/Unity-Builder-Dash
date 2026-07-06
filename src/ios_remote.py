@@ -320,6 +320,37 @@ def test_connection(remote, log_cb=None, notify=True):
         return False
 
 
+def get_mac_battery(remote):
+    """Return the Mac's battery as a dict, or None if unreachable.
+
+    {"percent": int, "state": "charging"|"discharging"|"charged"|"",
+     "ac": bool}. Parsed from `pmset -g batt`.
+    """
+    if not remote.get("mac_ip"):
+        return None
+    ok, out = _ssh_probe(remote, "pmset -g batt", timeout=8, connect_timeout=6)
+    if not ok or not out:
+        return None
+    import re
+    m = re.search(r"(\d+)%", out)
+    if not m:
+        return None
+    pct = int(m.group(1))
+    # Match state as a whole word — "discharging" CONTAINS "charging", so a
+    # naive substring check reports a discharging Mac as charging. \b anchors
+    # the word boundary; check discharging first for clarity.
+    state = ""
+    if re.search(r"\bdischarging\b", out):
+        state = "discharging"
+    elif re.search(r"\bcharging\b", out):
+        state = "charging"
+    elif re.search(r"\bcharged\b", out) or "finishing charge" in out:
+        state = "charged"
+    # Power source: pmset prints "Now drawing from 'AC Power'" vs 'Battery Power'.
+    ac = "'AC Power'" in out or "AC attached" in out
+    return {"percent": pct, "state": state, "ac": ac}
+
+
 def _ssh_probe(remote, command, timeout, connect_timeout):
     """Single SSH attempt running `command`. Returns (ok, stdout+stderr)."""
     cmd = ["ssh"] + _ssh_common_opts(remote) + [

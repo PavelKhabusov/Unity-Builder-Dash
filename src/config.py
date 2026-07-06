@@ -171,6 +171,47 @@ def find_unity():
         if os.path.isfile(p): return p
     return ""
 
+def find_unity_hub():
+    """Locate the Unity Hub launcher. Returns a command list to Popen, or []."""
+    import shutil
+    # Linux: unityhub on PATH (/usr/bin/unityhub). macOS: the .app bundle.
+    exe = shutil.which("unityhub")
+    if exe:
+        return [exe]
+    for p in ("/opt/unityhub/unityhub",
+              "/Applications/Unity Hub.app/Contents/MacOS/Unity Hub",
+              os.path.expanduser("~/Applications/Unity Hub.app/Contents/MacOS/Unity Hub")):
+        if os.path.isfile(p):
+            return [p]
+    return []
+
+
+def is_unity_running(project_path):
+    """True if the Unity editor is open on this project.
+
+    Requires BOTH a UnityLockfile AND a live Unity process whose command line
+    references the project path — the lockfile alone survives an editor crash,
+    so it isn't sufficient on its own.
+    """
+    if not project_path:
+        return False
+    lock = os.path.join(project_path, "Temp", "UnityLockfile")
+    if not os.path.exists(lock):
+        return False
+    try:
+        # -f matches against the full command line; the editor is launched with
+        # -projectPath <path>, so the path appears there. Exclude batchmode
+        # (our own build/test runs) so those don't read as "open in editor".
+        r = subprocess.run(["pgrep", "-af", project_path],
+                           capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
+            if "Unity" in line and "-batchmode" not in line:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def list_unity_versions():
     """List all installed Unity versions."""
     base = os.path.expanduser("~/Unity/Hub/Editor")
