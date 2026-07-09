@@ -48,6 +48,23 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._build_queue = []
         self._elapsed_timer = None
 
+        # Custom CSS: highlight the Unity button when the editor is open on a
+        # project. The built-in "accent" class barely shows on a flat icon
+        # button, so we tint the icon green and add a subtle background.
+        _css = Gtk.CssProvider()
+        # Explicit green (not @success_color, which can resolve grey on some
+        # themes) and `background-color` on the button + a green tint on the
+        # icon. !important beats the flat-button's own background.
+        _css.load_from_data(b"""
+        button.unity-running {
+            background-color: rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+        }
+        """)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), _css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
         # ── Split view: sidebar + content ──
         self._split = Adw.NavigationSplitView()
 
@@ -551,13 +568,14 @@ class BuilderWindow(Adw.ApplicationWindow):
                     btn = c.get("unity_btn")
                     if not btn:
                         continue
-                    # "accent" is a built-in libadwaita class → tints the icon
-                    # with the accent color, no custom CSS provider needed.
+                    # unity-running: green-tinted icon + subtle background
+                    # (custom CSS above; "accent" alone was invisible on a flat
+                    # icon button).
                     if running:
-                        btn.add_css_class("accent")
+                        btn.add_css_class("unity-running")
                         btn.set_tooltip_text("Open in Unity (editor is open)")
                     else:
-                        btn.remove_css_class("accent")
+                        btn.remove_css_class("unity-running")
                         btn.set_tooltip_text("Open in Unity")
                 return False
             GLib.idle_add(_apply)

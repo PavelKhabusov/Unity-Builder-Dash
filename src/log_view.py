@@ -8,6 +8,24 @@ from gi.repository import Gtk, Gio, GLib
 # Back-to-back matches are collapsed into a single updating line in the buffer.
 _BEE_PROGRESS_RE = re.compile(r'^\s*\[\s*\d+\s*/\s*\d+\s+\d+[ms]?\]')
 
+# xcodebuild per-file action headers like:
+#   "CompileC /…/foo.o /…/foo.cc normal arm64 c++ com.apple… (in target 'X' from project 'Y')"
+#   "CompileSwift …", "Copy …", "CpResource …", "Ld …", "PhaseScriptExecution …"
+# There are hundreds of these per build (one per source file). We collapse a run
+# of them into a single rolling counter line "⚙ <Action> <target>… (N files)"
+# instead of printing every one. Capture the action verb and the target name.
+_XCODE_ACTION_RE = re.compile(
+    r"^(CompileC|CompileSwift|CompileSwiftSources|CompileAssetCatalog|"
+    r"ScanDependencies|SwiftCompile|SwiftMergeGeneratedHeaders|"
+    r"SwiftGeneratePch|EmitSwiftModule|SwiftEmitModule|"
+    r"Copy|CpResource|CpHeader|Ld|CodeSign|ProcessInfoPlistFile|"
+    r"ProcessProductPackaging\S*|RegisterExecutionPolicyException|"
+    r"PhaseScriptExecution|CompileStoryboard|LinkStoryboards|"
+    r"CompileXCStrings|ExtractAppIntentsMetadata|GenerateDSYMFile|"
+    r"CreateUniversalBinary|Libtool|WriteAuxiliaryFile|MkDir|Touch|"
+    r"ProcessPCH\S*|SwiftDriver\S*)\b"
+    r".*?(?:\(in target '([^']+)'.*)?$")
+
 # Dedup normalization: replace hex runs, long alphanumeric identifiers, and
 # number runs with "#" so two lines that only differ in GUIDs, mangled
 # IL2CPP names, or IL2CPP-generated object file names (e.g. ss2j8xu5o4di.o)
@@ -263,6 +281,7 @@ class LogView(Gtk.Box):
         self._trace_ended_ago = 99
         self._bee_mark = None
         self._bee_line_idx = None
+        self._xcode_runs = {}
         self._buffer_first_idx = 0
         self._pending_lines = []
 
@@ -394,6 +413,13 @@ class LogView(Gtk.Box):
         """Append a line, respecting current filter. Stores raw line for refilter."""
         s = text.strip()
 
+        # While collapsing a run of xcodebuild per-file actions, drop the trace
+        # lines between them entirely (their .o/.cc paths are the noise the
+        # "⚙ … (N files)" counter already represents). Dropping them keeps the
+        # counter line's stored index/mark stable for in-place updates.
+        if getattr(self, "_xcode_runs", None) and s and self._is_trace_line(text):
+            return
+
         # Skip lines matching exclude patterns (and suppress following trace)
         if self._exclude_patterns and s:
             for pat in self._exclude_patterns:
@@ -456,6 +482,71 @@ class LogView(Gtk.Box):
                 self._insert_tagged(text)
                 self._bee_mark = mark
             return
+
+        # Collapse runs of xcodebuild per-file action headers (CompileC, Copy,
+        # Ld, …) into ONE rolling "⚙ <Action> <target>… (N files)" line. There
+        # are hundreds per build; printing each floods the log. Same mechanism
+        # as the Bee counter above. The counter line is UPDATED IN PLACE (its
+        # text is rewritten where it sits) rather than moved to the end, because
+        # the per-file `⋯ trace ⋯` markers in between would otherwise leave it
+        # stranded mid-buffer. trace lines don't reset the run — only a real
+        # (non-trace, non-action) build line does.
+        xm = _XCODE_ACTION_RE.match(s) if s else None
+        if xm:
+            action = xm.group(1)
+            target = xm.group(2) or ""
+            # Xcode builds multiple targets in parallel, so action lines for
+            # BoringSSL-GRPC / AppAuth / … interleave. Keep a counter PER TARGET
+            # (self._xcode_runs) and update each target's existing line in place,
+            # wherever it sits, instead of starting a new one every switch.
+            runs = getattr(self, "_xcode_runs", None)
+            if runs is None:
+                runs = self._xcode_runs = {}
+            tgt = f" {target}" if target else ""
+
+            def _label(g):
+                verb = g["action"] if len(g["actions"]) == 1 else "Building"
+                n = g["count"]
+                return f"⚙ {verb}{tgt}… ({n} step{'s' if n != 1 else ''})"
+
+            grp = runs.get(target)
+            if grp is not None:
+                # Existing counter for this target → bump + rewrite its line.
+                grp["count"] += 1
+                grp["actions"].add(action)
+                new_line = _label(grp) + "\n"
+                if 0 <= grp["idx"] < len(self._full_lines):
+                    self._full_lines[grp["idx"]] = new_line
+                mk = grp.get("mark")
+                if mk is not None and not self._paused:
+                    try:
+                        start = self._buffer.get_iter_at_mark(mk)
+                        end = start.copy(); end.forward_line()
+                        self._buffer.delete(start, end)
+                        self._buffer.insert(
+                            self._buffer.get_iter_at_mark(mk), new_line)
+                    except Exception:
+                        pass
+                return
+            # First action for this target → emit a fresh counter line.
+            grp = {"action": action, "actions": {action},
+                   "target": target, "count": 1}
+            runs[target] = grp
+            line = _label(grp) + "\n"
+            self._full_lines.append(line)
+            grp["idx"] = len(self._full_lines) - 1
+            if not self._paused and self._passes_filter(line):
+                end_iter = self._buffer.get_end_iter()
+                mark = self._buffer.create_mark(None, end_iter, True)  # left-gravity
+                self._insert_tagged(line)
+                grp["mark"] = mark
+            return
+        # Trace lines (per-file paths / `cd` / tool invocations under an action
+        # header) must NOT end the counters — they belong to the compile steps.
+        # A genuine non-trace build line means the action phase is over: clear
+        # all per-target counters so the next action phase starts fresh.
+        if not self._is_trace_line(text):
+            self._xcode_runs = {}
 
         self._full_lines.append(text)
         if len(self._full_lines) > 10000:
@@ -583,6 +674,14 @@ class LogView(Gtk.Box):
         # progress reports from rsync/Transfer — all go into the trace block.
         if s.startswith("cd /"):
             return True
+        # WriteAuxiliaryFile implementation lines: "write-file <path>" and the
+        # compiler-args line that follows (starts with a quoted flag like
+        # "'-std=gnu++17' …" or a bare "-flag"). Fold them so the counter isn't
+        # broken between consecutive WriteAuxiliaryFile actions.
+        if s.startswith("write-file "):
+            return True
+        if s.startswith("'-") or (s.startswith("-") and " -" in s[:40]):
+            return True
         if s.startswith("/Applications/Xcode.app/Contents/Developer/"):
             return True
         if s.startswith("/Users/") and "/Library/Developer/Xcode/" in s:
@@ -606,6 +705,57 @@ class LogView(Gtk.Box):
         # Unzip verbose output — one `inflating:`/`extracting:`/`creating:`
         # line per file. Hide the wall of text under the fold.
         if s.startswith("inflating:") or s.startswith("extracting:") or s.startswith("creating:"):
+            return True
+        # Xcode/DVT internal operation backtraces — dozens of frames Xcode dumps
+        # for every scheme operation, e.g.
+        #   "<__DVTSwiftAsyncOperation: 0x…; state = …> created at:"
+        #   "0   -[DVTOperation init] (in DVTFoundation)"
+        #   "19   main (in xcodebuild)"  /  "20   start (in dyld)"
+        # Pure noise — fold them. The header, the numbered frames, and the
+        # "in <Framework>" tail are all unambiguous.
+        if s.startswith("<") and "created at:" in s:
+            return True
+        if _re.match(r"^\d+\s+\S.*\(in \S+\)\s*$", s):
+            return True
+        # Unity shader-compilation detail — one block per shader/pass:
+        #   'Compiling shader "X"' / 'Pass "" (vp)' / 'Target graphics API: metal'
+        #   'Full variant space: N' / 'After … stripping: N' / 'Processed in …'
+        if s.startswith("Compiling shader ") or s.startswith('Pass "'):
+            return True
+        if (s.startswith("Target graphics API:") or
+                s.startswith("Full variant space:") or
+                s.startswith("After settings filtering:") or
+                s.startswith("After built-in stripping:") or
+                s.startswith("After scriptable stripping:") or
+                s.startswith("Processed in ")):
+            return True
+        # Unity IL2CPP / assembly size report — hundreds of lines like
+        #   " 0.1 kb\t 0.0% Packages/com.unity.…/Foo.cs"
+        # (size, percentage, path). Fold the whole listing.
+        if _re.match(r"^\s*[\d.]+\s*kb\s+[\d.]+%\s", line):
+            return True
+        # Native crash backtraces (UnityFramework / IL2CPP), e.g.
+        #   "Backtrace" / "===========…" header, then frames:
+        #   "0   UnityFramework   0x000000012…  _ZN12UnityClassic… + 28"
+        # A frame is: index, module, 0x-address, symbol(+offset). Hundreds deep.
+        if s == "Backtrace" or _re.match(r"^=+$", s):
+            return True
+        if _re.match(r"^\d+\s+\S+\s+0x[0-9a-fA-F]+\s+\S", s):
+            return True
+        # IL2CPP ILPP server (ASP.NET Core / gRPC) request log — hundreds of
+        # near-identical entries, one per PostProcessAssembly call:
+        #   "info: Microsoft.AspNetCore.Hosting.Diagnostics[2]"
+        #   "      Request finished HTTP/2 POST http://ilpp/… - 200 …"
+        #   "      Executing/Executed endpoint 'gRPC - /UnityILPP…'"
+        #   "      processors: …" / "      running …"
+        if _re.match(r"^(info|warn|trce|dbug|fail|crit):\s+Microsoft\.", s):
+            return True
+        if (s.startswith("Request starting HTTP") or
+                s.startswith("Request finished HTTP") or
+                s.startswith("Executing endpoint ") or
+                s.startswith("Executed endpoint ") or
+                s.startswith("processors: ") or
+                s.startswith("running ")):
             return True
         return False
 

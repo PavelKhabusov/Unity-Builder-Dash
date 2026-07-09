@@ -971,7 +971,12 @@ class ProgressListener:
                         chunk = client.recv(4096)
                         if not chunk:
                             break
-                        buf += chunk
+                        # AppleScript's `do shell script` returns output with
+                        # CR (\r) line separators, not \n — e.g. the whole
+                        # `unzip` log arrives as one CR-joined blob. Normalize
+                        # CRLF and lone CR to \n so each line is split (and
+                        # folded) individually instead of as one giant line.
+                        buf += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
                             text = line.decode("utf-8", errors="replace").strip()
