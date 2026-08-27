@@ -5,6 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3-3776AB?logo=python&logoColor=white)
 ![GTK4](https://img.shields.io/badge/GTK4-Libadwaita-4A86CF?logo=gnome&logoColor=white)
 ![Unity](https://img.shields.io/badge/Unity-6+-000000?logo=unity&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow)
 
 A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, profiling and managing Unity projects and Android devices.
 
