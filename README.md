@@ -8,6 +8,16 @@
 
 A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, profiling and managing Unity projects and Android devices.
 
+## Quick install
+
+```bash
+git clone https://github.com/PavelKhabusov/Unity-Builder-Dash.git && cd Unity-Builder-Dash
+cp config.example.json config.json
+./install.sh   # GNOME launcher entry; or just ./build.py
+```
+
+Requirements per distro are in [Requirements](#requirements).
+
 ## Features
 
 ### Projects
