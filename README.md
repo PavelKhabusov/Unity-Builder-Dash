@@ -1,13 +1,24 @@
-<img src="icons/ubd-app-icon.png" width="64" align="left" style="margin-right: 8px;" />
+<div align="center">
+
+<img src="icons/ubd-app-icon.png" width="96" alt="Unity Builder Dash">
 
 # Unity Builder Dash
 
+**Native GNOME (GTK4 + Libadwaita) app for building, deploying, profiling and managing**
+Unity projects and Android devices.
+
+![Status](https://img.shields.io/badge/status-active-2ea043)
+![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20GNOME-1f1f1f)
+![License](https://img.shields.io/badge/license-MIT-7ba7d4)
+
 ![Python](https://img.shields.io/badge/Python-3-3776AB?logo=python&logoColor=white)
 ![GTK4](https://img.shields.io/badge/GTK4-Libadwaita-4A86CF?logo=gnome&logoColor=white)
-![Unity](https://img.shields.io/badge/Unity-6+-000000?logo=unity&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+![Unity](https://img.shields.io/badge/Unity-6%2B-000000?logo=unity&logoColor=white)
+![ADB](https://img.shields.io/badge/ADB-Android%20Tools-3DDC84?logo=android&logoColor=white)
 
-A native GNOME (GTK4 + Libadwaita) desktop application for building, deploying, profiling and managing Unity projects and Android devices.
+</div>
+
+---
 
 ## Quick install
 
