@@ -187,7 +187,7 @@ Agents (and scripts) can start builds and watch them without the GUI:
 
 ```bash
 ./ubd projects                       # projects and targets
-./ubd build KartotekaAR ios --wait   # build, stream the log, exit with the result
+./ubd build ARViewer ios --wait   # build, stream the log, exit with the result
 ./ubd status; ./ubd log -f; ./ubd history; ./ubd devices; ./ubd ios-status; ./ubd cancel
 ```
 

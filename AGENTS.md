@@ -23,7 +23,7 @@ Do not bypass this check and do not start Unity manually in parallel. Wait with 
 
 ## Commands
 
-Run `~/DEV/unity-builder-dash/ubd <command>` (or `python3 -m src.cli` from the repo folder).
+Run `~/projects/unity-builder-dash/ubd <command>` (or `python3 -m src.cli` from the repo folder).
 Every command accepts `--json` for machine-readable output.
 
 | Command | What it does |
@@ -51,10 +51,10 @@ Every command accepts `--json` for machine-readable output.
 ## Examples
 
 ```bash
-cd ~/DEV/unity-builder-dash
-./ubd build KartotekaAR ios --dry-run          # check the plan
-./ubd build KartotekaAR ios --wait             # full iOS build of KartotekaAR
-./ubd build KartotekaMR android --scripts-only --install 2G0YC1ZG4P026Z
+cd ~/projects/unity-builder-dash
+./ubd build ARViewer ios --dry-run          # check the plan
+./ubd build ARViewer ios --wait             # full iOS build of ARViewer
+./ubd build MyGame android --scripts-only --install R58M123ABC
 ./ubd status && ./ubd log --tail 50
 ```
 
