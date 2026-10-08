@@ -181,6 +181,21 @@ Android and iOS build numbers are incremented **independently** —
 UBD reads both from `ProjectSettings.asset` and shows them in the project
 row (e.g. `v1.0.0 · iOS 325 / A 452`).
 
+## Agent control (CLI + local API)
+
+Agents (and scripts) can start builds and watch them without the GUI:
+
+```bash
+./ubd projects                       # projects and targets
+./ubd build KartotekaAR ios --wait   # build, stream the log, exit with the result
+./ubd status; ./ubd log -f; ./ubd history; ./ubd devices; ./ubd ios-status; ./ubd cancel
+```
+
+If the GUI is running, the command is sent to it over a local HTTP API on `127.0.0.1:47816`
+(`/health`, `/commands.json`, `/status`, `/build`, …) and shows up in the GUI log. Otherwise a
+headless runner builds in the background with the same code. Only one Unity build runs per
+machine. Commands, exit codes and rules: [AGENTS.md](AGENTS.md).
+
 ## Install as GNOME app
 
 ```bash
@@ -238,6 +253,12 @@ unity-builder-dash/
     profiler.py               — Real-time profiler — FPS, RAM, CPU, GPU, thermal
     settings_page.py          — Settings — projects, paths, upload, theme
     dialogs.py                — Health check dialog
+    pipeline.py               — Build pipeline shared by GUI/headless/CLI (iOS remote, history)
+    agent_state.py            — Current build state + live log for agents
+    agent_api.py              — Local HTTP API on 127.0.0.1 for agents
+    headless.py               — Headless build runner (no GUI)
+    cli.py                    — `ubd` CLI
+  ubd                         — CLI wrapper (see AGENTS.md)
 ```
 
 ## License

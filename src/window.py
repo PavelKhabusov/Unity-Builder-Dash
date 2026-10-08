@@ -25,8 +25,10 @@ from .devices import DevicesPage
 from .dialogs import show_scan, show_screenshots, show_ios_popup
 from .log_view import LogView
 from .profiler import ProfilerPage
-from . import ios_remote
+from . import ios_remote, pipeline
 from .config import save_config
+from .agent_state import tracker
+from .agent_api import AgentServer, Backend, api_port
 
 
 # Sidebar items: (id, icon, label)
@@ -39,7 +41,9 @@ SIDEBAR_ITEMS = [
 SIDEBAR_BOTTOM = ("settings", "emblem-system-symbolic", "Settings")
 
 
-class BuilderWindow(Adw.ApplicationWindow):
+class BuilderWindow(Adw.ApplicationWindow, Backend):
+    owner = "gui"
+
     def __init__(self, app, cfg):
         super().__init__(application=app, title=APP_NAME,
                          default_width=1000, default_height=700)
@@ -316,14 +320,22 @@ class BuilderWindow(Adw.ApplicationWindow):
                 ios_cfg.get("progress_port", 8080),
                 log_cb=_ios_progress_log,
                 log_bulk_cb=_ios_progress_bulk,
-                progress_cb=self.progress_bar.set_fraction)
+                progress_cb=self._set_progress)
             self._ios_progress_listener.start()
 
         # Stop listener (close socket) when the window closes so the port
         # frees immediately on quit — no orphan TCP:8080 across restarts.
         self.connect("close-request", self._on_window_close)
 
+        self._agent_install = None
+        self._agent_server = AgentServer(self, api_port(cfg))
+        if not self._agent_server.start():
+            print(f"[agent api] not started: {self._agent_server.error}")
+
     def _on_window_close(self, *_a):
+        srv = getattr(self, "_agent_server", None)
+        if srv:
+            srv.stop()
         # Stop TCP listener so port 8080 frees up immediately
         lst = getattr(self, "_ios_progress_listener", None)
         if lst:
@@ -507,6 +519,11 @@ class BuilderWindow(Adw.ApplicationWindow):
             get_tag=self._get_tag,
             extra_end=[log_close],
             exclude_patterns=self.cfg.get("log_filters", []))
+        _append_lines = self._log_widget.append_lines
+        def _tee_lines(lines, _orig=_append_lines):
+            tracker.log_lines(lines)
+            return _orig(lines)
+        self._log_widget.append_lines = _tee_lines
         self._build_log_box.append(self._log_widget)
 
         self._build_log_box.set_visible(False)
@@ -801,10 +818,16 @@ class BuilderWindow(Adw.ApplicationWindow):
         return None
 
     def _log(self, t):
+        tracker.log(t)
         self._log_widget.append_line(t)
         self._scan_for_alerts((t,))
 
+    def _set_progress(self, frac):
+        tracker.progress(frac)
+        self.progress_bar.set_fraction(frac)
+
     def _on_stage(self, text, frac):
+        tracker.stage(text, frac if frac >= 0 else None)
         if text: self.stage_label.set_text(text)
         if frac >= 0: self.progress_bar.set_fraction(frac)
         elif text: self.progress_bar.pulse()
@@ -989,7 +1012,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             self._ios_progress_listener = ios_remote.ProgressListener(
                 port, log_cb=self._log,
                 log_bulk_cb=_bulk,
-                progress_cb=self.progress_bar.set_fraction)
+                progress_cb=self._set_progress)
             self._ios_progress_listener.start()
 
         # Auto-show the log panel whenever the popup writes something so users
@@ -1016,54 +1039,14 @@ class BuilderWindow(Adw.ApplicationWindow):
         if hasattr(self, "_settings_page"):
             self._settings_page.select_tab("ios")
 
-    # action_id → (needs_unity, needs_zip, needs_scp, osa_arg_of_device, label)
-    # For run/runFull/build_only the prefix (`run:` vs `install:`) is swapped
-    # in _on_ios_action based on cfg.ios_remote.run_with_test.
-    _IOS_ACTIONS = {
-        "full":          (True,  True,  True,  lambda dev: f"{{PREFIX}}Full:{dev}", "Full build"),
-        "xcode":         (False, False, False, lambda dev: f"{{PREFIX}}Full:{dev}", "Xcode build"),
-        "build_only":    (False, False, False, lambda dev: f"{{PREFIX}}:{dev}",     "Build & install (no refresh)"),
-        "without_xcode": (True,  True,  True,  lambda _: "unpack",                  "Build without Xcode"),
-        "archive":       (False, True,  False, lambda _: None,                      "Pack zip"),
-        "unpack":        (False, False, False, lambda _: "unpack",                  "Unpack on Mac"),
-        "all":           (False, True,  True,  lambda _: "unpack",                  "Pack & unpack"),
-        "stop":          (False, False, False, lambda _: "stop",                    "Stop"),
-        "clear_cache":   (False, False, False, lambda _: "clearCache",              "Clear .pcm cache"),
-        "add_widget":    (False, False, False, lambda _: "addWidget",               "Add widget"),
-        "clear_build":   (False, False, False, lambda _: "clearBuild",              "Clean build"),
-        "update_pod":    (False, False, False, lambda _: "updatePod",               "Update Pod"),
-        "open_xcode":    (False, False, False, lambda _: "openXcode",               "Open in Xcode"),
-        # Release pipeline (App Store). Each runs on the already-unpacked iOS/
-        # project on the Mac — no Unity rebuild, no re-zip. archive → validate →
-        # distribute, run in order. Validate exports the .ipa that distribute
-        # then uploads, so run Validate before Distribute.
-        "archive_app":   (False, False, False, lambda _: "archiveApp",              "Archive (App Store)"),
-        "validate_app":  (False, False, False, lambda _: "validateApp",             "Validate archive"),
-        "distribute_app":(False, False, False, lambda _: "distributeApp",           "Distribute to App Store"),
-    }
+    _IOS_ACTIONS = pipeline.IOS_ACTIONS
 
-    def _on_ios_action(self, proj, action_id, device_target):
-        spec = self._IOS_ACTIONS.get(action_id)
+    def _on_ios_action(self, proj, action_id, device_target, increment=None, scripts_only=None):
+        spec = pipeline.resolve_ios_action(self.cfg, action_id, device_target)
         if not spec:
             self._log(f"Unknown iOS action: {action_id}\n")
             return
-        needs_unity, needs_zip, needs_scp, osa_fn, label = spec
-        osa_arg = osa_fn(device_target)
-        # Pick command prefix based on cfg.ios_remote.run_with_test toggle
-        # (kebab menu checkbox). Default off = install-only via devicectl;
-        # on = xcodebuild test (auto-launches app through xctest harness).
-        if osa_arg and "{PREFIX}" in osa_arg:
-            prefix = "run" if (self.cfg.get("ios_remote") or {}).get("run_with_test") else "install"
-            osa_arg = osa_arg.replace("{PREFIX}", prefix)
-
-        # Show what's running in the main status bar so it's visible after the
-        # popup closes.
-        dev_label = ""
-        for lbl, name in ios_remote.get_devices(self.cfg):
-            if name == device_target:
-                dev_label = f" — {lbl}"
-                break
-        status_text = f"iOS: {label}{dev_label}"
+        needs_unity, needs_zip, needs_scp, osa_arg, label, status_text = spec
 
         # Stop kills the currently running remote SSH (and cancels unity if any)
         if action_id == "stop":
@@ -1072,6 +1055,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             runner = getattr(self, "_ios_runner", None)
             if runner:
                 runner.stop()
+            tracker.finish(False, cancelled=True)
             self.stage_label.set_text("iOS: stop")
             # Still send "stop" to Mac in case a Terminal job is running there
             self._ios_run_remote(osa_arg)
@@ -1082,13 +1066,17 @@ class BuilderWindow(Adw.ApplicationWindow):
             self._log("Mac IP is empty — set it in the iOS popup.\n")
             return
 
+        if not tracker.active:
+            tracker.begin(proj["name"], "ios", action_id, "gui",
+                          {"device": device_target})
         self._toggle_build_log(True)
         self.status.set_text(f"{proj['name']}  {status_text}")
         self.stage_label.set_text(status_text)
 
         if needs_unity:
             # Run Unity iOS build first, then chain zip/scp/ssh on success
-            self._start_ios_build(proj, needs_zip, needs_scp, osa_arg, status_text)
+            self._start_ios_build(proj, needs_zip, needs_scp, osa_arg, status_text,
+                                  increment, scripts_only)
         else:
             # Pure post-build pipeline (runs off the UI thread)
             threading.Thread(
@@ -1096,11 +1084,13 @@ class BuilderWindow(Adw.ApplicationWindow):
                 args=(proj, needs_zip, needs_scp, osa_arg, False, status_text),
                 daemon=True).start()
 
-    def _start_ios_build(self, proj, needs_zip, needs_scp, osa_arg, status_text):
+    def _start_ios_build(self, proj, needs_zip, needs_scp, osa_arg, status_text,
+                         increment=None, scripts_only=None):
         """Run Unity iOS build, then chain into zip/scp/ssh."""
         unity = get_unity_for_project(self.cfg, proj)
         if not unity or not os.path.isfile(unity):
             self._log("Unity editor not found. Check Settings.\n")
+            tracker.finish(False)
             return
         # Fully reset device-lock alert state for the new build.
         self._lock_notified_at = 0
@@ -1130,8 +1120,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.worker = BuildWorker(
             self.cfg, proj, "ios",
             self._log, after_unity, self._on_stage,
-            auto_increment=self.increment_toggle.get_active(),
-            scripts_only=self.scripts_only_toggle.get_active(),
+            auto_increment=self.increment_toggle.get_active() if increment is None else increment,
+            scripts_only=self.scripts_only_toggle.get_active() if scripts_only is None else scripts_only,
             log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 
@@ -1141,50 +1131,14 @@ class BuilderWindow(Adw.ApplicationWindow):
         if not already_building:
             GLib.idle_add(self._set_building, True)
             GLib.idle_add(self.progress_bar.set_fraction, 0)
-        GLib.idle_add(self.stage_label.set_text, status_text)
-
         done = (self._on_done if already_building else self._ios_cleanup)
-
-        ok = True
-        build_dir = proj.get("build_dir") or os.path.join(proj["path"], "Builds")
-
-        if needs_zip:
-            GLib.idle_add(self.stage_label.set_text, f"{status_text} — zipping")
-            try:
-                ios_remote.make_ios_zip(build_dir, log_cb=self._log)
-            except Exception as e:
-                GLib.idle_add(self._log, f"Zip failed: {e}\n")
-                ok = False
-
-        # Anything below talks to the Mac over SSH (scp / osascript). Wake it
-        # first — an Apple Silicon MacBook on Wi-Fi+battery sleeps with sshd
-        # down and won't wake from the network on its own, so a bare scp/ssh
-        # would just hang until timeout. wake_mac() hammers it awake and starts
-        # caffeinate so it can't doze off mid-build.
-        if ok and (needs_scp or osa_arg is not None):
-            GLib.idle_add(self.stage_label.set_text, f"{status_text} — waking Mac")
-            remote = ios_remote.get_remote_cfg(self.cfg)
-            ok = ios_remote.wake_mac(remote, log_cb=self._log)
-
-        if ok and needs_scp:
-            GLib.idle_add(self.stage_label.set_text, f"{status_text} — uploading")
-            remote = ios_remote.get_remote_cfg(self.cfg)
-            zip_path = os.path.join(build_dir, "iOS.zip")
-            ok = ios_remote.scp_to_mac(zip_path, remote, log_cb=self._log)
-
-        if ok and osa_arg is not None:
-            GLib.idle_add(self.stage_label.set_text, f"{status_text} — Mac")
-            # RemoteRunner already invokes done_cb via GLib.idle_add on the
-            # main thread — passing `done` directly. An intermediate
-            # `lambda rok: GLib.idle_add(done, rok)` double-schedules AND
-            # (worse) returns the source-ID int → GLib treats the lambda as
-            # a repeating idle source and re-fires it every tick, calling
-            # _on_done in an infinite loop until AttributeError trips on
-            # self.worker=None (cleared by the first successful call).
-            self._ios_run_remote(osa_arg, on_remote_done=done)
-            return  # done fires from RemoteRunner callback
-
-        GLib.idle_add(done, ok)
+        # RemoteRunner invokes done_cb via GLib.idle_add itself — pass `done`
+        # directly; a wrapper returning idle_add's source-ID would re-fire forever.
+        pipeline.ios_post_build(
+            self.cfg, proj, needs_zip, needs_scp, osa_arg, self._log,
+            self.stage_label.set_text,
+            lambda arg, d: self._ios_run_remote(arg, on_remote_done=d),
+            done, status_text)
 
     def _ios_run_remote(self, osa_arg, on_remote_done=None):
         remote = ios_remote.get_remote_cfg(self.cfg)
@@ -1194,13 +1148,15 @@ class BuilderWindow(Adw.ApplicationWindow):
         runner = ios_remote.RemoteRunner(
             remote, log_cb=self._log,
             done_cb=on_remote_done,
-            progress_cb=self.progress_bar.set_fraction,
+            progress_cb=self._set_progress,
             log_bulk_cb=_bulk)
         self._ios_runner = runner
         runner.run(osa_arg)
 
     def _ios_cleanup(self, ok):
         """UI reset after a pure-remote (non-Unity) iOS action."""
+        if not self.worker:
+            tracker.finish(ok)
         self._set_building(False)
         self.stage_label.set_text("Done" if ok else "Failed")
         self.progress_bar.set_fraction(1.0 if ok else 0)
@@ -1220,11 +1176,18 @@ class BuilderWindow(Adw.ApplicationWindow):
         self._build_queue = q
         self._start(f[0], f[1])
 
-    def _start(self, proj, target_key, aab=False):
+    def _start(self, proj, target_key, aab=False, increment=None, scripts_only=None):
         unity = get_unity_for_project(self.cfg, proj)
         if not unity or not os.path.isfile(unity):
             self._log("Unity editor not found. Check Settings.\n")
             return
+        if increment is None:
+            increment = self.increment_toggle.get_active()
+        if scripts_only is None:
+            scripts_only = self.scripts_only_toggle.get_active()
+        if not tracker.active:
+            tracker.begin(proj["name"], target_key, "aab" if aab else "apk", "gui",
+                          {"increment": increment, "scripts_only": scripts_only, "aab": aab})
         self._log_widget.clear()
         self._toggle_build_log(True)
         self._set_building(True)
@@ -1237,13 +1200,47 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Starting Unity...")
         self.worker = BuildWorker(self.cfg, proj, target_key,
                                   self._log, self._on_done, self._on_stage,
-                                  auto_increment=self.increment_toggle.get_active(),
-                                  scripts_only=self.scripts_only_toggle.get_active(),
+                                  auto_increment=increment,
+                                  scripts_only=scripts_only,
                                   aab=aab,
                                   log_bulk_cb=self._log_widget.append_lines)
         self.worker.start()
 
+    # ── Agent API backend (called on the main thread by AgentServer) ──
+
+    def start_build(self, req):
+        err, p = pipeline.parse_build_request(self.cfg, req)
+        if err:
+            return 400, {"ok": False, "error": err}
+        own = bool(self.worker) or tracker.active or bool(getattr(self, "_test_proc", None))
+        reason = pipeline.busy_reason(own_busy=own, project=p["proj"])
+        if reason:
+            return 409, {"ok": False, "error": f"busy: {reason}", "status": tracker.snapshot()}
+        proj, target = p["proj"], p["target"]
+        action = p["ios_action"] if target == "ios" else ("aab" if p["aab"] else "apk")
+        tracker.begin(proj["name"], target, action, "api", pipeline.options_of(p))
+        self._build_queue = []
+        self._agent_install = p["install"] if target == "android" else None
+        self._log(f"[agent] {proj['name']} / {target} ({action})\n")
+        if target == "ios":
+            self._on_ios_action(proj, p["ios_action"], p["device"],
+                                increment=p["increment"], scripts_only=p["scripts_only"])
+        else:
+            self._start(proj, target, aab=p["aab"], increment=p["increment"],
+                        scripts_only=p["scripts_only"])
+        st = tracker.snapshot()
+        if not st.get("running"):
+            return 500, {"ok": False, "error": st.get("stage") or "failed to start"}
+        return 200, {"ok": True, "log_path": st.get("log_path"), "status": st}
+
+    def cancel(self):
+        if not (self.worker or tracker.active):
+            return 200, {"ok": True, "cancelled": False, "note": "nothing running"}
+        self._on_cancel(None)
+        return 200, {"ok": True, "cancelled": True}
+
     def _on_done(self, ok):
+        install, self._agent_install = self._agent_install, None
         try:
             name = self.worker.project["name"]
             proj = self.worker.project
@@ -1253,19 +1250,7 @@ class BuilderWindow(Adw.ApplicationWindow):
             if c["deploy"]:
                 c["deploy"].set_sensitive(find_apk(proj) is not None)
 
-            duration = int(time.time() - self.worker.start_time) if self.worker.start_time else 0
-            if ok and self.worker.start_time:
-                h = load_history()
-                h[f"{name}_{self.worker.target}"] = duration
-                save_history(h)
-
-            apk = find_apk(proj) if ok else None
-            try:
-                apk_size = os.path.getsize(apk) if apk and os.path.isfile(apk) else None
-            except OSError:
-                apk_size = None
-            save_build_entry(name, self.worker.target, ok, duration,
-                             apk_size, get_build_number(proj["path"], self.worker.target))
+            pipeline.record_build(proj, self.worker.target, ok, self.worker.start_time)
 
             try:
                 icon = "dialog-ok-apply" if ok else "dialog-error"
@@ -1276,12 +1261,21 @@ class BuilderWindow(Adw.ApplicationWindow):
             el = self.worker.elapsed_str()
             self.status.set_text(f"{name}  {'done' if ok else 'failed'}  {el}")
 
+            if ok and install:
+                def do_install(p=proj, dev=install):
+                    iok = pipeline.install_apk(p, dev, lambda t: GLib.idle_add(self._log, t))
+                    GLib.idle_add(tracker.finish, iok)
+                threading.Thread(target=do_install, daemon=True).start()
+            else:
+                tracker.finish(ok)
+
             if ok and self._build_queue:
                 p, t = self._build_queue.pop(0)
                 self._start(p, t)
         except Exception as e:
             print(f"[_on_done] ERROR: {e}")
             import traceback; traceback.print_exc()
+            tracker.finish(ok)
         finally:
             # ALWAYS stop building state
             self._set_building(False)
@@ -1410,6 +1404,8 @@ class BuilderWindow(Adw.ApplicationWindow):
         self.stage_label.set_text("Cancelled")
         self.progress_bar.set_fraction(0)
         self._log("\n  Cancelled by user.\n")
+        self._agent_install = None
+        tracker.finish(False, cancelled=True)
 
     def _get_known_fixtures(self, proj):
         """Extract test fixture names from previous XML results."""
