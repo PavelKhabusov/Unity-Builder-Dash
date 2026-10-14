@@ -3,6 +3,7 @@ import os, re, socket, subprocess, threading
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 from .log_view import LogView
 from . import ios_remote
+ADB = os.path.expanduser("~/.local/bin/adb") if os.path.exists(os.path.expanduser("~/.local/bin/adb")) else "adb"
 
 
 # logcat -v threadtime line prefix: "MM-DD HH:MM:SS.mmm  PID  TID  "
@@ -13,7 +14,7 @@ LOGCAT_PREFIX_RE = re.compile(
 
 def _adb(*args, device=None, timeout=15):
     """Run adb command, return (success, stdout, stderr)."""
-    cmd = ["adb"]
+    cmd = [ADB]
     if device:
         cmd += ["-s", device]
     cmd += list(args)
@@ -103,7 +104,7 @@ def _probe_adb_health():
     info["alive"] = _adb_daemon_alive(timeout=0.5)
     if info["alive"]:
         try:
-            r = subprocess.run(["adb", "devices", "-l"],
+            r = subprocess.run([ADB, "devices", "-l"],
                                capture_output=True, text=True, timeout=2)
             info["responsive"] = (r.returncode == 0)
             if info["responsive"]:
@@ -507,7 +508,7 @@ class DevicesPage(Gtk.Box):
                 # can surface a more actionable "replug device" hint
                 # instead of looping silently on "down".
                 try:
-                    subprocess.run(["adb", "start-server"], timeout=5,
+                    subprocess.run([ADB, "start-server"], timeout=5,
                                    capture_output=True)
                     self._adb_start_server_hung = False
                 except subprocess.TimeoutExpired:
@@ -523,7 +524,7 @@ class DevicesPage(Gtk.Box):
                 subprocess.run(["pkill", "-9", "-f", "adb.*fork-server"],
                                timeout=3, capture_output=True)
                 _t.sleep(0.3)
-                subprocess.run(["adb", "start-server"], timeout=5,
+                subprocess.run([ADB, "start-server"], timeout=5,
                                capture_output=True)
             elif state == "mtp_blocked":
                 # Frees the USB endpoint that gvfsd-mtp/gphoto2 holds.
@@ -533,10 +534,10 @@ class DevicesPage(Gtk.Box):
                     subprocess.run(["killall", proc],
                                    capture_output=True, timeout=2)
                 _t.sleep(0.5)
-                subprocess.run(["adb", "kill-server"], timeout=3,
+                subprocess.run([ADB, "kill-server"], timeout=3,
                                capture_output=True)
                 _t.sleep(0.3)
-                subprocess.run(["adb", "start-server"], timeout=5,
+                subprocess.run([ADB, "start-server"], timeout=5,
                                capture_output=True)
             elif state == "stuck":
                 for line in info.get("stuck", []):
@@ -1324,7 +1325,7 @@ class DevicesPage(Gtk.Box):
 
         def reader_thread():
             try:
-                cmd = ["adb", "-s", dev["id"], "logcat", "-v", "threadtime"]
+                cmd = [ADB, "-s", dev["id"], "logcat", "-v", "threadtime"]
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1)

@@ -1,3 +1,4 @@
+import os
 """Profiler page — real-time device performance monitoring via ADB.
 
 Collects metrics from:
@@ -12,10 +13,11 @@ Collects metrics from:
 import math, subprocess, threading, re
 from collections import deque
 from gi.repository import Gtk, Adw, GLib
+ADB = os.path.expanduser("~/.local/bin/adb") if os.path.exists(os.path.expanduser("~/.local/bin/adb")) else "adb"
 
 
 def _adb_quick(*args, device=None, timeout=5):
-    cmd = ["adb"]
+    cmd = [ADB]
     if device:
         cmd += ["-s", device]
     cmd += list(args)
@@ -556,10 +558,10 @@ class ProfilerPage(Gtk.Box):
         def reader():
             try:
                 # Clear old logcat first
-                subprocess.run(["adb", "-s", dev_id, "logcat", "-c", "-b", "main"],
+                subprocess.run([ADB, "-s", dev_id, "logcat", "-c", "-b", "main"],
                                capture_output=True, timeout=3)
                 proc = subprocess.Popen(
-                    ["adb", "-s", dev_id, "logcat", "-s", "VrApi:V"],
+                    [ADB, "-s", dev_id, "logcat", "-s", "VrApi:V"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     text=True, bufsize=1)
                 self._vrapi_proc = proc

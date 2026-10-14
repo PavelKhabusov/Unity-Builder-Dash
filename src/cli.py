@@ -8,6 +8,7 @@ import urllib.request, urllib.error
 
 from .config import load_config, load_builds_log, APP_DIR
 from .agent_state import read_state, pid_alive, gui_processes, LOGS_DIR
+ADB = os.path.expanduser("~/.local/bin/adb") if os.path.exists(os.path.expanduser("~/.local/bin/adb")) else "adb"
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_BUSY, EXIT_OLD_GUI, EXIT_API = 0, 1, 2, 3, 4, 5
 
@@ -158,7 +159,7 @@ def cmd_devices(args):
     from . import ios_remote
     android = []
     try:
-        r = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=8)
+        r = subprocess.run([ADB, "devices", "-l"], capture_output=True, text=True, timeout=8)
         for ln in r.stdout.splitlines()[1:]:
             parts = ln.split()
             if len(parts) >= 2:

@@ -8,6 +8,7 @@ from .constants import TARGET_INFO, resolve_build_method
 from .config import (find_apk, get_unity_for_project, get_build_number,
                      load_history, save_history, save_build_entry)
 from .agent_state import tracker, read_state, pid_alive, unity_batch_processes
+ADB = os.path.expanduser("~/.local/bin/adb") if os.path.exists(os.path.expanduser("~/.local/bin/adb")) else "adb"
 
 
 # action_id → (needs_unity, needs_zip, needs_scp, osa_arg_of_device, label)
@@ -131,7 +132,7 @@ def install_apk(proj, device, log_cb):
     if not apk:
         log_cb("Install: APK not found\n")
         return False
-    cmd = ["adb"] + (["-s", device] if device and device != "default" else []) + \
+    cmd = [ADB] + (["-s", device] if device and device != "default" else []) + \
           ["install", "-r", apk]
     log_cb(f"Installing {os.path.basename(apk)} → {device}...\n")
     try:

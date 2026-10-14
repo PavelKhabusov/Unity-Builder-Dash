@@ -28,6 +28,7 @@ from .profiler import ProfilerPage
 from . import ios_remote, pipeline
 from .config import save_config
 from .agent_state import tracker
+ADB = os.path.expanduser("~/.local/bin/adb") if os.path.exists(os.path.expanduser("~/.local/bin/adb")) else "adb"
 from .agent_api import AgentServer, Backend, api_port
 
 
@@ -1309,7 +1310,7 @@ class BuilderWindow(Adw.ApplicationWindow, Backend):
         def do_push():
             try:
                 r = subprocess.run(
-                    ["adb", "push", apk, f"/sdcard/Download/{os.path.basename(apk)}"],
+                    [ADB, "push", apk, f"/sdcard/Download/{os.path.basename(apk)}"],
                     capture_output=True, text=True, timeout=120)
                 if r.returncode == 0:
                     GLib.idle_add(self._log, f"Pushed to /sdcard/Download/\n")
@@ -1837,7 +1838,7 @@ class BuilderWindow(Adw.ApplicationWindow, Backend):
         # hide Unity's adb anyway, there's nothing to conflict with — leave
         # the daemon up so device-tab polling stays responsive.
         if not proj.get("hide_adb"):
-            try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
+            try: subprocess.run([ADB, "kill-server"], timeout=3, capture_output=True)
             except: pass
         if proj.get("hide_adb") and os.path.exists(unity_adb):
             try:
@@ -1854,7 +1855,7 @@ class BuilderWindow(Adw.ApplicationWindow, Backend):
             # so after every test run the device tab had to pay a 1-2s
             # cold-start on the next `adb devices -l`. start-server is a
             # no-op if the daemon's already alive.
-            try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
+            try: subprocess.run([ADB, "start-server"], timeout=5, capture_output=True)
             except: pass
 
         # Log file

@@ -3,6 +3,7 @@ import os, signal, subprocess, threading, time, datetime
 from gi.repository import GLib
 from .constants import TARGET_INFO, SKIP_PATTERNS, STAGE_PATTERNS, PROGRESS_RE, resolve_build_method
 from .config import find_apk, get_unity_for_project, APP_DIR
+ADB = os.path.expanduser("~/.local/bin/adb") if os.path.exists(os.path.expanduser("~/.local/bin/adb")) else "adb"
 
 
 class BuildWorker:
@@ -45,7 +46,7 @@ class BuildWorker:
         if not os.path.exists(unity_adb) and os.path.exists(adb_hidden):
             try: os.rename(adb_hidden, unity_adb)
             except: pass
-        try: subprocess.run(["adb", "start-server"], timeout=5, capture_output=True)
+        try: subprocess.run([ADB, "start-server"], timeout=5, capture_output=True)
         except: pass
 
     def _save_log(self, lines):
@@ -100,7 +101,7 @@ class BuildWorker:
         # keep running through the build, and UBD's device-tab polling won't
         # eat 2s cold-start penalties on every other tick.
         if not hide_adb:
-            try: subprocess.run(["adb", "kill-server"], timeout=3, capture_output=True)
+            try: subprocess.run([ADB, "kill-server"], timeout=3, capture_output=True)
             except: pass
 
         GLib.idle_add(self.log_cb, f"  {path}\n\n")
