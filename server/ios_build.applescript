@@ -24,7 +24,7 @@
    clearCache                remove Xcode DerivedData / .pcm
    clearBuild                xcodebuild clean
    updatePod                 full pod reinstall + add widget
-   addWidget                 re-run add_widget_dependency.rb
+   addWidget                 re-run add_widget_dependency.rb + add_share_extension.rb
    connectMac-<winIp>-<mac>  (Windows host only) SMB-mount winIp, save winIp
                              into config.json. Linux hosts don't need this
                              since they scp iOS.zip directly.
@@ -109,7 +109,7 @@ on stopTerminal()
 	-- agent's caffeinate would let the Mac sleep while keep-awake is still ON.
 	-- launchd would respawn it (KeepAlive), but we must not fight the agent.
 	try
-		do shell script "pkill -INT -x xcodebuild; pkill -INT -f 'pod install'; pkill -INT -f 'pod update'; pkill -INT -f 'pod repo'; pkill -INT -f 'add_widget_dependency'; pkill -INT -f 'caffeinate -i -s .'; true"
+		do shell script "pkill -INT -x xcodebuild; pkill -INT -f 'pod install'; pkill -INT -f 'pod update'; pkill -INT -f 'pod repo'; pkill -INT -f 'add_widget_dependency'; pkill -INT -f 'add_share_extension'; pkill -INT -f 'caffeinate -i -s .'; true"
 	end try
 	delay 0.3
 	tell application "Terminal"
@@ -278,7 +278,7 @@ MAIN_SHORT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' " & 
 /usr/bin/plutil -replace CFBundleShortVersionString -string \"$MAIN_SHORT\" " & widgetPlist & ";
 cd {{WORK_DIR}}/iOS;
 gem list -i xcodeproj >/dev/null 2>&1 || gem install xcodeproj --no-document --user-install;
-WIDGET_BUNDLE_ID='{{WIDGET_BUNDLE_ID}}' WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' WIDGET_TARGET_NAME='{{WIDGET_TARGET}}' ruby {{WORK_DIR}}/add_widget_dependency.rb;
+WIDGET_BUNDLE_ID='{{WIDGET_BUNDLE_ID}}' WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' WIDGET_TARGET_NAME='{{WIDGET_TARGET}}' ruby {{WORK_DIR}}/add_widget_dependency.rb && WIDGET_TEAM_ID='{{WIDGET_TEAM_ID}}' APP_GROUP_ID='{{APP_GROUP_ID}}' ruby {{WORK_DIR}}/add_share_extension.rb {{WORK_DIR}};
 echo $? > /tmp/ubd_widget_exit;
 touch /tmp/ubd_widget_done;
 "

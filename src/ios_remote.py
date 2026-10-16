@@ -711,7 +711,7 @@ def install_mac_server(remote, log_cb=None):
     # Locate the server/ folder next to src/ in the app root
     here = os.path.dirname(os.path.abspath(__file__))
     server_dir = os.path.join(os.path.dirname(here), "server")
-    files = ["ios_build.applescript", "add_widget_dependency.rb", "patch_scpt.sh",
+    files = ["ios_build.applescript", "add_widget_dependency.rb", "add_share_extension.rb", "patch_scpt.sh",
              "mac_console.applescript", "release.sh"]
     missing = [f for f in files if not os.path.isfile(os.path.join(server_dir, f))]
     if missing:
