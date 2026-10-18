@@ -198,7 +198,7 @@ def _build_req(args):
     req = {"project": args.project, "target": args.target,
            "scripts_only": args.scripts_only, "aab": args.aab,
            "increment": not args.no_increment, "install": args.install,
-           "ios_action": args.ios_action}
+           "ios_action": args.ios_action, "ios_mode": args.ios_mode}
     return req
 
 
@@ -217,7 +217,7 @@ def cmd_build(args):
         print("DRY RUN — nothing is started")
         for ln in pipeline.build_plan(cfg, p["proj"], p["target"], p["increment"],
                                       p["scripts_only"], p["aab"], p["ios_action"],
-                                      p["device"], p["install"]):
+                                      p["device"], p["install"], p["ios_mode"]):
             print("  " + ln)
         if owner:
             print(f"  via:      POST /build → running {owner} (127.0.0.1:{_port()})")
@@ -318,6 +318,9 @@ def main(argv=None):
     bp.add_argument("--install", metavar="DEVICE")
     bp.add_argument("--ios-action", default="full",
                     choices=["full", "xcode", "build_only", "without_xcode"])
+    bp.add_argument("--ios-mode", choices=["incremental", "clean"],
+                    help="iOS transfer: rsync + incremental Xcode, or zip + clean unpack "
+                         "(default: ios_remote.transfer_mode, else incremental)")
     bp.add_argument("--wait", "-w", action="store_true", help="follow log, exit with build result")
     bp.add_argument("--dry-run", action="store_true")
     for p in sub.choices.values():

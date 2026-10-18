@@ -1042,8 +1042,9 @@ class BuilderWindow(Adw.ApplicationWindow, Backend):
 
     _IOS_ACTIONS = pipeline.IOS_ACTIONS
 
-    def _on_ios_action(self, proj, action_id, device_target, increment=None, scripts_only=None):
-        spec = pipeline.resolve_ios_action(self.cfg, action_id, device_target)
+    def _on_ios_action(self, proj, action_id, device_target, increment=None, scripts_only=None,
+                       ios_mode=None):
+        spec = pipeline.resolve_ios_action(self.cfg, action_id, device_target, ios_mode)
         if not spec:
             self._log(f"Unknown iOS action: {action_id}\n")
             return
@@ -1225,7 +1226,8 @@ class BuilderWindow(Adw.ApplicationWindow, Backend):
         self._log(f"[agent] {proj['name']} / {target} ({action})\n")
         if target == "ios":
             self._on_ios_action(proj, p["ios_action"], p["device"],
-                                increment=p["increment"], scripts_only=p["scripts_only"])
+                                increment=p["increment"], scripts_only=p["scripts_only"],
+                                ios_mode=p["ios_mode"])
         else:
             self._start(proj, target, aab=p["aab"], increment=p["increment"],
                         scripts_only=p["scripts_only"])

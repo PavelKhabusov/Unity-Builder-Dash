@@ -107,7 +107,7 @@ class HeadlessRunner(Backend):
     def _start_ios(self):
         cfg, p = self.cfg, self.p
         needs_unity, needs_zip, needs_scp, osa_arg, _label, status_text = \
-            pipeline.resolve_ios_action(cfg, p["ios_action"], p["device"])
+            pipeline.resolve_ios_action(cfg, p["ios_action"], p["device"], p["ios_mode"])
         self.stage(status_text)
 
         def post():

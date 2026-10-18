@@ -200,6 +200,16 @@ def show_ios_popup(parent, proj, cfg, on_action, save_cfg, log_cb,
     with_test_check.connect("toggled", _on_with_test_toggle)
     menu_box.append(with_test_check)
 
+    incr_check = Gtk.CheckButton(label="Incremental Xcode build (rsync, keep DerivedData)",
+        margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
+    incr_check.set_active(
+        (cfg.get("ios_remote") or {}).get("transfer_mode", "incremental") != "clean")
+    def _on_incr_toggle(b):
+        cfg.setdefault("ios_remote", {})["transfer_mode"] = "incremental" if b.get_active() else "clean"
+        save_cfg(cfg)
+    incr_check.connect("toggled", _on_incr_toggle)
+    menu_box.append(incr_check)
+
     terminal_check = Gtk.CheckButton(label="External terminal window",
         margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
     terminal_check.set_active(

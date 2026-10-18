@@ -34,6 +34,13 @@ IOS_ACTIONS = {
 }
 
 AGENT_IOS_ACTIONS = ("full", "xcode", "build_only", "without_xcode")
+IOS_MODES = ("incremental", "clean")
+SYNC_OSA = {"unpack": "syncUnpack"}
+
+
+def ios_mode_of(cfg, mode=None):
+    m = mode or (cfg.get("ios_remote") or {}).get("transfer_mode") or "incremental"
+    return m if m in IOS_MODES else "incremental"
 
 
 def find_project(cfg, name):
@@ -49,13 +56,24 @@ def default_ios_device(cfg):
     return devs[0][1] if devs else "iPhone 12 mini"
 
 
-def resolve_ios_action(cfg, action_id, device):
-    """→ (needs_unity, needs_zip, needs_scp, osa_arg, label, status_text) or None."""
+def resolve_ios_action(cfg, action_id, device, mode=None):
+    """→ (needs_unity, needs_zip, needs_scp, osa_arg, label, status_text) or None.
+
+    Incremental mode swaps zip+scp+unpack for rsync (needs_scp == "rsync").
+    """
     spec = IOS_ACTIONS.get(action_id)
     if not spec:
         return None
     needs_unity, needs_zip, needs_scp, osa_fn, label = spec
     osa_arg = osa_fn(device)
+    if osa_arg and ios_mode_of(cfg, mode) == "incremental":
+        orig = osa_arg
+        if needs_zip and needs_scp:
+            needs_zip, needs_scp = False, "rsync"
+            osa_arg = SYNC_OSA.get(osa_arg, osa_arg)
+        osa_arg = osa_arg.replace("Full:", "Sync:")
+        if osa_arg != orig:
+            label += " (incremental)"
     if osa_arg and "{PREFIX}" in osa_arg:
         prefix = "run" if (cfg.get("ios_remote") or {}).get("run_with_test") else "install"
         osa_arg = osa_arg.replace("{PREFIX}", prefix)
@@ -95,7 +113,11 @@ def ios_post_build(cfg, proj, needs_zip, needs_scp, osa_arg, log_cb, stage_cb,
         stage(f"{status_text} — waking Mac")
         ok = ios_remote.wake_mac(ios_remote.get_remote_cfg(cfg), log_cb=log_cb)
 
-    if ok and needs_scp:
+    if ok and needs_scp == "rsync":
+        stage(f"{status_text} — syncing")
+        stamp = f"v1|{get_unity_for_project(cfg, proj) or ''}"
+        ok = ios_remote.rsync_to_mac(build_dir, ios_remote.get_remote_cfg(cfg), stamp, log_cb=log_cb)
+    elif ok and needs_scp:
         stage(f"{status_text} — uploading")
         zip_path = os.path.join(build_dir, "iOS.zip")
         ok = ios_remote.scp_to_mac(zip_path, ios_remote.get_remote_cfg(cfg), log_cb=log_cb)
@@ -155,6 +177,8 @@ def parse_build_request(cfg, req):
     ios_action = req.get("ios_action") or "full"
     if target == "ios" and ios_action not in AGENT_IOS_ACTIONS:
         return f"ios_action must be one of {AGENT_IOS_ACTIONS}", None
+    if req.get("ios_mode") and req["ios_mode"] not in IOS_MODES:
+        return f"ios_mode must be one of {IOS_MODES}", None
     p = {
         "proj": proj, "target": target,
         "increment": bool(req.get("increment", True)),
@@ -162,6 +186,7 @@ def parse_build_request(cfg, req):
         "aab": bool(req.get("aab", False)) and target == "android",
         "install": req.get("install") or None,
         "ios_action": ios_action,
+        "ios_mode": ios_mode_of(cfg, req.get("ios_mode")),
     }
     p["device"] = (p["install"] or default_ios_device(cfg)) if target == "ios" else None
     if target == "ios":
@@ -178,7 +203,7 @@ def parse_build_request(cfg, req):
 
 
 def options_of(p):
-    return {k: p[k] for k in ("increment", "scripts_only", "aab", "install", "ios_action")}
+    return {k: p[k] for k in ("increment", "scripts_only", "aab", "install", "ios_action", "ios_mode")}
 
 
 def _lockfile_held(project_path):
@@ -215,7 +240,7 @@ def busy_reason(own_busy=False, project=None):
 
 
 def build_plan(cfg, proj, target, increment=True, scripts_only=False, aab=False,
-               ios_action="full", device=None, install=None):
+               ios_action="full", device=None, install=None, ios_mode=None):
     """Human-readable description of what a build would execute (for --dry-run)."""
     lines = []
     unity = get_unity_for_project(cfg, proj)
@@ -225,7 +250,7 @@ def build_plan(cfg, proj, target, increment=True, scripts_only=False, aab=False,
                  + ("" if unity and os.path.isfile(unity) else "  [MISSING]"))
     run_unity = True
     if target == "ios":
-        spec = resolve_ios_action(cfg, ios_action, device or default_ios_device(cfg))
+        spec = resolve_ios_action(cfg, ios_action, device or default_ios_device(cfg), ios_mode)
         if not spec:
             return [f"unknown iOS action: {ios_action}"]
         run_unity, needs_zip, needs_scp, osa_arg, label, _st = spec
@@ -244,7 +269,9 @@ def build_plan(cfg, proj, target, increment=True, scripts_only=False, aab=False,
             lines.append(f"step:     zip {build_dir}/iOS → iOS.zip")
         if needs_scp or osa_arg is not None:
             lines.append(f"step:     wake Mac {remote.get('mac_user')}@{remote.get('mac_ip') or '(no mac_ip)'}")
-        if needs_scp:
+        if needs_scp == "rsync":
+            lines.append(f"step:     rsync -c {build_dir}/iOS → {remote['mac_work_dir']}/iOS")
+        elif needs_scp:
             lines.append(f"step:     scp iOS.zip → {remote['mac_zip_dest']}")
         if osa_arg is not None:
             lines.append(f"step:     ssh osascript {remote['mac_script_path']} '{osa_arg}'")

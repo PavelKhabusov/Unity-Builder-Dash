@@ -20,6 +20,8 @@
    run:<device>              stopTerminal + xcodebuild-test on <device>
    runFull:<device>          unpack + run:<device>
    unpack                    unzip iOS.zip, pod install, add widget
+   syncUnpack                same on an rsync'ed iOS/ (no wipe, keeps DerivedData)
+   runSync:/installSync:<d>  syncUnpack + run:/install:<d>
    stop                      kill active Terminal job
    clearCache                remove Xcode DerivedData / .pcm
    clearBuild                xcodebuild clean
@@ -382,6 +384,17 @@ on unpack()
 		do shell script "echo 'unpack: unzip done' | nc -w 1 " & IPADDRESS & " 8080"
 	end try
 
+	prepareProject()
+end unpack
+
+-- Incremental: host already rsync'ed iOS/ in place (DerivedData, Pods kept).
+on syncUnpack()
+	my forceCloseAllWindows()
+	prepareProject()
+end syncUnpack
+
+on prepareProject()
+
 	-- Patch project.pbxproj: Unity on Linux bakes absolute paths like
 	-- "/home/pavel/DEV/KartotekaAR/build AR/iOS/testIcon.png" into file
 	-- references. On Mac those paths don't exist → xcodebuild fails with
@@ -513,7 +526,7 @@ open(p,'w').write(s.rstrip() + '\\n')
 	my forceCloseAllWindows()
 
 	addWidgetToProject()
-end unpack
+end prepareProject
 
 -- Build + test: runs the app through xctest, which auto-launches it on device.
 -- Works for most Unity projects; some crash during test-runner init
@@ -679,6 +692,14 @@ on run argv
 		set deviceName to text 13 thru -1 of command
 		unpack()
 		installDevice(deviceName)
+	else if command starts with "runSync:" then
+		set deviceName to text 9 thru -1 of command
+		syncUnpack()
+		runDevice(deviceName)
+	else if command starts with "installSync:" then
+		set deviceName to text 13 thru -1 of command
+		syncUnpack()
+		installDevice(deviceName)
 	else if command starts with "install:" then
 		set deviceName to text 9 thru -1 of command
 		installDevice(deviceName)
@@ -693,6 +714,8 @@ on run argv
 		connectToServer(winIp)
 	else if command is "unpack" then
 		unpack()
+	else if command is "syncUnpack" then
+		syncUnpack()
 	else if command is "stop" then
 		stopTerminal()
 	else if command is "clearCache" then

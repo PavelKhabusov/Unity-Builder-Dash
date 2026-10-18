@@ -522,6 +522,57 @@ def wake_mac(remote, log_cb=None, max_wait=30):
     return True
 
 
+SYNC_STAMP = ".ubd_sync_stamp"
+# Mac-only state inside iOS/ that rsync --delete must keep.
+SYNC_KEEP = ["/build/", "/Pods/", "/Podfile.lock", "/Unity-iPhone.xcworkspace/",
+             "/Widgets/", "xcuserdata/", "/" + SYNC_STAMP]
+
+
+def rsync_to_mac(build_dir, remote, stamp, log_cb=None):
+    """Mirror {build_dir}/iOS → {mac_work_dir}/iOS by content (-c, no -t).
+
+    Unchanged files keep their Mac mtimes, so Xcode/DerivedData only rebuild
+    what Unity actually changed. A stamp mismatch (Unity version, first run)
+    wipes the Mac folder first = clean fallback.
+    """
+    def log(t):
+        if log_cb: GLib.idle_add(log_cb, t)
+    src, _name = ios_build_subdir(build_dir)
+    if not src:
+        log(f"iOS Xcode project not found in {build_dir}\n")
+        return False
+    host = f'{remote["mac_user"]}@{remote["mac_ip"]}'
+    dest = f'{remote["mac_work_dir"]}/iOS'
+    ssh = ["ssh"] + _ssh_common_opts(remote)
+    stamp_file = f"{dest}/{SYNC_STAMP}"
+    check = (f'[ -d "{dest}/Unity-iPhone.xcodeproj" ] && cat "{stamp_file}" 2>/dev/null; true')
+    try:
+        r = subprocess.run(_wrap_sshpass(remote, ssh + [host, check]),
+                           capture_output=True, text=True, timeout=30)
+        if r.stdout.strip() != stamp:
+            log("Incremental sync: no matching previous sync on Mac → clean iOS/\n")
+            subprocess.run(_wrap_sshpass(remote, ssh + [host, f'rm -rf "{dest}"']),
+                           capture_output=True, timeout=300)
+        log(f"Syncing {src} → {remote['mac_ip']}:{dest} (rsync -c)...\n")
+        cmd = ["rsync", "-rlc", "--delete", "--stats", "-e", " ".join(ssh)]
+        cmd += [f"--exclude={x}" for x in SYNC_KEEP]
+        cmd += [src.rstrip("/") + "/", f"{host}:{dest}/"]
+        r = subprocess.run(_wrap_sshpass(remote, cmd), capture_output=True, text=True, timeout=1800)
+        stats = [ln for ln in r.stdout.splitlines()
+                 if ln.startswith(("Number of", "Total transferred", "Total bytes sent"))]
+        log("".join(f"  {ln}\n" for ln in stats))
+        if r.returncode != 0:
+            log(f"  rsync failed ({r.returncode}): {r.stderr.strip()}\n")
+            return False
+        subprocess.run(_wrap_sshpass(remote, ssh + [host, f'printf %s "{stamp}" > "{stamp_file}"']),
+                       capture_output=True, timeout=30)
+        log("  Sync done\n")
+        return True
+    except Exception as e:
+        log(f"  Sync error: {e}\n")
+        return False
+
+
 def scp_to_mac(zip_path, remote, log_cb=None):
     """Upload zip to {mac_zip_dest}. Returns True on success."""
     dest = f'{remote["mac_user"]}@{remote["mac_ip"]}:{remote["mac_zip_dest"]}'
