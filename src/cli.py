@@ -276,9 +276,14 @@ def _maybe_wait(args, log_path):
         return EXIT_OK
     for _ in range(20):
         if os.path.isfile(log_path):
-            break
+            return follow(log_path, from_end=False)
         time.sleep(0.5)
-    return follow(log_path, from_end=False)
+    while True:
+        st = read_state() or {}
+        if not st.get("running") and st.get("finished_at"):
+            print(f"build {st.get('result')}: {st.get('stage')}")
+            return EXIT_OK if st.get("result") == "success" else 1
+        time.sleep(5)
 
 
 def cmd_cancel(args):
