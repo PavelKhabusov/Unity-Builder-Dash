@@ -12,6 +12,7 @@ integrates the widget, builds via `xcodebuild`, and installs on the iOS device.
 | `ios_build.applescript` | **Source** with `{{PLACEHOLDERS}}`. Compiled to `ios_build.scpt` on the Mac at install time. |
 | `add_widget_dependency.rb` | Adds the WidgetKit extension target to the Unity-exported Xcode project. Fully env-driven (BUNDLE_ID / TEAM_ID / WIDGET_TARGET_NAME come from your `config.json`). |
 | `add_share_extension.rb` | Adds a Share extension target when the Unity export contains `iOS/ShareExtension/` (Swift sources, `Info.plist`, `<Target>.entitlements`). Bundle id defaults to `<app bundle id>.share`; signing team and App Group come from the widget settings. Runs right after the widget script. |
+| `add_broadcast_extension.rb` | Adds a ReplayKit Broadcast Upload extension target when the export contains `iOS/BroadcastExtension/` (screen sharing from the app). Bundle id defaults to `<app bundle id>.broadcast`; writes the App Group into the entitlements and the `KrtAppGroup` Info.plist key. Runs after the share script. |
 | `patch_scpt.sh` | Substitutes placeholders in `ios_build.applescript` with env-var values and runs `osacompile` to produce `ios_build.scpt`. |
 
 `ios_build.scpt` is **not** checked in — it's generated from source on your Mac.
